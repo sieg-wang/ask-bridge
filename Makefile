@@ -64,8 +64,21 @@ open: build ## Launch Chrome and open ChatGPT page
 
 ##@ Installation
 
+.PHONY: install-browser
+install-browser: ## Install Google Chrome if it is missing (required by Chrome DevTools MCP)
+	@if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then \
+		echo "$(GREEN)Google Chrome is already installed.$(RESET)"; \
+	elif command -v brew >/dev/null 2>&1; then \
+		echo "$(CYAN)Installing Google Chrome with Homebrew...$(RESET)"; \
+		brew install --cask google-chrome; \
+	else \
+		echo "$(YELLOW)Google Chrome is required by Chrome DevTools MCP but was not found.$(RESET)"; \
+		echo "$(YELLOW)Install Homebrew or install Chrome manually from https://www.google.com/chrome/ and rerun make install.$(RESET)"; \
+		exit 1; \
+	fi
+
 .PHONY: install
-install: release ## Build release and create an 'ask' symlink in ~/.local/bin/
+install: install-browser release ## Install required browser, build release, and create an 'ask' symlink in ~/.local/bin/
 	@echo "$(CYAN)Installing binary symlink to ~/.local/bin/ask...$(RESET)"
 	@mkdir -p ~/.local/bin
 	@ln -sf "$$(pwd)/target/release/ask-chatgpt" ~/.local/bin/ask

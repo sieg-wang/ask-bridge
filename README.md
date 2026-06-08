@@ -1,166 +1,166 @@
-# Ask ChatGPT (Rust Version) 🦀
+# Ask ChatGPT Rust 版
 
-`ask` is a powerful, lightweight, zero-dependency-runtime command-line tool written in **Rust** that automates ChatGPT directly in your real Chrome browser. It uses the **Model Context Protocol (MCP)** and **Chrome DevTools Protocol (CDP)** via `mcp-cli` and `chrome-devtools-mcp` to control Chrome, input prompts, click submit, and **stream the response back to your terminal in real-time**.
+`ask` 是以 Rust 撰寫的輕量命令列工具，可透過真實 Chrome 瀏覽器自動操作 ChatGPT。它使用 Model Context Protocol MCP 與 Chrome DevTools Protocol CDP，並透過內建的 `doggy8088/mcp-cli` Rust library dependency 搭配 `chrome-devtools-mcp` 控制 Chrome、輸入 prompt、送出訊息，並將回覆即時串流輸出到終端機。
 
-Unlike typical API clients, `ask` operates inside a real, headful Chrome browser with a **persistent user profile**. This means:
-- You log in manually **once** (`ask login`).
-- You can solve CAPTCHAs, bypass Cloudflare, and access GPT-4o or your custom GPTs exactly like a human would.
-- Your session cookies, login state, and chat history are saved persistently.
+不同於一般 API client，`ask` 會在真實 Chrome 瀏覽器中執行，並使用持久化的專屬使用者 profile。這表示：
 
----
+- 只需要手動登入一次，透過 `ask login` 完成。
+- 可處理 CAPTCHA、Cloudflare，並像一般使用者一樣存取 ChatGPT 方案功能與自訂 GPT。
+- Session cookies、登入狀態與對話紀錄會持久保存。
 
-## 🌟 Key Features
+## 主要功能
 
-- **🦀 100% Rust Core**: Extremely fast, lightweight, and compile-once, run-anywhere binary.
-- **🌐 Real Browser Automation**: Directly interacts with Chrome on port `9223` (isolated debug profile).
-- **🔒 Persistent Login**: Uses a dedicated local profile directory (`~/.config/ask-chatgpt/chrome-profile`) so you never lose your login state.
-- **⚡ Real-time Streaming**: Streams ChatGPT's response character-by-character as it's generated, with a beautiful live-typing effect.
-- **🌀 TUI Thinking Animation**: Displays a gorgeous, fluid rotating braille spinner (`⠋ 正在思考中 🧠...`) while waiting for ChatGPT to think and reply, which clears automatically the instant the streaming response starts.
-- **🧠 Intelligent Tab Management**: Reuses existing ChatGPT tabs if open, focuses them, or opens new ones, avoiding tab clutter.
-- **🖥️ Pipe & Stdin Support**: Supports piping prompts via `stdin` (e.g. `cat report.txt | ask "summarize this"`).
-- **🔍 Quiet by Default & Verbose Mode**: Quiet and clean output by default (displaying only the generated response), with an optional `--verbose` (`-v`) flag to display full browser state logs if needed.
+- **100% Rust 核心**：快速、輕量，編譯後即可執行。
+- **真實瀏覽器自動化**：直接控制監聽 `9223` port 的 Chrome debug profile。
+- **持久登入狀態**：使用專屬本機 profile 目錄 `~/.config/ask-chatgpt/chrome-profile`，避免重複登入。
+- **即時串流輸出**：ChatGPT 產生回覆時，逐字將內容輸出到終端機。
+- **思考動畫**：等待 ChatGPT 回覆時，在終端機顯示旋轉 spinner，開始輸出內容後自動清除。
+- **智慧分頁管理**：可重用既有 ChatGPT 分頁、聚焦分頁，或開啟新分頁，避免分頁過度增加。
+- **Pipe 與 stdin 支援**：支援透過 standard input 傳入 prompt，例如 `cat report.txt | ask "summarize this"`。
+- **預設安靜模式與 verbose 模式**：預設只輸出最終回覆；加上 `--verbose` 或 `-v` 可顯示背景瀏覽器控制流程。
 
----
+## 前置需求
 
-## 🛠️ Prerequisites
+執行此工具需要：
 
-To run this tool, you need:
+1. 已安裝 `node` 與 `npx`，用於自動啟動 `chrome-devtools-mcp` server。
+2. 已安裝 Google Chrome。macOS 預設路徑通常是 `/Applications/Google Chrome.app`。若缺少 Chrome，且系統有 Homebrew，`make install` 會自動安裝。
 
-1. **Google Chrome** installed (normally located at `/Applications/Google Chrome.app` on macOS).
-2. **`mcp-cli`** installed on your system. If not already installed, install it using Bun:
-   ```bash
-   bun install -g mcp-cli
-   ```
-3. **`node`/`npx`** installed to automatically launch the `chrome-devtools-mcp` server.
+不需要安裝全域 `mcp-cli` 執行檔。Rust binary 會透過 Cargo 從 `https://github.com/doggy8088/mcp-cli` 使用 `mcp-cli` 作為 dependency。
 
----
+## 安裝與建置
 
-## 🚀 Installation & Build
+### 1. 安裝工具
 
-### 1. Build the Rust Project
+在專案目錄執行：
 
-Clone or navigate to the project directory and build with Cargo:
+```bash
+make install
+```
+
+此命令會安裝必要的 Chrome 瀏覽器、建置最佳化 binary，並建立 `~/.local/bin/ask` symlink。
+
+請確認 `~/.local/bin` 已加入 shell 的 `PATH`。
+
+### 2. 只建置不安裝
+
+若只想建置 binary：
 
 ```bash
 cargo build --release
 ```
 
-The compiled binary will be located at `target/release/ask-chatgpt`.
+編譯後的 binary 會位於 `target/release/ask-chatgpt`。
 
-### 2. Add to PATH
+## 使用方式
 
-Create a symlink to easily call the tool as `ask` from anywhere:
+### 1. 首次設定：登入 ChatGPT
 
-```bash
-ln -sf "$(pwd)/target/release/ask-chatgpt" ~/.local/bin/ask
-```
-
-*(Ensure `~/.local/bin` is in your shell's `PATH` variable).*
-
----
-
-## 📖 Usage Guide
-
-### 1. First Time Setup: Login to ChatGPT
-
-Before sending prompts, you need to log in to your ChatGPT account. Run:
+送出 prompt 前，需要先登入 ChatGPT 帳號。執行：
 
 ```bash
 ask login
 ```
 
-- This will automatically launch Google Chrome with a dedicated, persistent debug profile.
-- Log in manually to `https://chatgpt.com/` using your account (Google, Apple, Email, etc.).
-- Once logged in, return to your terminal and press **`[Enter]`**.
-- The tool will verify your login status and save your profile. You only need to do this **once**!
+此命令會：
 
-### 2. Send Prompts Directly
+- 使用專屬且持久化的 debug profile 啟動 Google Chrome。
+- 開啟 `https://chatgpt.com/`。
+- 等待你手動登入帳號。
+- 在你回到終端機按 Enter 後，驗證登入狀態並保存 profile。
 
-Simply pass your prompt as an argument:
+此流程通常只需要執行一次。
+
+### 2. 直接提問
+
+將 prompt 作為 argument 傳入：
 
 ```bash
-ask "What is the difference between a struct and a tuple in Rust?"
+ask "Rust struct 和 tuple 有什麼差異？"
 ```
 
-- Chrome will open or focus on your ChatGPT tab.
-- The prompt will be typed out and submitted.
-- The AI's response will **stream live inside your terminal**!
+執行後：
 
-### 3. Open a Brand New Session (`--new`)
+- Chrome 會開啟或聚焦 ChatGPT 分頁。
+- Prompt 會自動輸入並送出。
+- ChatGPT 回覆會即時串流輸出到終端機。
 
-By default, `ask` will reuse any existing open ChatGPT tab to avoid cluttering your browser with too many tabs.
+### 3. 開啟全新對話
 
-If you want to start a **completely fresh conversation session** (equivalent to clicking "New Chat" in the sidebar), use the `--new` flag:
+預設情況下，`ask` 會重用既有 ChatGPT 分頁，以避免建立過多分頁。
+
+若要開啟全新的 ChatGPT 對話，使用 `--new`：
 
 ```bash
 ask "誰是保哥？" --new
 ```
 
-- This will open a **brand new ChatGPT tab**.
-- It will **automatically close all previous ChatGPT tabs** to keep your workspace clean and organized.
+此模式會開啟新的 ChatGPT 分頁，並清理先前的 ChatGPT 分頁。
 
-### 4. Headless Mode (Default: True)
+### 4. Headless 模式
 
-By default, standard queries run Chrome in **headless mode** (`--headless=true`) so that the browser operates silently in the background without stealing your focus or popping up windows.
+一般提問預設使用 headless Chrome，也就是 `--headless=true`。Chrome 會在背景執行，不會搶走焦點或跳出視窗。
 
-If you want to watch Chrome work in real-time or need to manually check what's happening on the page, you can run in **headful mode** by setting `--headless=false`:
+若想觀察 Chrome 的操作過程，或需要手動檢查頁面狀態，可改用 headful 模式：
 
 ```bash
 ask "誰是保哥？" --headless=false
 ```
 
-*Note: Subcommands like `ask login` and `ask open` always override the default and run in **headful mode** so you can interact with the UI.*
+`ask login` 與 `ask open` 這類 subcommand 會強制使用 headful 模式，方便你和瀏覽器 UI 互動。
 
-### 5. Verbose Mode (`--verbose` / `-v`)
+### 5. Verbose 模式
 
-By default, `ask` runs in a **quiet, clean mode** that hides all background browser-control logs (such as "Checking open Chrome tabs...", "Typing prompt...", etc.) and only displays the final streamed markdown answer. However, it still plays a beautiful, animated rotating spinner in your terminal while waiting for ChatGPT to generate a response.
+預設情況下，`ask` 只輸出 ChatGPT 的最終回覆，隱藏背景控制訊息。
 
-If you want to see detailed step-by-step status logs of what `ask` is doing behind the scenes, add the `--verbose` or `-v` flag:
+若要查看完整瀏覽器自動化流程，加入 `--verbose` 或 `-v`：
 
 ```bash
 ask "誰是保哥？" --verbose
 ```
 
-This will print every stage of the browser automation:
-- Checking open Chrome tabs...
-- Focusing input field...
-- Typing your prompt...
-- Submitting...
-- Waiting for ChatGPT response...
+Verbose 模式會顯示類似以下流程：
 
-### 6. Piping & Stdin Support
+- 檢查已開啟的 Chrome 分頁。
+- 聚焦輸入欄位。
+- 輸入 prompt。
+- 送出訊息。
+- 等待 ChatGPT 回覆。
 
-You can pipe text or files directly into `ask`:
+### 6. Pipe 與 stdin
 
-```bash
-echo "Explain quantum computing in one sentence" | ask
-```
-
-Or read files:
+可透過 pipe 將文字或檔案內容傳入 `ask`：
 
 ```bash
-cat src/main.rs | ask "Are there any memory leaks in this Rust code?"
+echo "用一句話解釋 quantum computing" | ask
 ```
 
-### 7. Just Open ChatGPT
+也可以讀取檔案內容：
 
-To quickly launch the browser and open ChatGPT without sending any query:
+```bash
+cat src/main.rs | ask "這段 Rust code 有記憶體洩漏風險嗎？"
+```
+
+### 7. 只開啟 ChatGPT
+
+若只想快速開啟瀏覽器並進入 ChatGPT：
 
 ```bash
 ask open
 ```
 
----
+## 運作原理
 
-## ⚙️ How It Works (Under the Hood)
+1. **瀏覽器初始化**：`ask` 會檢查 Chrome 是否正在監聽 debug port `9223`。若沒有，會以專屬 profile 目錄 `~/.config/ask-chatgpt/chrome-profile` 啟動 Google Chrome。
+2. **MCP Bridge 設定**：啟動時會自動寫入 `~/.config/ask-chatgpt/mcp_servers.json`，預設設定 Chrome DevTools MCP server，使用 `chrome-devtools-mcp@latest` 與 `--browser-url=http://127.0.0.1:9223`。
+3. **Client 呼叫**：`ask` 透過內建的 `doggy8088/mcp-cli` Rust library dependency 呼叫 MCP tools，例如 `list_pages`、`select_page`、`type_text` 與 `evaluate_script`，不依賴系統上的外部 `mcp-cli` 命令。
+4. **狀態輪詢**：ChatGPT 產生回覆期間，工具會以 JavaScript 檢查送出與停止按鈕狀態，擷取回覆元素的文字內容，並將差異串流輸出到 `stdout`。
 
-1. **Browser Initialization**: `ask` checks if Chrome is listening on debugging port `9223`. If not, it spawns Google Chrome as a background process with a custom profile directory (`~/.config/ask-chatgpt/chrome-profile`).
-2. **MCP Bridge Config**: On startup, it automatically writes a custom `mcp_servers.json` to `~/.config/ask-chatgpt/mcp_servers.json`, configuring `chrome-devtools-mcp` to hook into `http://127.0.0.1:9223`.
-3. **Client Call**: `ask` runs `mcp-cli` subprocesses, calling `list_pages`, `select_page`, `type_text`, and `evaluate_script` tools to automate the DOM.
-4. **State Polling**: During generation, a lightweight JavaScript engine checks ChatGPT's send/stop button states and extracts response element inner-text, streaming the delta to `stdout`.
+## 相關文件
 
----
+- [快速開始](docs/quick-start.md)
+- [English README](README.en.md)
 
-## 📄 License
+## 授權
 
-MIT License. Feel free to use, modify, and distribute.
+MIT License。可自由使用、修改與散布。

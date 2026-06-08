@@ -1,4 +1,5 @@
 use clap::{CommandFactory, Parser, Subcommand};
+use mcp_cli::McpClient;
 use serde_json::Value;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -48,16 +49,6 @@ struct Page {
     selected: bool,
 }
 
-fn get_mcp_cli_path() -> String {
-    if let Some(mut home_dir) = home::home_dir() {
-        home_dir.push(".local/bin/mcp-cli");
-        if home_dir.exists() {
-            return home_dir.to_string_lossy().to_string();
-        }
-    }
-    "mcp-cli".to_string()
-}
-
 fn write_mcp_config() -> Result<String, String> {
     let mut config_dir = home::home_dir().ok_or("Could not locate home directory")?;
     config_dir.push(".config/ask-chatgpt");
@@ -74,8 +65,7 @@ fn write_mcp_config() -> Result<String, String> {
                 "args": [
                     "-y",
                     "chrome-devtools-mcp@latest",
-                    "--browserUrl",
-                    "http://127.0.0.1:9223"
+                    "--browser-url=http://127.0.0.1:9223"
                 ]
             }
         }
@@ -143,43 +133,16 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
 }
 
 fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
-    let args_str = serde_json::to_string(&args).map_err(|e| e.to_string())?;
-    let mcp_cli_path = get_mcp_cli_path();
+    let client = McpClient::load(Some(config_path))
+        .map_err(|e| format!("Failed to load MCP config: {}", e))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create async runtime for MCP call: {}", e))?;
 
-    let output = Command::new(&mcp_cli_path)
-        .arg("-c")
-        .arg(config_path)
-        .arg("call")
-        .arg("chrome-devtools")
-        .arg(tool)
-        .arg(&args_str)
-        .output()
-        .map_err(|e| format!("Failed to execute mcp-cli: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "mcp-cli call failed (exit status {}): {}",
-            output.status, stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let val: Value = match serde_json::from_str::<Value>(&stdout) {
-        Ok(v) if v.is_object() && v.get("content").is_some() => v,
-        _ => {
-            serde_json::json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": stdout.to_string()
-                    }
-                ]
-            })
-        }
-    };
-
-    Ok(val)
+    runtime
+        .block_on(async { client.call_tool("chrome-devtools", tool, args).await })
+        .map_err(|e| format!("mcp-cli library call failed: {}", e))
 }
 
 fn parse_pages(text: &str) -> Vec<Page> {
