@@ -607,18 +607,40 @@ fn copy_latest_markdown(config_path: &str) -> Result<String, String> {
 
     click_latest_copy_button(config_path)?;
 
+    let mut copied_content = None;
     for _ in 0..30 {
         thread::sleep(Duration::from_millis(100));
         match read_clipboard() {
             Ok(content) if !content.trim().is_empty() && content != sentinel => {
-                return Ok(content);
+                copied_content = Some(content);
+                break;
             }
             _ => {}
         }
     }
 
+    // Always restore the original clipboard
     let _ = write_clipboard(&clipboard_before);
-    Err("Timed out waiting for clipboard content after clicking copy".to_string())
+
+    let content = copied_content.ok_or_else(|| {
+        "Timed out waiting for clipboard content after clicking copy".to_string()
+    })?;
+
+    // Create a temporary file path
+    let temp_path = std::env::temp_dir().join(format!("ask_chatgpt_{}.md", std::process::id()));
+
+    // Write the copied content immediately to the temporary file
+    std::fs::write(&temp_path, &content)
+        .map_err(|e| format!("Failed to write to temporary file: {}", e))?;
+
+    // Read the content back from the temporary file to output to the terminal
+    let verified_content = std::fs::read_to_string(&temp_path)
+        .map_err(|e| format!("Failed to read from temporary file: {}", e))?;
+
+    // Clean up temporary file
+    let _ = std::fs::remove_file(&temp_path);
+
+    Ok(verified_content)
 }
 
 fn ensure_chatgpt_tab(config_path: &str, force_new: bool, verbose: bool) -> Result<(), String> {
@@ -1131,24 +1153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.verbose {
             println!("Copying final response from ChatGPT toolbar...");
         }
-        let clipboard_before = read_clipboard().unwrap_or_default();
-        match click_latest_copy_button(&config_path) {
-            Ok(()) => {
-                for _ in 0..20 {
-                    thread::sleep(Duration::from_millis(100));
-                    match read_clipboard() {
-                        Ok(content)
-                            if !content.trim().is_empty() && content != clipboard_before =>
-                        {
-                            last_markdown = content;
-                            break;
-                        }
-                        Ok(content) if !content.trim().is_empty() && last_markdown.is_empty() => {
-                            last_markdown = content;
-                        }
-                        _ => {}
-                    }
-                }
+        match copy_latest_markdown(&config_path) {
+            Ok(content) => {
+                last_markdown = content;
             }
             Err(e) => {
                 eprintln!("Error copying response from ChatGPT toolbar: {}", e);
