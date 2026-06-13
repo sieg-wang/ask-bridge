@@ -74,6 +74,7 @@ dependencies = [
 name = "ask-chatgpt"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "home",
  "mcp-cli",

@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose};
 use clap::{CommandFactory, Parser, Subcommand};
 use mcp_cli::McpClient;
 use serde_json::Value;
@@ -49,6 +50,10 @@ enum Commands {
     },
     /// Open Chrome browser and wait for manual login
     Login,
+    /// Dump the current browser tab HTML for debugging
+    Dump,
+    /// Take a screenshot of the current browser tab for debugging
+    Screenshot,
 }
 
 struct Page {
@@ -394,10 +399,11 @@ fn render_markdown(markdown: &str, use_glow: bool) -> Result<(), String> {
             .spawn();
 
         if let Ok(mut child) = glow {
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(e) = stdin.write_all(markdown.as_bytes()) {
+            let stdin_opt = child.stdin.take();
+            if let Some(mut stdin) = stdin_opt {
+                let _ = stdin.write_all(markdown.as_bytes()).map_err(|e| {
                     eprintln!("Failed to send Markdown content to glow: {}", e);
-                }
+                });
             }
 
             match child.wait() {
@@ -489,11 +495,12 @@ fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
                     if (el.closest('pre, code, [class*="code"], [data-testid*="code"]')) return -1;
                     if (/copy-turn-action-button/i.test(label)) return 100;
                     if (/response|回應|回答|reply/i.test(label)) return 90;
-                    if (el.closest('model-response, response-container, [data-message-author-role="assistant"]')) return 50;
+                    if (el.closest('model-response, response-container, [data-message-author-role="assistant"], .agent-turn')) return 50;
                     return 10;
                 };
                 const messages = Array.from(document.querySelectorAll([
                     '[data-message-author-role="assistant"]',
+                    '.agent-turn',
                     'model-response',
                     '.model-response',
                     '[data-test-id*="response"]',
@@ -546,9 +553,11 @@ fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
 
 fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
     if verbose {
-        println!("Waiting for page to load...");
+        println!("Waiting for page readyState...");
     }
 
+    // Phase 1: Wait for readyState complete or interactive
+    let mut ready = false;
     for _ in 0..90 {
         let ready_res = call_mcp_tool(
             config_path,
@@ -558,18 +567,49 @@ fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
             }),
         );
 
-        if let Ok(res) = ready_res {
-            if let Ok(parsed) = parse_script_result(&res) {
-                if parsed.as_bool().unwrap_or(false) {
-                    return Ok(());
-                }
-            }
+        if ready_res.and_then(|res| parse_script_result(&res)).map(|parsed| parsed.as_bool().unwrap_or(false)).unwrap_or(false) {
+            ready = true;
+            break;
         }
 
         thread::sleep(Duration::from_millis(500));
     }
 
-    Err("Timeout waiting for page to load".to_string())
+    if !ready {
+        return Err("Timeout waiting for page readyState to be loaded".to_string());
+    }
+
+    if verbose {
+        println!("Waiting for ChatGPT SPA elements...");
+    }
+
+    // Phase 2: Wait for key elements to render on ChatGPT (e.g. textarea, login button, or form)
+    for _ in 0..60 {
+        let element_res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => { \
+                    if (window.location.hostname.includes('chatgpt.com')) { \
+                        return document.querySelector('#prompt-textarea') !== null || \
+                               document.querySelector('[data-testid=\"login-button\"]') !== null || \
+                               document.querySelector('form') !== null; \
+                    } \
+                    return true; \
+                }"
+            }),
+        );
+
+        if element_res.and_then(|res| parse_script_result(&res)).map(|parsed| parsed.as_bool().unwrap_or(false)).unwrap_or(false) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    if verbose {
+        println!("Warning: Timeout waiting for ChatGPT SPA elements. Proceeding anyway...");
+    }
+    Ok(())
 }
 
 fn open_url_tab(config_path: &str, url: &str, headless: bool, verbose: bool) -> Result<(), String> {
@@ -655,6 +695,13 @@ fn open_url_tab(config_path: &str, url: &str, headless: bool, verbose: bool) -> 
 }
 
 fn copy_latest_markdown(config_path: &str) -> Result<String, String> {
+    match copy_latest_markdown_via_clipboard(config_path) {
+        Ok(content) => Ok(content),
+        Err(_) => scrape_latest_markdown_from_dom(config_path),
+    }
+}
+
+fn copy_latest_markdown_via_clipboard(config_path: &str) -> Result<String, String> {
     let clipboard_before = read_clipboard().unwrap_or_default();
     let sentinel = format!("__ASK_CHATGPT_COPY_PENDING_{}__", std::process::id());
     write_clipboard(&sentinel)?;
@@ -713,6 +760,324 @@ fn copy_latest_markdown(config_path: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&temp_path);
 
     Ok(verified_content)
+}
+
+fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> {
+    let inspect_js = r#"() => {
+        const turn = document.querySelector('.agent-turn');
+        if (!turn) return 'No agent-turn found';
+        
+        const elementToMarkdown = (element) => {
+            let markdown = '';
+            const processedSrcs = new Set();
+            const walk = (node) => {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    markdown += node.textContent;
+                    return;
+                }
+                if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+                const tag = node.tagName.toLowerCase();
+                
+                if (node.classList.contains('sr-only') || tag === 'button' || tag === 'style' || tag === 'script') {
+                    return;
+                }
+
+                // Code blocks
+                if (tag === 'pre') {
+                    const codeEl = node.querySelector('code');
+                    const langClass = codeEl ? Array.from(codeEl.classList).find(c => c.startsWith('language-')) : '';
+                    const lang = langClass ? langClass.replace('language-', '') : '';
+                    const codeText = codeEl ? codeEl.textContent : node.textContent;
+                    markdown += '\n```' + lang + '\n' + codeText + '\n```\n';
+                    return;
+                }
+
+                // Inline code
+                if (tag === 'code') {
+                    if (!node.closest('pre')) {
+                        markdown += '`' + node.textContent + '`';
+                        return;
+                    }
+                }
+
+                // Bold
+                if (tag === 'strong' || tag === 'b') {
+                    markdown += '**';
+                    for (const child of node.childNodes) walk(child);
+                    markdown += '**';
+                    return;
+                }
+
+                // Italics
+                if (tag === 'em' || tag === 'i') {
+                    markdown += '*';
+                    for (const child of node.childNodes) walk(child);
+                    markdown += '*';
+                    return;
+                }
+
+                // Links
+                if (tag === 'a') {
+                    const href = node.getAttribute('href') || '';
+                    const text = node.textContent || '';
+                    if (href && text) {
+                        markdown += '[' + text + '](' + href + ')';
+                        return;
+                    }
+                }
+
+                // Paragraphs, headers, list items
+                if (tag === 'p') markdown += '\n';
+                if (tag === 'br') markdown += '\n';
+                if (tag === 'h1') markdown += '\n# ';
+                if (tag === 'h2') markdown += '\n## ';
+                if (tag === 'h3') markdown += '\n### ';
+                if (tag === 'h4') markdown += '\n#### ';
+                if (tag === 'h5') markdown += '\n##### ';
+                if (tag === 'h6') markdown += '\n###### ';
+                if (tag === 'li') markdown += '\n* ';
+
+                // Images
+                if (tag === 'img') {
+                    const src = node.getAttribute('src') || '';
+                    const alt = node.getAttribute('alt') || 'image';
+                    if (src && !src.includes('avatar') && !src.includes('profile')) {
+                        if (processedSrcs.has(src)) return;
+                        processedSrcs.add(src);
+                        markdown += '\n![' + alt + '](' + src + ')\n';
+                        return;
+                    }
+                }
+
+                for (const child of node.childNodes) {
+                    walk(child);
+                }
+
+                if (['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li'].includes(tag)) {
+                    markdown += '\n';
+                }
+            };
+
+            walk(element);
+            return markdown.trim().replace(/\n{3,}/g, '\n\n');
+        };
+        
+        return elementToMarkdown(turn);
+    }"#;
+
+    let res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": inspect_js
+        }),
+    )?;
+
+    let val = parse_script_result(&res)?;
+    let content = val
+        .as_str()
+        .ok_or_else(|| "DOM scraper returned non-string result".to_string())?
+        .to_string();
+
+    if content == "No agent-turn found" {
+        return Err("No assistant message (.agent-turn) found on page".to_string());
+    }
+
+    Ok(content)
+}
+
+fn download_images_from_latest_message(config_path: &str, verbose: bool) -> Result<(), String> {
+    if verbose {
+        println!("Checking for generated images in the latest assistant response...");
+    }
+
+    let start_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": r#"() => {
+                window.__downloaded_images_status = "pending";
+                window.__downloaded_images = null;
+                (async () => {
+                    try {
+                        const messages = document.querySelectorAll('[data-message-author-role="assistant"], .agent-turn');
+                        const latestMessage = messages[messages.length - 1];
+                        if (!latestMessage) {
+                            window.__downloaded_images = [];
+                            window.__downloaded_images_status = "success";
+                            return;
+                        }
+                        
+                        const imgs = Array.from(latestMessage.querySelectorAll('img'));
+                        const seenSrcs = new Set();
+                        const candidateImgs = imgs.filter(img => {
+                            const src = img.src || '';
+                            if (src.includes('avatar') || src.includes('profile')) return false;
+                            const width = img.naturalWidth || img.width || 0;
+                            const height = img.naturalHeight || img.height || 0;
+                            if (width > 0 && width < 100) return false;
+                            if (height > 0 && height < 100) return false;
+                            if (!src.startsWith('http') && !src.startsWith('blob:')) return false;
+                            if (seenSrcs.has(src)) return false;
+                            seenSrcs.add(src);
+                            return true;
+                        });
+
+                        const imagesData = [];
+                        for (let i = 0; i < candidateImgs.length; i++) {
+                            const img = candidateImgs[i];
+                            try {
+                                if (!img.complete) {
+                                    await new Promise((resolve) => {
+                                        img.addEventListener('load', resolve);
+                                        img.addEventListener('error', resolve);
+                                        setTimeout(resolve, 10000);
+                                    });
+                                }
+
+                                let dataUrl = "";
+                                try {
+                                    const response = await fetch(img.src);
+                                    const blob = await response.blob();
+                                    dataUrl = await new Promise((resolve, reject) => {
+                                        const reader = new FileReader();
+                                        reader.onloadend = () => resolve(reader.result);
+                                        reader.onerror = reject;
+                                        reader.readAsDataURL(blob);
+                                    });
+                                } catch (fetchErr) {
+                                    const canvas = document.createElement('canvas');
+                                    canvas.width = img.naturalWidth || img.width || 512;
+                                    canvas.height = img.naturalHeight || img.height || 512;
+                                    const ctx = canvas.getContext('2d');
+                                    ctx.drawImage(img, 0, 0);
+                                    dataUrl = canvas.toDataURL('image/png');
+                                }
+
+                                if (dataUrl && dataUrl.startsWith('data:image/')) {
+                                    imagesData.push({
+                                        index: i,
+                                        src: img.src,
+                                        alt: img.alt || "",
+                                        dataUrl: dataUrl
+                                    });
+                                }
+                            } catch (err) {
+                                // ignore
+                            }
+                        }
+                        window.__downloaded_images = imagesData;
+                        window.__downloaded_images_status = "success";
+                    } catch (e) {
+                        window.__downloaded_images_status = "error: " + e.message;
+                    }
+                })();
+                return { ok: true };
+            }"#
+        }),
+    )?;
+
+    let start_parsed = parse_script_result(&start_res)?;
+    if !start_parsed["ok"].as_bool().unwrap_or(false) {
+        return Err("Failed to initiate image scanning script".to_string());
+    }
+
+    let mut wait_cycles = 0;
+    let mut status = String::from("pending");
+    while status == "pending" && wait_cycles < 150 {
+        thread::sleep(Duration::from_millis(100));
+        let check_res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => window.__downloaded_images_status || 'pending'"
+            }),
+        )?;
+        if let Some(s) = parse_script_result(&check_res).ok().and_then(|p| p.as_str().map(|str_ref| str_ref.to_string())) {
+            status = s;
+        }
+        wait_cycles += 1;
+    }
+
+    if status.starts_with("error:") {
+        return Err(format!("Image scanning failed: {}", status));
+    }
+
+    if status == "pending" {
+        return Err("Timed out waiting for images to download in browser".to_string());
+    }
+
+    let get_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": r#"() => {
+                const res = window.__downloaded_images || [];
+                delete window.__downloaded_images;
+                delete window.__downloaded_images_status;
+                return res;
+            }"#
+        }),
+    )?;
+
+    let parsed = parse_script_result(&get_res)?;
+    let images = match parsed.as_array() {
+        Some(arr) => arr,
+        None => return Ok(()),
+    };
+
+    if images.is_empty() {
+        if verbose {
+            println!("No generated images found in the latest response.");
+        }
+        return Ok(());
+    }
+
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    std::fs::create_dir_all("target")
+        .map_err(|e| format!("Failed to create target/ directory: {}", e))?;
+
+    for (idx, img) in images.iter().enumerate() {
+        let data_url = match img["dataUrl"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let parts: Vec<&str> = data_url.splitn(2, ',').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let header = parts[0];
+        let base64_data = parts[1];
+
+        let ext = if header.contains("image/png") {
+            "png"
+        } else if header.contains("image/jpeg") || header.contains("image/jpg") {
+            "jpg"
+        } else if header.contains("image/webp") {
+            "webp"
+        } else {
+            "png"
+        };
+
+        let decoded = general_purpose::STANDARD
+            .decode(base64_data)
+            .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
+
+        let file_name = format!("target/generated_{}_{}.{}", epoch, idx, ext);
+        std::fs::write(&file_name, decoded)
+            .map_err(|e| format!("Failed to write image file {}: {}", file_name, e))?;
+
+        println!("📥 Downloaded and saved generated image to: {}", file_name);
+    }
+
+    Ok(())
 }
 
 fn ensure_chatgpt_tab(
@@ -817,23 +1182,20 @@ fn ensure_chatgpt_tab(
 
         match chatgpt_page {
             Some(page) => {
-                if page.selected {
-                    if verbose {
-                        println!("Found ChatGPT tab (selected).");
-                    }
-                } else {
-                    if verbose {
-                        println!("Found ChatGPT tab (ID: {}). Selecting tab...", page.id);
-                    }
-                    call_mcp_tool(
-                        config_path,
-                        "select_page",
-                        serde_json::json!({
-                            "pageId": page.id,
-                            "bringToFront": !headless
-                        }),
-                    )?;
+                if verbose {
+                    println!(
+                        "Found ChatGPT tab (ID: {}, selected: {}). Selecting/focusing...",
+                        page.id, page.selected
+                    );
                 }
+                call_mcp_tool(
+                    config_path,
+                    "select_page",
+                    serde_json::json!({
+                        "pageId": page.id,
+                        "bringToFront": !headless
+                    }),
+                )?;
             }
             None => {
                 // No ChatGPT tab. If there is only one blank tab, we navigate it. Otherwise, open a new page.
@@ -874,28 +1236,19 @@ fn ensure_chatgpt_tab(
     }
     for attempt in 0..90 {
         if attempt > 0 && attempt % 10 == 0 {
-            if let Ok(list_res) = call_mcp_tool(config_path, "list_pages", serde_json::json!({})) {
-                if let Some(text) = list_res
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|obj| obj.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    if let Some(page) = parse_pages(text)
-                        .iter()
-                        .find(|p| p.url.contains("chatgpt.com"))
-                    {
-                        let _ = call_mcp_tool(
-                            config_path,
-                            "select_page",
-                            serde_json::json!({
-                                "pageId": page.id,
-                                "bringToFront": !headless
-                            }),
-                        );
-                    }
-                }
+            let page_opt = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))
+                .ok()
+                .and_then(|res| res.get("content").and_then(|c| c.as_array()).and_then(|arr| arr.first()).and_then(|obj| obj.get("text")).and_then(|t| t.as_str()).map(|t| t.to_string()))
+                .and_then(|text| parse_pages(&text).into_iter().find(|p| p.url.contains("chatgpt.com")));
+            if let Some(page) = page_opt {
+                let _ = call_mcp_tool(
+                    config_path,
+                    "select_page",
+                    serde_json::json!({
+                        "pageId": page.id,
+                        "bringToFront": !headless
+                    }),
+                );
             }
         }
 
@@ -992,14 +1345,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match copy_latest_markdown(&config_path) {
                         Ok(markdown) => {
                             if let Some(ref output_path) = cli.output {
-                                if let Err(e) = std::fs::write(output_path, &markdown) {
+                                let _ = std::fs::write(output_path, &markdown).map_err(|e| {
                                     eprintln!("Error writing output file: {}", e);
                                     std::process::exit(1);
-                                }
+                                });
                             }
                             if let Err(e) = render_markdown(&markdown, use_glow) {
                                 eprintln!("Error rendering Markdown: {}", e);
                                 std::process::exit(1);
+                            }
+                            if let Err(e) =
+                                download_images_from_latest_message(&config_path, cli.verbose)
+                            {
+                                eprintln!("Error downloading images: {}", e);
                             }
                         }
                         Err(e) => {
@@ -1036,14 +1394,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match copy_latest_markdown(&config_path) {
                     Ok(markdown) => {
                         if let Some(ref output_path) = cli.output {
-                            if let Err(e) = std::fs::write(output_path, &markdown) {
+                            let _ = std::fs::write(output_path, &markdown).map_err(|e| {
                                 eprintln!("Error writing output file: {}", e);
                                 std::process::exit(1);
-                            }
+                            });
                         }
                         if let Err(e) = render_markdown(&markdown, use_glow) {
                             eprintln!("Error rendering Markdown: {}", e);
                             std::process::exit(1);
+                        }
+                        if let Err(e) =
+                            download_images_from_latest_message(&config_path, cli.verbose)
+                        {
+                            eprintln!("Error downloading images: {}", e);
                         }
                     }
                     Err(e) => {
@@ -1073,6 +1436,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => println!(
                         "Warning: We still detected a login button on the page. You might not be fully logged in. Please verify."
                     ),
+                }
+                return Ok(());
+            }
+            Commands::Dump => {
+                let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
+                println!("All pages: {:?}", list_res);
+                if let Err(e) = ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose) {
+                    eprintln!("Error ensuring ChatGPT tab: {}", e);
+                    std::process::exit(1);
+                }
+                let url_res = call_mcp_tool(
+                    &config_path,
+                    "evaluate_script",
+                    serde_json::json!({
+                        "function": "() => window.location.href"
+                    }),
+                )?;
+                println!("Current page URL: {:?}", parse_script_result(&url_res));
+                let res = call_mcp_tool(
+                    &config_path,
+                    "evaluate_script",
+                    serde_json::json!({
+                        "function": "() => document.body.innerHTML"
+                    }),
+                )?;
+                let html = parse_script_result(&res)?
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                std::fs::create_dir_all("target").unwrap();
+                std::fs::write("target/dump.html", html)?;
+                println!("Dumped HTML to target/dump.html");
+                return Ok(());
+            }
+            Commands::Screenshot => {
+                if let Err(e) = ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose) {
+                    eprintln!("Error ensuring ChatGPT tab: {}", e);
+                    std::process::exit(1);
+                }
+                let res = call_mcp_tool(&config_path, "take_screenshot", serde_json::json!({}))?;
+
+                let mut saved = false;
+                if let Some(arr) = res.get("content").and_then(|c| c.as_array()) {
+                    for item in arr {
+                        if let Some(data) = item.get("type")
+                            .filter(|t| t.as_str() == Some("image"))
+                            .and_then(|_| item.get("data"))
+                            .and_then(|d| d.as_str())
+                        {
+                            use base64::{Engine as _, engine::general_purpose::STANDARD};
+                            match STANDARD.decode(data.trim()) {
+                                Ok(bytes) => {
+                                    std::fs::create_dir_all("target").unwrap();
+                                    std::fs::write("target/screenshot.png", bytes)?;
+                                    println!("Saved screenshot to target/screenshot.png");
+                                    saved = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to decode base64 image data: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !saved {
+                    eprintln!(
+                        "Could not find any image item in the tool response content. Full response: {:?}",
+                        res
+                    );
                 }
                 return Ok(());
             }
@@ -1127,7 +1560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config_path,
         "evaluate_script",
         serde_json::json!({
-            "function": "() => document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+            "function": "() => document.querySelectorAll('[data-message-author-role=\"assistant\"], .agent-turn').length"
         }),
     )?;
     let initial_assistant_count = parse_script_result(&count_res)
@@ -1136,39 +1569,158 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0) as usize;
 
     if cli.verbose {
-        println!("Focusing input field...");
+        println!("Setting prompt text and submitting...");
     }
-    call_mcp_tool(
+    let set_and_submit_js = format!(
+        "() => {{
+            window.__submit_status = 'pending';
+            (async () => {{
+                try {{
+                    const el = document.getElementById('prompt-textarea');
+                    if (!el) {{
+                        window.__submit_status = 'error: textarea not found';
+                        return;
+                    }}
+                    el.focus();
+                    
+                    const value = {};
+                    el.focus();
+                    
+                    // Select all content inside el so that whatever we insert replaces it
+                    try {{
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    }} catch (e) {{}}
+                    
+                    let pasted = false;
+                    try {{
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.setData('text/plain', value);
+                        const event = new ClipboardEvent('paste', {{
+                            bubbles: true,
+                            cancelable: true
+                        }});
+                        Object.defineProperty(event, 'clipboardData', {{
+                            value: dataTransfer,
+                            writable: false,
+                            configurable: true
+                        }});
+                        el.dispatchEvent(event);
+                        
+                        // Check if text was actually inserted successfully
+                        if (el.textContent && el.textContent.trim().length > 0) {{
+                            pasted = true;
+                        }}
+                    }} catch (e) {{}}
+                    
+                    if (!pasted) {{
+                        // Fallback to execCommand('insertText') which naturally dispatches input/beforeinput
+                        const success = document.execCommand('insertText', false, value);
+                        if (!success) {{
+                            if (typeof el.value !== 'undefined') {{
+                                el.value = value;
+                                if (el._valueTracker) {{
+                                    el._valueTracker.setValue('');
+                                }}
+                            }} else {{
+                                el.innerText = value;
+                            }}
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                    }}
+                    
+                    const findAndClickSendButton = () => {{
+                        const selectors = [
+                            '[data-testid=\"send-button\"]',
+                            '#composer-submit-button',
+                            'button[aria-label*=\"Send\"]',
+                            'button[aria-label*=\"傳送\"]',
+                            'button[aria-label*=\"发送\"]'
+                        ];
+                        
+                        let btn = null;
+                        for (const s of selectors) {{
+                            btn = document.querySelector(s);
+                            if (btn) break;
+                        }}
+                        
+                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {{
+                            btn.click();
+                            return {{ ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') }};
+                        }}
+                        return null;
+                    }};
+                    
+                    let result = findAndClickSendButton();
+                    if (result) {{
+                        window.__submit_status = 'success:' + JSON.stringify(result);
+                        return;
+                    }}
+                    
+                    for (let i = 0; i < 30; i++) {{
+                        await new Promise(r => setTimeout(r, 100));
+                        result = findAndClickSendButton();
+                        if (result) {{
+                            window.__submit_status = 'success:' + JSON.stringify(result);
+                            return;
+                        }}
+                    }}
+                    
+                    window.__submit_status = 'error: Send button did not become active/enabled';
+                }} catch (e) {{
+                    window.__submit_status = 'error: ' + e.message;
+                }}
+            }})();
+            return true;
+        }}",
+        serde_json::to_string(&prompt).unwrap()
+    );
+
+    let start_res = call_mcp_tool(
         &config_path,
         "evaluate_script",
         serde_json::json!({
-            "function": "() => { const el = document.getElementById('prompt-textarea'); if (el) { el.focus(); return true; } return false; }"
+            "function": set_and_submit_js
         }),
     )?;
+
+    let start_parsed = parse_script_result(&start_res)?;
+    if !start_parsed.as_bool().unwrap_or(false) {
+        return Err("Failed to initiate text entry and submission script".into());
+    }
+
+    let mut wait_cycles = 0;
+    let mut status = String::from("pending");
+    while status == "pending" && wait_cycles < 50 {
+        thread::sleep(Duration::from_millis(100));
+        let check_res = call_mcp_tool(
+            &config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => window.__submit_status || 'pending'"
+            }),
+        )?;
+        if let Some(s) = parse_script_result(&check_res).ok().and_then(|p| p.as_str().map(|str_ref| str_ref.to_string())) {
+            status = s;
+        }
+        wait_cycles += 1;
+    }
+
+    if status.starts_with("error:") {
+        return Err(format!("Text entry or submission failed: {}", status).into());
+    }
+
+    if status == "pending" {
+        return Err("Timed out waiting for send button to activate and submit".into());
+    }
 
     if cli.verbose {
-        println!("Typing your prompt...");
+        println!("Prompt submitted successfully: {}", status);
     }
-    call_mcp_tool(
-        &config_path,
-        "type_text",
-        serde_json::json!({
-            "text": prompt
-        }),
-    )?;
-
-    thread::sleep(Duration::from_millis(500));
-
-    if cli.verbose {
-        println!("Submitting...");
-    }
-    call_mcp_tool(
-        &config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": "() => { const btn = document.querySelector('[data-testid=\"send-button\"]') || document.getElementById('composer-submit-button'); if (btn) { btn.click(); return true; } return false; }"
-        }),
-    )?;
 
     if cli.verbose {
         println!("Waiting for ChatGPT response...");
@@ -1208,7 +1760,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return rect.width > 0 && rect.height > 0;
                     }};
                     
-                    const messages = document.querySelectorAll('[data-message-author-role="assistant"]');
+                    const messages = document.querySelectorAll('[data-message-author-role="assistant"], .agent-turn');
                     const isNew = messages.length > {initial_assistant_count};
                     
                     if (isVisible(stopButton)) {{
@@ -1278,6 +1830,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = render_markdown(&last_markdown, use_glow) {
         eprintln!("Error rendering Markdown: {}", e);
+    }
+
+    if finished {
+        let _ = download_images_from_latest_message(&config_path, cli.verbose).map_err(|e| {
+            eprintln!("Error downloading images: {}", e);
+        });
     }
 
     // Print the URL link of the current conversation thread
