@@ -33,7 +33,7 @@ struct Cli {
         short_alias = 'V',
         action = ArgAction::Version
     )]
-    _version: bool,
+    _version: (),
 
     /// Print verbose debugging status messages.
     #[arg(long, default_value_t = false)]
@@ -50,6 +50,11 @@ struct Cli {
     /// Attach one or more local image files to the prompt (can be specified multiple times).
     #[arg(long = "image", value_name = "IMAGE_FILE", num_args = 1)]
     images: Vec<String>,
+
+    /// Attach one or more local document files (PDF, Word, Excel, text, etc.) to the prompt
+    /// (can be specified multiple times).
+    #[arg(long = "file", value_name = "FILE", num_args = 1)]
+    files: Vec<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -586,7 +591,11 @@ fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
             }),
         );
 
-        if ready_res.and_then(|res| parse_script_result(&res)).map(|parsed| parsed.as_bool().unwrap_or(false)).unwrap_or(false) {
+        if ready_res
+            .and_then(|res| parse_script_result(&res))
+            .map(|parsed| parsed.as_bool().unwrap_or(false))
+            .unwrap_or(false)
+        {
             ready = true;
             break;
         }
@@ -619,7 +628,11 @@ fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
             }),
         );
 
-        if element_res.and_then(|res| parse_script_result(&res)).map(|parsed| parsed.as_bool().unwrap_or(false)).unwrap_or(false) {
+        if element_res
+            .and_then(|res| parse_script_result(&res))
+            .map(|parsed| parsed.as_bool().unwrap_or(false))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(250));
@@ -1017,7 +1030,10 @@ fn download_images_from_latest_message(
                 "function": "() => window.__downloaded_images_status || 'pending'"
             }),
         )?;
-        if let Some(s) = parse_script_result(&check_res).ok().and_then(|p| p.as_str().map(|str_ref| str_ref.to_string())) {
+        if let Some(s) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|p| p.as_str().map(|str_ref| str_ref.to_string()))
+        {
             status = s;
         }
         wait_cycles += 1;
@@ -1106,16 +1122,16 @@ fn download_images_from_latest_message(
                 } else {
                     let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
                     if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("Failed to create parent directory {:?}: {}", parent, e))?;
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create parent directory {:?}: {}", parent, e)
+                        })?;
                     }
-                    let file_stem = path.file_stem()
+                    let file_stem = path
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .ok_or_else(|| "Invalid file name".to_string())?;
-                    let file_ext = path.extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or(ext);
-                    
+                    let file_ext = path.extension().and_then(|e| e.to_str()).unwrap_or(ext);
+
                     if total <= 1 {
                         parent.join(format!("{}.{}", file_stem, file_ext))
                     } else {
@@ -1133,7 +1149,10 @@ fn download_images_from_latest_message(
         std::fs::write(&file_path, decoded)
             .map_err(|e| format!("Failed to write image file {:?}: {}", file_path, e))?;
 
-        println!("📥 Downloaded and saved generated image to: {}", file_path.to_string_lossy());
+        println!(
+            "📥 Downloaded and saved generated image to: {}",
+            file_path.to_string_lossy()
+        );
     }
 
     Ok(())
@@ -1142,81 +1161,167 @@ fn download_images_from_latest_message(
 /// Display an image in the terminal using kitty's icat protocol.
 /// Silently skips if kitty icat is not available.
 fn display_image_in_terminal(image_path: &str) {
-    let _ = Command::new("kitty")
-        .args(["icat", image_path])
-        .status();
+    let _ = Command::new("kitty").args(["icat", image_path]).status();
 }
 
-/// Encode a local image file as a base64 data URL.
-fn image_to_data_url(path: &str) -> Result<String, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("Failed to read image file '{}': {}", path, e))?;
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png")
-        .to_lowercase();
-    let mime = match ext.as_str() {
+/// Map a file extension to a MIME type. Covers common image and document formats.
+fn mime_type_for_extension(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        // Images
+        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
-        _ => "image/png",
-    };
-    let b64 = general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{};base64,{}", mime, b64))
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        // Documents
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "odp" => "application/vnd.oasis.opendocument.presentation",
+        "rtf" => "application/rtf",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "yaml" | "yml" => "text/yaml",
+        "ts" => "text/typescript",
+        "tsx" => "text/typescript",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "jsx" => "text/javascript",
+        "css" => "text/css",
+        "py" => "text/x-python",
+        "rb" => "text/x-ruby",
+        "go" => "text/x-go",
+        "rs" => "text/x-rust",
+        "java" => "text/x-java",
+        "kt" => "text/x-kotlin",
+        "c" => "text/x-c",
+        "h" => "text/x-c",
+        "cpp" | "cc" | "cxx" => "text/x-c++",
+        "hpp" => "text/x-c++",
+        "cs" => "text/x-csharp",
+        "swift" => "text/x-swift",
+        "php" => "text/x-php",
+        "sh" => "application/x-sh",
+        "bash" => "application/x-sh",
+        "zsh" => "application/x-sh",
+        "sql" => "application/sql",
+        "toml" => "application/toml",
+        "ini" => "text/plain",
+        "log" => "text/plain",
+        // Archives
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "bz2" => "application/x-bzip2",
+        "7z" => "application/x-7z-compressed",
+        // Audio
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        // Video
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
 }
 
-/// Upload local image files to the ChatGPT prompt textarea using the DataTransfer API.
-/// Returns an error string if any image fails to upload.
-fn upload_images_to_chatgpt(
+/// Upload local image and/or document files to the ChatGPT prompt composer using the
+/// DataTransfer API against the page's file input element.
+/// Returns an error string if any attachment fails to upload.
+fn upload_attachments_to_chatgpt(
     config_path: &str,
     image_paths: &[String],
+    file_paths: &[String],
     verbose: bool,
 ) -> Result<(), String> {
-    if image_paths.is_empty() {
+    let total = image_paths.len() + file_paths.len();
+    if total == 0 {
         return Ok(());
     }
 
     if verbose {
-        println!("Attaching {} image(s) to the prompt...", image_paths.len());
+        println!(
+            "Attaching {} attachment(s) ({} image(s), {} file(s)) to the prompt...",
+            total,
+            image_paths.len(),
+            file_paths.len()
+        );
     }
 
-    // Build a JSON array of { name, dataUrl } objects
+    // Build a JSON array of { name, mime, base64 } objects. Images first, then other files.
+    // We pass raw base64 + mime and decode in JS to avoid `fetch(data:...)` which ChatGPT's
+    // Content-Security-Policy blocks (results in "Failed to fetch").
     let mut files_json = Vec::new();
-    for path in image_paths {
-        let data_url = image_to_data_url(path)?;
+    for path in image_paths.iter().chain(file_paths.iter()) {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let mime = mime_type_for_extension(&ext);
+        let b64 = general_purpose::STANDARD.encode(&bytes);
         let file_name = Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("image.png")
+            .unwrap_or("attachment")
             .to_string();
         files_json.push(serde_json::json!({
             "name": file_name,
-            "dataUrl": data_url
+            "mime": mime,
+            "base64": b64
         }));
     }
 
     let files_json_str = serde_json::to_string(&files_json)
-        .map_err(|e| format!("Failed to serialize image data: {}", e))?;
+        .map_err(|e| format!("Failed to serialize attachment data: {}", e))?;
     // Build JS without raw strings to avoid r#"..."# termination conflicts
     let js = "() => {\n".to_string()
         + "    window.__upload_images_status = 'pending';\n"
         + "    (async () => {\n"
         + "        try {\n"
         + &format!("            const filesData = {};\n", files_json_str)
-        + "            const fileObjects = await Promise.all(filesData.map(async (f) => {\n"
-        + "                const res = await fetch(f.dataUrl);\n"
-        + "                const blob = await res.blob();\n"
+        + "            const decodeB64 = (b64) => {\n"
+        + "                const bin = atob(b64);\n"
+        + "                const len = bin.length;\n"
+        + "                const bytes = new Uint8Array(len);\n"
+        + "                for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);\n"
+        + "                return bytes;\n"
+        + "            };\n"
+        + "            const fileObjects = filesData.map((f) => {\n"
+        + "                const bytes = decodeB64(f.base64);\n"
+        + "                const blob = new Blob([bytes], { type: f.mime || 'application/octet-stream' });\n"
         + "                return new File([blob], f.name, { type: blob.type });\n"
-        + "            }));\n"
+        + "            });\n"
         + "            const el = document.getElementById('prompt-textarea');\n"
         + "            if (!el) {\n"
         + "                window.__upload_images_status = 'error: textarea not found';\n"
         + "                return;\n"
         + "            }\n"
         + "            el.focus();\n"
-        + "            const fileInput = document.querySelector('input[type=\"file\"]');\n"
+        + "            const fileInputs = Array.from(document.querySelectorAll('input[type=\"file\"]'));\n"
+        + "            // Prefer a file input whose accept attribute allows arbitrary files/documents;\n"
+        + "            // fall back to the first available file input.\n"
+        + "            const fileInput = fileInputs.find(i => !i.accept || /\\*|\\/|pdf|document|word|excel|powerpoint|octet/i.test(i.accept)) || fileInputs[0];\n"
         + "            if (fileInput) {\n"
         + "                const dt = new DataTransfer();\n"
         + "                for (const f of fileObjects) dt.items.add(f);\n"
@@ -1254,10 +1359,10 @@ fn upload_images_to_chatgpt(
         return Err("Failed to initiate image upload script".to_string());
     }
 
-    // Poll for completion
+    // Poll for completion. Allow up to ~60s for large document uploads.
     let mut wait_cycles = 0;
     let mut status = String::from("pending");
-    while status == "pending" && wait_cycles < 150 {
+    while status == "pending" && wait_cycles < 300 {
         thread::sleep(Duration::from_millis(200));
         let check_res = call_mcp_tool(
             config_path,
@@ -1448,8 +1553,19 @@ fn ensure_chatgpt_tab(
         if attempt > 0 && attempt % 10 == 0 {
             let page_opt = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))
                 .ok()
-                .and_then(|res| res.get("content").and_then(|c| c.as_array()).and_then(|arr| arr.first()).and_then(|obj| obj.get("text")).and_then(|t| t.as_str()).map(|t| t.to_string()))
-                .and_then(|text| parse_pages(&text).into_iter().find(|p| p.url.contains("chatgpt.com")));
+                .and_then(|res| {
+                    res.get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|obj| obj.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.to_string())
+                })
+                .and_then(|text| {
+                    parse_pages(&text)
+                        .into_iter()
+                        .find(|p| p.url.contains("chatgpt.com"))
+                });
             if let Some(page) = page_opt {
                 let _ = call_mcp_tool(
                     config_path,
@@ -1564,9 +1680,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error rendering Markdown: {}", e);
                                 std::process::exit(1);
                             }
-                            if let Err(e) =
-                                download_images_from_latest_message(&config_path, cli.image_output.as_deref(), cli.verbose)
-                            {
+                            if let Err(e) = download_images_from_latest_message(
+                                &config_path,
+                                cli.image_output.as_deref(),
+                                cli.verbose,
+                            ) {
                                 eprintln!("Error downloading images: {}", e);
                             }
                         }
@@ -1613,9 +1731,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Error rendering Markdown: {}", e);
                             std::process::exit(1);
                         }
-                        if let Err(e) =
-                            download_images_from_latest_message(&config_path, cli.image_output.as_deref(), cli.verbose)
-                        {
+                        if let Err(e) = download_images_from_latest_message(
+                            &config_path,
+                            cli.image_output.as_deref(),
+                            cli.verbose,
+                        ) {
                             eprintln!("Error downloading images: {}", e);
                         }
                     }
@@ -1690,7 +1810,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut saved = false;
                 if let Some(arr) = res.get("content").and_then(|c| c.as_array()) {
                     for item in arr {
-                        if let Some(data) = item.get("type")
+                        if let Some(data) = item
+                            .get("type")
                             .filter(|t| t.as_str() == Some("image"))
                             .and_then(|_| item.get("data"))
                             .and_then(|d| d.as_str())
@@ -1772,10 +1893,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    // Upload any attached images before counting messages (so the UI is ready)
-    if !cli.images.is_empty() {
-        if let Err(e) = upload_images_to_chatgpt(&config_path, &cli.images, cli.verbose) {
-            eprintln!("Error attaching images: {}", e);
+    // Upload any attached images/files before counting messages (so the UI is ready)
+    if !cli.images.is_empty() || !cli.files.is_empty() {
+        if let Err(e) =
+            upload_attachments_to_chatgpt(&config_path, &cli.images, &cli.files, cli.verbose)
+        {
+            eprintln!("Error attaching images/files: {}", e);
             std::process::exit(1);
         }
     }
@@ -1885,8 +2008,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         window.__submit_status = 'success:' + JSON.stringify(result);
                         return;
                     }}
-                    
-                    for (let i = 0; i < 30; i++) {{
+
+                    for (let i = 0; i < 150; i++) {{
                         await new Promise(r => setTimeout(r, 100));
                         result = findAndClickSendButton();
                         if (result) {{
@@ -1929,7 +2052,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "function": "() => window.__submit_status || 'pending'"
             }),
         )?;
-        if let Some(s) = parse_script_result(&check_res).ok().and_then(|p| p.as_str().map(|str_ref| str_ref.to_string())) {
+        if let Some(s) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|p| p.as_str().map(|str_ref| str_ref.to_string()))
+        {
             status = s;
         }
         wait_cycles += 1;
@@ -2058,7 +2184,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if finished {
-        let _ = download_images_from_latest_message(&config_path, cli.image_output.as_deref(), cli.verbose).map_err(|e| {
+        let _ = download_images_from_latest_message(
+            &config_path,
+            cli.image_output.as_deref(),
+            cli.verbose,
+        )
+        .map_err(|e| {
             eprintln!("Error downloading images: {}", e);
         });
     }

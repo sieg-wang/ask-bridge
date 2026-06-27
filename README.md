@@ -17,6 +17,7 @@
 - **思考動畫**：等待 ChatGPT 回覆時，在終端機顯示旋轉 spinner，開始輸出內容後自動清除。
 - **智慧分頁管理**：可重用既有 ChatGPT 分頁、聚焦分頁，或開啟新分頁，避免分頁過度增加。
 - **Pipe 與 stdin 支援**：支援透過 standard input 傳入 prompt，例如 `cat report.txt | ask "summarize this"`。
+- **圖片與文件上傳**：可透過 `--image` 附上本機圖片，或透過 `--file` 附上文件（PDF、Word、Excel、純文字、Markdown、JSON 等皆可），一次可指定多個檔案。
 - **預設安靜模式與 verbose 模式**：預設只輸出最終回覆；加上 `--verbose` 可顯示背景瀏覽器控制流程。
 - **版本資訊**：使用 `-v` 或 `--version` 顯示目前版本號。
 
@@ -150,7 +151,42 @@ echo "用一句話解釋 quantum computing" | ask
 cat src/main.rs | ask "這段 Rust code 有記憶體洩漏風險嗎？"
 ```
 
-### 8. 只開啟 ChatGPT
+### 8. 附上圖片或文件
+
+除了把檔案內容透過 pipe 傳入 prompt，你也可以直接把本機檔案當作附件上傳給 ChatGPT。
+
+#### 附上圖片
+
+使用 `--image` 附上一或多張本機圖片（可重複指定）：
+
+```bash
+ask "請描述這張圖片的內容。" --image screenshot.png
+ask "比較這兩張圖的差異。" --image v1.png --image v2.png
+```
+
+支援的格式包含 PNG、JPEG、GIF、WebP、SVG、BMP 等。
+
+#### 附上文件
+
+使用 `--file` 附上一或多份本機文件（可重複指定），例如 PDF、Word、Excel、PowerPoint、純文字、Markdown、CSV、JSON、程式碼等：
+
+```bash
+ask "請摘要這份 PDF 的重點。" --file report.pdf
+ask "這份 CSV 總共有幾筆資料？" --file data.csv
+ask "幫我檢查這段程式碼有沒有問題。" --file src/main.rs
+```
+
+也可以同時附上圖片與文件：
+
+```bash
+ask "請對照這張設計圖與規格文件，指出不一致的地方。" --image design.png --file spec.docx
+```
+
+#### 顯示上傳結果
+
+ChatGPT 回覆後，可使用 `-i` / `--image-output` 指定 ChatGPT 生成圖片的下載路徑（資料夾或檔案路徑）。
+
+### 9. 只開啟 ChatGPT
 
 若只想快速開啟瀏覽器並進入 ChatGPT：
 
