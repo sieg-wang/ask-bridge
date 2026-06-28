@@ -1171,8 +1171,9 @@ fn display_image_in_terminal(image_path: &str) {
 }
 
 /// Map a file extension to a MIME type. Covers common image and document formats.
+/// `ext` is expected to already be lowercased by the caller.
 fn mime_type_for_extension(ext: &str) -> &'static str {
-    match ext.to_lowercase().as_str() {
+    match ext {
         // Images
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -1325,9 +1326,20 @@ fn upload_attachments_to_chatgpt(
         + "            }\n"
         + "            el.focus();\n"
         + "            const fileInputs = Array.from(document.querySelectorAll('input[type=\"file\"]'));\n"
-        + "            // Prefer a file input whose accept attribute allows arbitrary files/documents;\n"
-        + "            // fall back to the first available file input.\n"
-        + "            const fileInput = fileInputs.find(i => !i.accept || /\\*|\\/|pdf|document|word|excel|powerpoint|octet/i.test(i.accept)) || fileInputs[0];\n"
+        + "            // Pick the file input whose `accept` attribute covers every attached file.\n"
+        + "            // An input accepts a file when accept is empty, contains `*/*` or a matching\n"
+        + "            // wildcard (e.g. `image/*`), or lists the file's exact MIME type.\n"
+        + "            const accepts = (input, file) => {\n"
+        + "                const acc = (input.getAttribute('accept') || '').trim();\n"
+        + "                if (!acc) return true;\n"
+        + "                const parts = acc.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\n"
+        + "                const mime = (file.type || '').toLowerCase();\n"
+        + "                const top = mime.split('/')[0];\n"
+        + "                return parts.some(p => p === '*/*' || p === mime || (p.endsWith('/*') && top && p === top + '/*'));\n"
+        + "            };\n"
+        + "            const fileInput = fileInputs.find(i => fileObjects.every(f => accepts(i, f)))\n"
+        + "                || fileInputs.find(i => !i.getAttribute('accept'))\n"
+        + "                || fileInputs[0];\n"
         + "            if (fileInput) {\n"
         + "                const dt = new DataTransfer();\n"
         + "                for (const f of fileObjects) dt.items.add(f);\n"
@@ -1362,7 +1374,7 @@ fn upload_attachments_to_chatgpt(
 
     let start_parsed = parse_script_result(&start_res)?;
     if !start_parsed.as_bool().unwrap_or(false) {
-        return Err("Failed to initiate image upload script".to_string());
+        return Err("Failed to initiate attachment upload script".to_string());
     }
 
     // Poll for completion. Allow up to ~60s for large document uploads.
@@ -1385,14 +1397,14 @@ fn upload_attachments_to_chatgpt(
     }
 
     if status.starts_with("error:") {
-        return Err(format!("Image upload failed: {}", status));
+        return Err(format!("Attachment upload failed: {}", status));
     }
     if status == "pending" {
-        return Err("Timed out waiting for images to upload".to_string());
+        return Err("Timed out waiting for attachments to upload".to_string());
     }
 
     if verbose {
-        println!("Images attached successfully ({})", status);
+        println!("Attachments attached successfully ({})", status);
     }
 
     // Give the UI a moment to render the attachments before typing the prompt
@@ -1435,7 +1447,12 @@ fn switch_model(config_path: &str, model: &str, verbose: bool) -> Result<(), Str
         + "            await sleep(400);\n"
         + "        };\n"
         + "        await closeMenus();\n"
-        + "        const pill = document.querySelector('button.__composer-pill');\n"
+        + "        let pill = null;\n"
+        + "        for (let i = 0; i < 20; i++) {\n"
+        + "            pill = document.querySelector('button.__composer-pill');\n"
+        + "            if (pill) break;\n"
+        + "            await sleep(250);\n"
+        + "        }\n"
         + "        if (!pill) { window.__switch_model_status = 'error: composer pill not found'; return; }\n"
         + "        pill.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));\n"
         + "        pill.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));\n"
@@ -2183,7 +2200,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut wait_cycles = 0;
     let mut status = String::from("pending");
-    while status == "pending" && wait_cycles < 50 {
+    // JS retry loop waits up to 15s for the send button to activate; poll at least that long
+    // (plus margin) so we don't time out before the page-side retry completes.
+    while status == "pending" && wait_cycles < 180 {
         thread::sleep(Duration::from_millis(100));
         let check_res = call_mcp_tool(
             &config_path,
