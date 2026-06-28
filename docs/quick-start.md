@@ -82,6 +82,50 @@ cat README.md | ask "摘要這份文件。"
 
 若未提供 prompt argument，`ask` 會從 standard input 讀取內容。
 
+## 附上圖片或文件
+
+`ask` 支援把本機檔案當作附件直接上傳給 ChatGPT，不必透過 pipe 把內容塞進 prompt。
+
+### 附上圖片
+
+使用 `--image`（可重複指定）：
+
+```sh
+ask "請描述這張圖片。" --image screenshot.png
+ask "比較這兩張圖。" --image v1.png --image v2.png
+```
+
+### 附上文件
+
+使用 `--file`（可重複指定）附上 PDF、Word、Excel、純文字、Markdown、CSV、JSON、程式碼等文件：
+
+```sh
+ask "請摘要這份 PDF。" --file report.pdf
+ask "這份 CSV 有幾筆資料？" --file data.csv
+ask "幫我檢查這段程式碼。" --file src/main.rs
+```
+
+也可以同時附上圖片與文件：
+
+```sh
+ask "對照這張設計圖與規格文件，指出不一致處。" --image design.png --file spec.docx
+```
+
+## 切換模型
+
+使用 `--model` 在送出 prompt 前自動切換 ChatGPT 模型或思考強度（不分大小寫與標點）：
+
+```sh
+ask "用幾句話介紹 Rust。" --model GPT-5.4
+ask "證明這個數學問題。" --model o3
+ask "快速翻譯這段話。" --model 即時
+```
+
+可用名稱（視帳號權限）：
+
+- **模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
+- **思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+
 ## MCP 行為
 
 啟動時，`ask` 會把 MCP 設定寫入：
