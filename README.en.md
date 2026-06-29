@@ -219,6 +219,16 @@ ask open
 ask --provider gemini open
 ```
 
+### 11. Close the Browser Instance
+
+To close the Chrome debug profile instance managed by `ask`:
+
+```bash
+ask close
+```
+
+`close` only shuts down the `ask` Chrome instance that uses `~/.config/ask-chatgpt/chrome-profile` and listens on debug port `9223`. If that port is occupied by a non-`ask` Chrome process, it reports an error instead of closing it.
+
 ---
 
 ## ⚙️ How It Works (Under the Hood)

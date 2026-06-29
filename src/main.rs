@@ -251,6 +251,8 @@ enum Commands {
     },
     /// Open Chrome browser and wait for manual login
     Login,
+    /// Close the managed Chrome browser instance
+    Close,
     /// Dump the current browser tab HTML for debugging
     Dump,
     /// Take a screenshot of the current browser tab for debugging
@@ -340,13 +342,17 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
     Ok(config_path)
 }
 
-fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
+fn chrome_profile_path() -> Result<String, String> {
     let mut profile_dir = home::home_dir().ok_or("Could not locate home directory")?;
     profile_dir.push(".config/ask-chatgpt/chrome-profile");
     std::fs::create_dir_all(&profile_dir)
         .map_err(|e| format!("Failed to create chrome profile directory: {}", e))?;
 
-    let profile_path = profile_dir.to_string_lossy().to_string();
+    Ok(profile_dir.to_string_lossy().to_string())
+}
+
+fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
+    let profile_path = chrome_profile_path()?;
 
     if TcpStream::connect("127.0.0.1:9223").is_ok() {
         if !headless || is_debug_chrome_background(&profile_path) {
@@ -473,9 +479,14 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
     })
 }
 
-fn stop_ask_chrome_on_debug_port(profile_path: &str) -> Result<(), String> {
+fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     let profile_arg = format!("--user-data-dir={}", profile_path);
-    let ask_pids: Vec<String> = debug_port_listener_pids()
+    let listener_pids = debug_port_listener_pids();
+    if listener_pids.is_empty() {
+        return Ok(false);
+    }
+
+    let ask_pids: Vec<String> = listener_pids
         .into_iter()
         .filter(|pid| {
             process_command(pid)
@@ -492,17 +503,21 @@ fn stop_ask_chrome_on_debug_port(profile_path: &str) -> Result<(), String> {
     }
 
     for pid in ask_pids {
-        let _ = Command::new("kill").arg(&pid).status();
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
     }
 
     for _ in 0..50 {
         if TcpStream::connect("127.0.0.1:9223").is_err() {
-            return Ok(());
+            return Ok(true);
         }
         thread::sleep(Duration::from_millis(100));
     }
 
     Err("Timed out waiting for existing ask Chrome to stop".to_string())
+}
+
+fn stop_ask_chrome_on_debug_port(profile_path: &str) -> Result<(), String> {
+    close_ask_chrome_on_debug_port(profile_path).map(|_| ())
 }
 
 fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
@@ -696,6 +711,12 @@ mod tests {
         let cli = Cli::try_parse_from(["ask", "login", "--provider", "gemini"]).unwrap();
         assert_eq!(cli.provider, Provider::Gemini);
         assert!(matches!(cli.command, Some(Commands::Login)));
+    }
+
+    #[test]
+    fn parses_close_command() {
+        let cli = Cli::try_parse_from(["ask", "close"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Close)));
     }
 
     #[test]
@@ -2407,6 +2428,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => cli.headless, // Respect --headless (defaults to true) for all other commands (including Open and Get)
     };
 
+    if matches!(cli.command, Some(Commands::Close)) {
+        let profile_path = match chrome_profile_path() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Error locating Chrome profile: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        match close_ask_chrome_on_debug_port(&profile_path) {
+            Ok(true) => println!("Closed ask Chrome browser instance."),
+            Ok(false) => println!("No ask Chrome browser instance is running."),
+            Err(e) => {
+                eprintln!("Error closing ask Chrome browser instance: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        return Ok(());
+    }
+
     let config_path = match write_mcp_config(!cli.verbose, is_headless) {
         Ok(path) => path,
         Err(e) => {
@@ -2541,6 +2583,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            Commands::Close => unreachable!("close command is handled before Chrome startup"),
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);

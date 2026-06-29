@@ -137,6 +137,16 @@ ask --provider gemini "用幾句話介紹 Rust。" --model "3.5 Flash"
 - **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
 - **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 
+## 關閉瀏覽器 instance
+
+執行：
+
+```sh
+ask close
+```
+
+`close` 只會關閉使用本專案專屬 Chrome profile 且監聽 debug port `9223` 的瀏覽器 instance；如果沒有執行中的 `ask` Chrome，會直接回報沒有 instance 正在執行。
+
 ## MCP 行為
 
 啟動時，`ask` 會把 MCP 設定寫入：

@@ -224,6 +224,16 @@ ask open
 ask --provider gemini open
 ```
 
+### 11. 關閉瀏覽器 instance
+
+若要關閉 `ask` 管理的 Chrome debug profile instance：
+
+```bash
+ask close
+```
+
+`close` 只會關閉使用 `~/.config/ask-chatgpt/chrome-profile` 且監聽 debug port `9223` 的 `ask` Chrome instance；若該 port 被非 `ask` Chrome 程序占用，會回報錯誤而不會關閉它。
+
 ## 運作原理
 
 1. **瀏覽器初始化**：`ask` 會檢查 Chrome 是否正在監聽 debug port `9223`。若沒有，會以專屬 profile 目錄 `~/.config/ask-chatgpt/chrome-profile` 啟動 Google Chrome。
