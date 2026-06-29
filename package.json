@@ -1,7 +1,7 @@
 {
   "name": "ask-chatgpt",
   "version": "0.1.0",
-  "description": "Automate ChatGPT from the command line through Chrome.",
+  "description": "Automate ChatGPT or Gemini from the command line through Chrome.",
   "bin": {
     "ask": "npm/cli.cjs"
   },
@@ -23,6 +23,7 @@
   },
   "keywords": [
     "chatgpt",
+    "gemini",
     "chrome",
     "rust",
     "cli"

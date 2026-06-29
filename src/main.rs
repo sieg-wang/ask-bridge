@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use mcp_cli::McpClient;
 use serde_json::Value;
+use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -9,20 +10,189 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Provider {
+    #[value(name = "chatgpt")]
+    ChatGpt,
+    #[value(name = "gemini")]
+    Gemini,
+}
+
+impl Provider {
+    fn display_name(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "ChatGPT",
+            Provider::Gemini => "Gemini",
+        }
+    }
+
+    fn home_url(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "https://chatgpt.com/",
+            Provider::Gemini => "https://gemini.google.com/app",
+        }
+    }
+
+    fn owns_url(self, url: &str) -> bool {
+        match self {
+            Provider::ChatGpt => url.contains("chatgpt.com"),
+            Provider::Gemini => url.contains("gemini.google.com"),
+        }
+    }
+
+    fn from_url(url: &str) -> Option<Self> {
+        [Provider::ChatGpt, Provider::Gemini]
+            .into_iter()
+            .find(|provider| provider.owns_url(url))
+    }
+
+    fn ready_check_js(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => r#"() => document.getElementById('prompt-textarea') !== null"#,
+            Provider::Gemini => {
+                r#"() => {
+                    return document.querySelector('div[role="textbox"][aria-label*="Gemini"]') !== null ||
+                           document.querySelector('rich-textarea [contenteditable="true"]') !== null ||
+                           document.querySelector('.ql-editor[contenteditable="true"]') !== null ||
+                           document.querySelector('a[href*="accounts.google.com"]') !== null ||
+                           /Sign in|登入/.test(document.body.innerText || '');
+                }"#
+            }
+        }
+    }
+
+    fn login_check_js(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => {
+                r#"() => document.querySelector('[data-testid="login-button"]') === null"#
+            }
+            Provider::Gemini => {
+                r#"() => {
+                    const composer = document.querySelector('div[role="textbox"][aria-label*="Gemini"]') ||
+                        document.querySelector('rich-textarea [contenteditable="true"]') ||
+                        document.querySelector('.ql-editor[contenteditable="true"]');
+                    const account = document.querySelector('a[href*="accounts.google.com/SignOutOptions"]') ||
+                        document.querySelector('[aria-label*="Google 帳戶"]') ||
+                        document.querySelector('[aria-label*="Google Account"]');
+                    const signIn = Array.from(document.querySelectorAll('a, button'))
+                        .some((el) => /Sign in|登入/.test([
+                            el.getAttribute('aria-label'),
+                            el.textContent
+                        ].filter(Boolean).join(' ')));
+                    return Boolean(composer) && (Boolean(account) || !signIn);
+                }"#
+            }
+        }
+    }
+
+    fn assistant_selector(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "[data-message-author-role=\"assistant\"], .agent-turn",
+            Provider::Gemini => "model-response",
+        }
+    }
+
+    fn latest_response_selector(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => {
+                "[data-message-author-role=\"assistant\"], .agent-turn, model-response, .model-response, [data-test-id*=\"response\"], [data-testid*=\"response\"]"
+            }
+            Provider::Gemini => "model-response",
+        }
+    }
+
+    fn response_content_selector(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "",
+            Provider::Gemini => {
+                "message-content, .markdown, structured-content-container.model-response-text"
+            }
+        }
+    }
+
+    fn composer_selectors_json(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => r##"["#prompt-textarea"]"##,
+            Provider::Gemini => {
+                r#"[
+                    "div[role=\"textbox\"][aria-label*=\"Gemini\"]",
+                    "rich-textarea [contenteditable=\"true\"]",
+                    ".ql-editor[contenteditable=\"true\"]"
+                ]"#
+            }
+        }
+    }
+
+    fn send_button_selectors_json(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => {
+                r##"[
+                    "[data-testid=\"send-button\"]",
+                    "#composer-submit-button",
+                    "button[aria-label*=\"Send\"]",
+                    "button[aria-label*=\"傳送\"]",
+                    "button[aria-label*=\"发送\"]"
+                ]"##
+            }
+            Provider::Gemini => {
+                r#"[
+                    "button[aria-label=\"傳送訊息\"]",
+                    "button[aria-label=\"Submit\"]",
+                    "button[aria-label*=\"Send\"]",
+                    "button[aria-label*=\"傳送\"]",
+                    "button[aria-label*=\"提交\"]"
+                ]"#
+            }
+        }
+    }
+
+    fn stop_button_selectors_json(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => {
+                r##"[
+                    "[data-testid=\"stop-button\"]",
+                    "#composer-stop-button",
+                    "button[aria-label=\"Stop generating\"]"
+                ]"##
+            }
+            Provider::Gemini => {
+                r#"[
+                    "button[aria-label=\"停止回覆\"]",
+                    "button[aria-label*=\"Stop\"]",
+                    "button[aria-label*=\"停止\"]"
+                ]"#
+            }
+        }
+    }
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Provider::ChatGpt => write!(f, "chatgpt"),
+            Provider::Gemini => write!(f, "gemini"),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "ask")]
 #[command(version = "0.1.0")]
 #[command(disable_version_flag = true)]
-#[command(about = "ChatGPT CLI - Ask ChatGPT from your Terminal with your subscription", long_about = None)]
+#[command(about = "AI browser CLI - Ask ChatGPT or Gemini from your Terminal with your subscription", long_about = None)]
 struct Cli {
-    /// The prompt to send to ChatGPT. If empty, reads from standard input.
+    /// The prompt to send to the selected provider. If empty, reads from standard input.
     prompt: Option<String>,
+
+    /// AI provider to automate.
+    #[arg(long, short = 'p', value_enum, global = true, default_value_t = Provider::ChatGpt)]
+    provider: Provider,
 
     /// Run Chrome in headless mode. Defaults to true.
     #[arg(long, require_equals = true, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     headless: bool,
 
-    /// Create a brand new ChatGPT session by opening a new tab and closing old ones.
+    /// Create a brand new provider session by opening a new tab and closing old ones.
     #[arg(long, default_value_t = false)]
     new: bool,
 
@@ -56,9 +226,10 @@ struct Cli {
     #[arg(long = "file", value_name = "FILE", num_args = 1)]
     files: Vec<String>,
 
-    /// Switch the ChatGPT model (or thinking level) before sending the prompt.
-    /// Examples: "GPT-5.5", "GPT-5.4", "GPT-5.3", "o3", or thinking levels such as
-    /// "即時", "中等", "高", "超高", "專業", "智慧". Matching is case- and punctuation-insensitive.
+    /// Switch the provider model before sending the prompt.
+    /// ChatGPT examples: "GPT-5.5", "GPT-5.4", "GPT-5.3", "o3", or thinking levels such as
+    /// "即時", "中等", "高", "超高", "專業", "智慧". Gemini examples: "3.5 Flash",
+    /// "3.1 Flash-Lite", or "3.1 Pro". Matching is case- and punctuation-insensitive.
     #[arg(long = "model", value_name = "MODEL")]
     model: Option<String>,
 
@@ -70,12 +241,12 @@ struct Cli {
 enum Commands {
     /// Open Chrome browser, optionally navigate to a URL, and copy the latest response
     Open {
-        /// Optional ChatGPT conversation URL to open before copying the latest response.
+        /// Optional conversation URL to open before copying the latest response.
         url: Option<String>,
     },
-    /// Retrieve the latest response from ChatGPT (defaults to headless)
+    /// Retrieve the latest response from the selected provider (defaults to headless)
     Get {
-        /// Optional ChatGPT conversation URL to fetch before copying the latest response.
+        /// Optional conversation URL to fetch before copying the latest response.
         url: Option<String>,
     },
     /// Open Chrome browser and wait for manual login
@@ -405,6 +576,49 @@ fn parse_script_result(val: &Value) -> Result<Value, String> {
     ))
 }
 
+fn tool_text(val: &Value) -> Result<String, String> {
+    val.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|text| text.to_string())
+        .ok_or_else(|| format!("Could not extract text field from tool result: {:?}", val))
+}
+
+fn take_snapshot_text(config_path: &str) -> Result<String, String> {
+    let res = call_mcp_tool(config_path, "take_snapshot", serde_json::json!({}))?;
+    tool_text(&res)
+}
+
+fn extract_snapshot_uid(line: &str) -> Option<String> {
+    let marker_pos = line.find("uid=")?;
+    let mut rest = line[marker_pos + 4..].trim_start();
+    rest = rest.trim_start_matches(['"', '\'', '[']);
+    let uid: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ']')
+        .collect();
+    if uid.is_empty() { None } else { Some(uid) }
+}
+
+fn find_snapshot_uid(snapshot: &str, include: &[&str], exclude: &[&str]) -> Option<String> {
+    snapshot.lines().find_map(|line| {
+        let lower = line.to_lowercase();
+        let includes_all = include
+            .iter()
+            .all(|needle| lower.contains(&needle.to_lowercase()));
+        let excludes_all = exclude
+            .iter()
+            .all(|needle| !lower.contains(&needle.to_lowercase()));
+        if includes_all && excludes_all {
+            extract_snapshot_uid(line)
+        } else {
+            None
+        }
+    })
+}
+
 fn is_glow_available() -> bool {
     Command::new("glow")
         .arg("--version")
@@ -458,6 +672,97 @@ fn render_markdown(markdown: &str, use_glow: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_provider_feature_support(cli: &Cli) -> Result<(), String> {
+    if cli.provider == Provider::Gemini && !cli.images.is_empty() {
+        return Err(
+            "Gemini image attachments are not supported yet. Use --file for Gemini document attachments."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_as_global_argument() {
+        let cli = Cli::try_parse_from(["ask", "--provider", "gemini", "login"]).unwrap();
+        assert_eq!(cli.provider, Provider::Gemini);
+        assert!(matches!(cli.command, Some(Commands::Login)));
+
+        let cli = Cli::try_parse_from(["ask", "login", "--provider", "gemini"]).unwrap();
+        assert_eq!(cli.provider, Provider::Gemini);
+        assert!(matches!(cli.command, Some(Commands::Login)));
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        assert!(Cli::try_parse_from(["ask", "--provider", "claude", "hello"]).is_err());
+    }
+
+    #[test]
+    fn maps_provider_urls() {
+        assert_eq!(
+            Provider::from_url("https://chatgpt.com/c/abc"),
+            Some(Provider::ChatGpt)
+        );
+        assert_eq!(
+            Provider::from_url("https://gemini.google.com/app/abc"),
+            Some(Provider::Gemini)
+        );
+        assert_eq!(Provider::from_url("https://example.com"), None);
+    }
+
+    #[test]
+    fn extracts_snapshot_uid_from_common_formats() {
+        assert_eq!(
+            extract_snapshot_uid(r#"- button "上傳檔案" [uid="1_23"]"#),
+            Some("1_23".to_string())
+        );
+        assert_eq!(
+            extract_snapshot_uid(r#"- button "Upload file" uid=42"#),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn finds_snapshot_uid_with_include_and_exclude_terms() {
+        let snapshot = r#"
+            - button "加入雲端硬碟檔案" [uid="1_10"]
+            - menuitem "上傳檔案. 文件、資料、程式碼檔案" [uid="1_11"]
+        "#;
+        assert_eq!(
+            find_snapshot_uid(snapshot, &["上傳檔案"], &["雲端"]),
+            Some("1_11".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_gemini_image_attachments() {
+        let cli = Cli::try_parse_from([
+            "ask",
+            "--provider",
+            "gemini",
+            "--image",
+            "token.png",
+            "read",
+        ])
+        .unwrap();
+        assert!(validate_provider_feature_support(&cli).is_err());
+    }
+
+    #[test]
+    fn allows_gemini_file_attachments() {
+        let cli =
+            Cli::try_parse_from(["ask", "--provider", "gemini", "--file", "token.txt", "read"])
+                .unwrap();
+        assert!(validate_provider_feature_support(&cli).is_ok());
+    }
+}
+
 fn read_clipboard() -> Result<String, String> {
     let output = Command::new("pbpaste")
         .output()
@@ -493,12 +798,10 @@ fn write_clipboard(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
-    let res = call_mcp_tool(
-        config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": r#"() => {
+fn click_latest_copy_button(config_path: &str, provider: Provider) -> Result<(), String> {
+    let response_selector = serde_json::to_string(provider.latest_response_selector())
+        .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
+    let script = r#"() => {
                 const isVisible = (el) => {
                     if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                     const style = window.getComputedStyle(el);
@@ -528,14 +831,7 @@ fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
                     if (el.closest('model-response, response-container, [data-message-author-role="assistant"], .agent-turn')) return 50;
                     return 10;
                 };
-                const messages = Array.from(document.querySelectorAll([
-                    '[data-message-author-role="assistant"]',
-                    '.agent-turn',
-                    'model-response',
-                    '.model-response',
-                    '[data-test-id*="response"]',
-                    '[data-testid*="response"]'
-                ].join(',')));
+                const messages = Array.from(document.querySelectorAll(__RESPONSE_SELECTOR__));
                 const latest = messages[messages.length - 1];
                 if (!latest) return { ok: false, reason: "No assistant message found" };
 
@@ -567,6 +863,12 @@ fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
 
                 return { ok: false, reason: "Copy response button not found" };
             }"#
+    .replace("__RESPONSE_SELECTOR__", &response_selector);
+    let res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": script
         }),
     )?;
 
@@ -581,7 +883,7 @@ fn click_latest_copy_button(config_path: &str) -> Result<(), String> {
     }
 }
 
-fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
+fn wait_for_page_load(config_path: &str, provider: Provider, verbose: bool) -> Result<(), String> {
     if verbose {
         println!("Waiting for page readyState...");
     }
@@ -614,23 +916,16 @@ fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
     }
 
     if verbose {
-        println!("Waiting for ChatGPT SPA elements...");
+        println!("Waiting for {} page elements...", provider.display_name());
     }
 
-    // Phase 2: Wait for key elements to render on ChatGPT (e.g. textarea, login button, or form)
+    // Phase 2: Wait for key provider elements to render.
     for _ in 0..60 {
         let element_res = call_mcp_tool(
             config_path,
             "evaluate_script",
             serde_json::json!({
-                "function": "() => { \
-                    if (window.location.hostname.includes('chatgpt.com')) { \
-                        return document.querySelector('#prompt-textarea') !== null || \
-                               document.querySelector('[data-testid=\"login-button\"]') !== null || \
-                               document.querySelector('form') !== null; \
-                    } \
-                    return true; \
-                }"
+                "function": provider.ready_check_js()
             }),
         );
 
@@ -645,12 +940,21 @@ fn wait_for_page_load(config_path: &str, verbose: bool) -> Result<(), String> {
     }
 
     if verbose {
-        println!("Warning: Timeout waiting for ChatGPT SPA elements. Proceeding anyway...");
+        println!(
+            "Warning: Timeout waiting for {} page elements. Proceeding anyway...",
+            provider.display_name()
+        );
     }
     Ok(())
 }
 
-fn open_url_tab(config_path: &str, url: &str, headless: bool, verbose: bool) -> Result<(), String> {
+fn open_url_tab(
+    config_path: &str,
+    provider: Provider,
+    url: &str,
+    headless: bool,
+    verbose: bool,
+) -> Result<(), String> {
     if verbose {
         println!("Opening URL: {}", url);
     }
@@ -723,23 +1027,28 @@ fn open_url_tab(config_path: &str, url: &str, headless: bool, verbose: bool) -> 
                 );
             }
 
-            return wait_for_page_load(config_path, verbose);
+            let page_provider = Provider::from_url(url).unwrap_or(provider);
+            return wait_for_page_load(config_path, page_provider, verbose);
         }
 
         thread::sleep(Duration::from_millis(250));
     }
 
-    wait_for_page_load(config_path, verbose)
+    let page_provider = Provider::from_url(url).unwrap_or(provider);
+    wait_for_page_load(config_path, page_provider, verbose)
 }
 
-fn copy_latest_markdown(config_path: &str) -> Result<String, String> {
-    match copy_latest_markdown_via_clipboard(config_path) {
+fn copy_latest_markdown(config_path: &str, provider: Provider) -> Result<String, String> {
+    match copy_latest_markdown_via_clipboard(config_path, provider) {
         Ok(content) => Ok(content),
-        Err(_) => scrape_latest_markdown_from_dom(config_path),
+        Err(_) => scrape_latest_markdown_from_dom(config_path, provider),
     }
 }
 
-fn copy_latest_markdown_via_clipboard(config_path: &str) -> Result<String, String> {
+fn copy_latest_markdown_via_clipboard(
+    config_path: &str,
+    provider: Provider,
+) -> Result<String, String> {
     let clipboard_before = read_clipboard().unwrap_or_default();
     let sentinel = format!("__ASK_CHATGPT_COPY_PENDING_{}__", std::process::id());
     write_clipboard(&sentinel)?;
@@ -747,7 +1056,7 @@ fn copy_latest_markdown_via_clipboard(config_path: &str) -> Result<String, Strin
     // Click the copy button, retrying if the message or button is not found yet (due to asynchronous rendering of Single Page App)
     let mut click_err = None;
     for _ in 0..30 {
-        match click_latest_copy_button(config_path) {
+        match click_latest_copy_button(config_path, provider) {
             Ok(_) => {
                 click_err = None;
                 break;
@@ -800,10 +1109,22 @@ fn copy_latest_markdown_via_clipboard(config_path: &str) -> Result<String, Strin
     Ok(verified_content)
 }
 
-fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> {
+fn scrape_latest_markdown_from_dom(
+    config_path: &str,
+    provider: Provider,
+) -> Result<String, String> {
+    let latest_selector = serde_json::to_string(provider.latest_response_selector())
+        .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
+    let content_selector = serde_json::to_string(provider.response_content_selector())
+        .map_err(|e| format!("Failed to serialize response content selector: {}", e))?;
     let inspect_js = r#"() => {
-        const turn = document.querySelector('.agent-turn');
-        if (!turn) return 'No agent-turn found';
+        const latestSelector = __LATEST_SELECTOR__;
+        const contentSelector = __CONTENT_SELECTOR__;
+        const messages = Array.from(document.querySelectorAll(latestSelector))
+            .filter((el) => ((el.innerText || el.textContent || '').trim().length > 0));
+        const latest = messages[messages.length - 1];
+        if (!latest) return 'No assistant message found';
+        const turn = contentSelector ? (latest.querySelector(contentSelector) || latest) : latest;
         
         const elementToMarkdown = (element) => {
             let markdown = '';
@@ -817,7 +1138,10 @@ fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> 
 
                 const tag = node.tagName.toLowerCase();
                 
-                if (node.classList.contains('sr-only') || tag === 'button' || tag === 'style' || tag === 'script') {
+                const classText = Array.from(node.classList || []).join(' ');
+                if (node.classList.contains('sr-only') ||
+                    /screen-reader|visually-hidden|cdk-visually-hidden/.test(classText) ||
+                    tag === 'button' || tag === 'style' || tag === 'script') {
                     return;
                 }
 
@@ -902,7 +1226,9 @@ fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> 
         };
         
         return elementToMarkdown(turn);
-    }"#;
+    }"#
+    .replace("__LATEST_SELECTOR__", &latest_selector)
+    .replace("__CONTENT_SELECTOR__", &content_selector);
 
     let res = call_mcp_tool(
         config_path,
@@ -918,8 +1244,11 @@ fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> 
         .ok_or_else(|| "DOM scraper returned non-string result".to_string())?
         .to_string();
 
-    if content == "No agent-turn found" {
-        return Err("No assistant message (.agent-turn) found on page".to_string());
+    if content == "No assistant message found" {
+        return Err(format!(
+            "No assistant message found on {} page",
+            provider.display_name()
+        ));
     }
 
     Ok(content)
@@ -927,23 +1256,21 @@ fn scrape_latest_markdown_from_dom(config_path: &str) -> Result<String, String> 
 
 fn download_images_from_latest_message(
     config_path: &str,
+    provider: Provider,
     image_output: Option<&str>,
     verbose: bool,
 ) -> Result<(), String> {
     if verbose {
         println!("Checking for generated images in the latest assistant response...");
     }
-
-    let start_res = call_mcp_tool(
-        config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": r#"() => {
+    let latest_selector = serde_json::to_string(provider.latest_response_selector())
+        .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
+    let image_scan_js = r#"() => {
                 window.__downloaded_images_status = "pending";
                 window.__downloaded_images = null;
                 (async () => {
                     try {
-                        const messages = document.querySelectorAll('[data-message-author-role="assistant"], .agent-turn');
+                        const messages = document.querySelectorAll(__LATEST_SELECTOR__);
                         const latestMessage = messages[messages.length - 1];
                         if (!latestMessage) {
                             window.__downloaded_images = [];
@@ -960,7 +1287,7 @@ fn download_images_from_latest_message(
                             const height = img.naturalHeight || img.height || 0;
                             if (width > 0 && width < 100) return false;
                             if (height > 0 && height < 100) return false;
-                            if (!src.startsWith('http') && !src.startsWith('blob:')) return false;
+                            if (!src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:image/')) return false;
                             if (seenSrcs.has(src)) return false;
                             seenSrcs.add(src);
                             return true;
@@ -979,22 +1306,26 @@ fn download_images_from_latest_message(
                                 }
 
                                 let dataUrl = "";
-                                try {
-                                    const response = await fetch(img.src);
-                                    const blob = await response.blob();
-                                    dataUrl = await new Promise((resolve, reject) => {
-                                        const reader = new FileReader();
-                                        reader.onloadend = () => resolve(reader.result);
-                                        reader.onerror = reject;
-                                        reader.readAsDataURL(blob);
-                                    });
-                                } catch (fetchErr) {
-                                    const canvas = document.createElement('canvas');
-                                    canvas.width = img.naturalWidth || img.width || 512;
-                                    canvas.height = img.naturalHeight || img.height || 512;
-                                    const ctx = canvas.getContext('2d');
-                                    ctx.drawImage(img, 0, 0);
-                                    dataUrl = canvas.toDataURL('image/png');
+                                if ((img.src || '').startsWith('data:image/')) {
+                                    dataUrl = img.src;
+                                } else {
+                                    try {
+                                        const response = await fetch(img.src);
+                                        const blob = await response.blob();
+                                        dataUrl = await new Promise((resolve, reject) => {
+                                            const reader = new FileReader();
+                                            reader.onloadend = () => resolve(reader.result);
+                                            reader.onerror = reject;
+                                            reader.readAsDataURL(blob);
+                                        });
+                                    } catch (fetchErr) {
+                                        const canvas = document.createElement('canvas');
+                                        canvas.width = img.naturalWidth || img.width || 512;
+                                        canvas.height = img.naturalHeight || img.height || 512;
+                                        const ctx = canvas.getContext('2d');
+                                        ctx.drawImage(img, 0, 0);
+                                        dataUrl = canvas.toDataURL('image/png');
+                                    }
                                 }
 
                                 if (dataUrl && dataUrl.startsWith('data:image/')) {
@@ -1017,6 +1348,13 @@ fn download_images_from_latest_message(
                 })();
                 return { ok: true };
             }"#
+    .replace("__LATEST_SELECTOR__", &latest_selector);
+
+    let start_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": image_scan_js
         }),
     )?;
 
@@ -1156,7 +1494,7 @@ fn download_images_from_latest_message(
             .map_err(|e| format!("Failed to write image file {:?}: {}", file_path, e))?;
 
         println!(
-            "📥 Downloaded and saved generated image to: {}",
+            "Downloaded and saved generated image to: {}",
             file_path.to_string_lossy()
         );
     }
@@ -1168,6 +1506,138 @@ fn download_images_from_latest_message(
 /// Silently skips if kitty icat is not available.
 fn display_image_in_terminal(image_path: &str) {
     let _ = Command::new("kitty").args(["icat", image_path]).status();
+}
+
+fn wait_for_attachment_indicator(
+    config_path: &str,
+    provider: Provider,
+    path: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    let file_stem = Path::new(path)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file_name);
+    let file_name_json = serde_json::to_string(file_name)
+        .map_err(|e| format!("Failed to serialize file name: {}", e))?;
+    let file_stem_json = serde_json::to_string(file_stem)
+        .map_err(|e| format!("Failed to serialize file stem: {}", e))?;
+    let js = r#"() => {
+        const fileName = __FILE_NAME__;
+        const fileStem = __FILE_STEM__;
+        const text = document.body.innerText || '';
+        return text.includes(fileName) || text.includes(fileStem);
+    }"#
+    .replace("__FILE_NAME__", &file_name_json)
+    .replace("__FILE_STEM__", &file_stem_json);
+
+    for _ in 0..30 {
+        let check_res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": js }),
+        )?;
+        if parse_script_result(&check_res)
+            .ok()
+            .and_then(|p| p.as_bool())
+            .unwrap_or(false)
+        {
+            if verbose {
+                println!(
+                    "{} accepted attachment '{}'",
+                    provider.display_name(),
+                    file_name
+                );
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    Err(format!(
+        "Timed out waiting for {} to show attachment '{}'",
+        provider.display_name(),
+        file_name
+    ))
+}
+
+fn upload_attachments_via_file_chooser(
+    config_path: &str,
+    provider: Provider,
+    image_paths: &[String],
+    file_paths: &[String],
+    verbose: bool,
+) -> Result<(), String> {
+    for (path, verify_filename) in image_paths
+        .iter()
+        .map(|path| (path, false))
+        .chain(file_paths.iter().map(|path| (path, true)))
+    {
+        let canonical_path = std::fs::canonicalize(path)
+            .map_err(|e| format!("Failed to resolve file '{}': {}", path, e))?;
+        let file_path = canonical_path.to_string_lossy().to_string();
+
+        let snapshot = take_snapshot_text(config_path)?;
+        let menu_uid = match provider {
+            Provider::Gemini => {
+                find_snapshot_uid(&snapshot, &["上傳與工具"], &["更多", "雲端", "drive"])
+                    .or_else(|| find_snapshot_uid(&snapshot, &["upload"], &["drive"]))
+            }
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"]),
+        }
+        .ok_or_else(|| {
+            format!(
+                "Could not find {} upload menu in page snapshot",
+                provider.display_name()
+            )
+        })?;
+
+        call_mcp_tool(
+            config_path,
+            "click",
+            serde_json::json!({
+                "uid": menu_uid,
+                "includeSnapshot": false
+            }),
+        )?;
+        thread::sleep(Duration::from_millis(500));
+
+        let snapshot = take_snapshot_text(config_path)?;
+        let upload_uid = match provider {
+            Provider::Gemini => find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端", "drive"])
+                .or_else(|| find_snapshot_uid(&snapshot, &["upload", "file"], &["drive"])),
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"]),
+        }
+        .unwrap_or_else(|| menu_uid.clone());
+
+        if verbose {
+            println!(
+                "Uploading attachment '{}' to {}...",
+                file_path,
+                provider.display_name()
+            );
+        }
+        call_mcp_tool(
+            config_path,
+            "upload_file",
+            serde_json::json!({
+                "uid": upload_uid,
+                "filePath": file_path,
+                "includeSnapshot": false
+            }),
+        )?;
+        if verify_filename {
+            wait_for_attachment_indicator(config_path, provider, path, verbose)?;
+        } else {
+            thread::sleep(Duration::from_millis(800));
+        }
+    }
+
+    Ok(())
 }
 
 /// Map a file extension to a MIME type. Covers common image and document formats.
@@ -1250,11 +1720,12 @@ fn mime_type_for_extension(ext: &str) -> &'static str {
     }
 }
 
-/// Upload local image and/or document files to the ChatGPT prompt composer using the
-/// DataTransfer API against the page's file input element.
+/// Upload local image and/or document files to the provider prompt composer using the
+/// best available provider-specific upload mechanism.
 /// Returns an error string if any attachment fails to upload.
-fn upload_attachments_to_chatgpt(
+fn upload_attachments_to_provider(
     config_path: &str,
+    provider: Provider,
     image_paths: &[String],
     file_paths: &[String],
     verbose: bool,
@@ -1264,11 +1735,37 @@ fn upload_attachments_to_chatgpt(
         return Ok(());
     }
 
+    let data_transfer_image_paths: &[String] = if provider == Provider::Gemini
+        && !image_paths.is_empty()
+    {
+        match upload_attachments_via_file_chooser(config_path, provider, image_paths, &[], verbose)
+        {
+            Ok(()) => &[],
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "Warning: {} image file chooser upload failed, trying DataTransfer fallback: {}",
+                        provider.display_name(),
+                        e
+                    );
+                }
+                image_paths
+            }
+        }
+    } else {
+        image_paths
+    };
+
+    let data_transfer_total = data_transfer_image_paths.len() + file_paths.len();
+    if data_transfer_total == 0 {
+        return Ok(());
+    }
+
     if verbose {
         println!(
             "Attaching {} attachment(s) ({} image(s), {} file(s)) to the prompt...",
-            total,
-            image_paths.len(),
+            data_transfer_total,
+            data_transfer_image_paths.len(),
             file_paths.len()
         );
     }
@@ -1277,7 +1774,7 @@ fn upload_attachments_to_chatgpt(
     // We pass raw base64 + mime and decode in JS to avoid `fetch(data:...)` which ChatGPT's
     // Content-Security-Policy blocks (results in "Failed to fetch").
     let mut files_json = Vec::new();
-    for path in image_paths.iter().chain(file_paths.iter()) {
+    for path in data_transfer_image_paths.iter().chain(file_paths.iter()) {
         let bytes =
             std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
         let ext = Path::new(path)
@@ -1301,6 +1798,7 @@ fn upload_attachments_to_chatgpt(
 
     let files_json_str = serde_json::to_string(&files_json)
         .map_err(|e| format!("Failed to serialize attachment data: {}", e))?;
+    let composer_selectors = provider.composer_selectors_json();
     // Build JS without raw strings to avoid r#"..."# termination conflicts
     let js = "() => {\n".to_string()
         + "    window.__upload_images_status = 'pending';\n"
@@ -1319,9 +1817,13 @@ fn upload_attachments_to_chatgpt(
         + "                const blob = new Blob([bytes], { type: f.mime || 'application/octet-stream' });\n"
         + "                return new File([blob], f.name, { type: blob.type });\n"
         + "            });\n"
-        + "            const el = document.getElementById('prompt-textarea');\n"
+        + &format!(
+            "            const composerSelectors = {};\n",
+            composer_selectors
+        )
+        + "            const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);\n"
         + "            if (!el) {\n"
-        + "                window.__upload_images_status = 'error: textarea not found';\n"
+        + "                window.__upload_images_status = 'error: composer not found';\n"
         + "                return;\n"
         + "            }\n"
         + "            el.focus();\n"
@@ -1350,10 +1852,14 @@ fn upload_attachments_to_chatgpt(
         + "            }\n"
         + "            const dt = new DataTransfer();\n"
         + "            for (const f of fileObjects) dt.items.add(f);\n"
-        + "            const dropEvent = new DragEvent('drop', {\n"
-        + "                bubbles: true, cancelable: true, dataTransfer: dt\n"
-        + "            });\n"
-        + "            el.dispatchEvent(dropEvent);\n"
+        + "            const targets = [el, el.closest('form'), document.querySelector('main'), document.body].filter(Boolean);\n"
+        + "            for (const target of targets) {\n"
+        + "                for (const type of ['dragenter', 'dragover', 'drop']) {\n"
+        + "                    target.dispatchEvent(new DragEvent(type, {\n"
+        + "                        bubbles: true, cancelable: true, dataTransfer: dt\n"
+        + "                    }));\n"
+        + "                }\n"
+        + "            }\n"
         + "            const pasteEvent = new ClipboardEvent('paste', {\n"
         + "                bubbles: true, cancelable: true, clipboardData: dt\n"
         + "            });\n"
@@ -1410,14 +1916,41 @@ fn upload_attachments_to_chatgpt(
     // Give the UI a moment to render the attachments before typing the prompt
     thread::sleep(Duration::from_millis(800));
 
+    if provider == Provider::Gemini {
+        // Gemini renders image attachments as thumbnails without a stable filename in
+        // the accessible text. Text/document chips do expose their filename, so keep
+        // the stricter post-upload check for `--file` attachments only.
+        for path in file_paths {
+            if let Err(e) = wait_for_attachment_indicator(config_path, provider, path, verbose) {
+                if verbose {
+                    eprintln!(
+                        "Warning: {} DataTransfer upload was not detected, trying file chooser fallback: {}",
+                        provider.display_name(),
+                        e
+                    );
+                }
+                return upload_attachments_via_file_chooser(
+                    config_path,
+                    provider,
+                    image_paths,
+                    file_paths,
+                    verbose,
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
-/// Switch the ChatGPT composer to the specified model or thinking level by driving
-/// the composer's pill menu (a Radix UI menu). The page must already be loaded and
-/// logged in. `model` is matched case- and punctuation-insensitively against the
-/// visible menu item labels (e.g. "GPT-5.4", "o3", "即時", "超高").
-fn switch_model(config_path: &str, model: &str, verbose: bool) -> Result<(), String> {
+/// Switch the selected provider to the specified model. The page must already be
+/// loaded and logged in. `model` is matched case- and punctuation-insensitively.
+fn switch_model(
+    config_path: &str,
+    provider: Provider,
+    model: &str,
+    verbose: bool,
+) -> Result<(), String> {
     if model.trim().is_empty() {
         return Err("Empty model name".to_string());
     }
@@ -1425,79 +1958,134 @@ fn switch_model(config_path: &str, model: &str, verbose: bool) -> Result<(), Str
         .map_err(|e| format!("Failed to serialize model name: {}", e))?;
 
     if verbose {
-        println!("Switching ChatGPT model to '{}'...", model.trim());
+        println!(
+            "Switching {} model to '{}'...",
+            provider.display_name(),
+            model.trim()
+        );
     }
 
-    // The script sets `window.__switch_model_status` and resolves asynchronously.
-    // It opens the composer pill menu, walks visible leaves and submenu triggers,
-    // clicking the first leaf whose normalized label equals the normalized target.
-    // Radix re-renders menus on each open/close, so submenu triggers are tracked by
-    // a stable key (normalized text + aria-label) rather than DOM identity.
-    let js = "() => {\n".to_string()
-        + "    window.__switch_model_status = 'pending';\n"
-        + "    (async () => {\n"
-        + "    try {\n"
-        + "        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n"
-        + "        const norm = (s) => (s || '').toLowerCase().replace(/[\\s.\\-_]/g, '');\n"
-        + &format!("        const target = norm({});\n", target_json)
-        + "        if (!target) { window.__switch_model_status = 'error: empty target'; return; }\n"
-        + "        const visited = new Set();\n"
-        + "        const closeMenus = async () => {\n"
-        + "            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-        + "            await sleep(400);\n"
-        + "        };\n"
-        + "        await closeMenus();\n"
-        + "        let pill = null;\n"
-        + "        for (let i = 0; i < 20; i++) {\n"
-        + "            pill = document.querySelector('button.__composer-pill');\n"
-        + "            if (pill) break;\n"
-        + "            await sleep(250);\n"
-        + "        }\n"
-        + "        if (!pill) { window.__switch_model_status = 'error: composer pill not found'; return; }\n"
-        + "        pill.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));\n"
-        + "        pill.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));\n"
-        + "        pill.click();\n"
-        + "        await sleep(800);\n"
-        + "        let clicked = false;\n"
-        + "        let chosen = '';\n"
-        + "        for (let depth = 0; depth < 6 && !clicked; depth++) {\n"
-        + "            const all = Array.from(document.querySelectorAll('[role=\"menuitem\"], [role=\"menuitemradio\"]'));\n"
-        + "            const leaves = all.filter((it) => it.getAttribute('aria-haspopup') !== 'menu');\n"
-        + "            for (const it of leaves) {\n"
-        + "                const t = norm(it.innerText);\n"
-        + "                if (t && t === target) {\n"
-        + "                    it.click();\n"
-        + "                    clicked = true;\n"
-        + "                    chosen = it.innerText;\n"
-        + "                    break;\n"
-        + "                }\n"
-        + "            }\n"
-        + "            if (clicked) break;\n"
-        + "            const trigs = all.filter((it) => it.getAttribute('aria-haspopup') === 'menu');\n"
-        + "            const trig = trigs.find((it) => {\n"
-        + "                const k = norm(it.innerText) + '|' + (it.getAttribute('aria-label') || '');\n"
-        + "                return !visited.has(k);\n"
-        + "            });\n"
-        + "            if (!trig) break;\n"
-        + "            visited.add(norm(trig.innerText) + '|' + (trig.getAttribute('aria-label') || ''));\n"
-        + "            trig.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));\n"
-        + "            trig.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));\n"
-        + "            trig.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));\n"
-        + "            trig.click();\n"
-        + "            await sleep(750);\n"
-        + "        }\n"
-        + "        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-        + "        if (!clicked) {\n"
-        + "            window.__switch_model_status = 'error: model not found in menu';\n"
-        + "            return;\n"
-        + "        }\n"
-        + "        window.__switch_model_status = 'success:' + chosen;\n"
-        + "    } catch (e) {\n"
-        + "        window.__switch_model_status = 'error: ' + e.message;\n"
-        + "    }\n"
-        + "    })();\n"
-        + "    return true;\n"
-        + "}";
+    let js = match provider {
+        Provider::ChatGpt => {
+            // The script opens the composer pill menu, walks visible leaves and submenu
+            // triggers, and clicks the first leaf whose normalized label matches.
+            "() => {\n".to_string()
+                + "    window.__switch_model_status = 'pending';\n"
+                + "    (async () => {\n"
+                + "    try {\n"
+                + "        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n"
+                + "        const norm = (s) => (s || '').toLowerCase().replace(/[\\s.\\-_]/g, '');\n"
+                + &format!("        const target = norm({});\n", target_json)
+                + "        if (!target) { window.__switch_model_status = 'error: empty target'; return; }\n"
+                + "        const visited = new Set();\n"
+                + "        const closeMenus = async () => {\n"
+                + "            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
+                + "            await sleep(400);\n"
+                + "        };\n"
+                + "        await closeMenus();\n"
+                + "        let pill = null;\n"
+                + "        for (let i = 0; i < 20; i++) {\n"
+                + "            pill = document.querySelector('button.__composer-pill');\n"
+                + "            if (pill) break;\n"
+                + "            await sleep(250);\n"
+                + "        }\n"
+                + "        if (!pill) { window.__switch_model_status = 'error: composer pill not found'; return; }\n"
+                + "        pill.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));\n"
+                + "        pill.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));\n"
+                + "        pill.click();\n"
+                + "        await sleep(800);\n"
+                + "        let clicked = false;\n"
+                + "        let chosen = '';\n"
+                + "        for (let depth = 0; depth < 6 && !clicked; depth++) {\n"
+                + "            const all = Array.from(document.querySelectorAll('[role=\"menuitem\"], [role=\"menuitemradio\"]'));\n"
+                + "            const leaves = all.filter((it) => it.getAttribute('aria-haspopup') !== 'menu');\n"
+                + "            for (const it of leaves) {\n"
+                + "                const t = norm(it.innerText);\n"
+                + "                if (t && t === target) {\n"
+                + "                    it.click();\n"
+                + "                    clicked = true;\n"
+                + "                    chosen = it.innerText;\n"
+                + "                    break;\n"
+                + "                }\n"
+                + "            }\n"
+                + "            if (clicked) break;\n"
+                + "            const trigs = all.filter((it) => it.getAttribute('aria-haspopup') === 'menu');\n"
+                + "            const trig = trigs.find((it) => {\n"
+                + "                const k = norm(it.innerText) + '|' + (it.getAttribute('aria-label') || '');\n"
+                + "                return !visited.has(k);\n"
+                + "            });\n"
+                + "            if (!trig) break;\n"
+                + "            visited.add(norm(trig.innerText) + '|' + (trig.getAttribute('aria-label') || ''));\n"
+                + "            trig.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));\n"
+                + "            trig.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));\n"
+                + "            trig.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));\n"
+                + "            trig.click();\n"
+                + "            await sleep(750);\n"
+                + "        }\n"
+                + "        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
+                + "        if (!clicked) {\n"
+                + "            window.__switch_model_status = 'error: model not found in menu';\n"
+                + "            return;\n"
+                + "        }\n"
+                + "        window.__switch_model_status = 'success:' + chosen;\n"
+                + "    } catch (e) {\n"
+                + "        window.__switch_model_status = 'error: ' + e.message;\n"
+                + "    }\n"
+                + "    })();\n"
+                + "    return true;\n"
+                + "}"
+        }
+        Provider::Gemini => {
+            let template = r#"() => {
+                window.__switch_model_status = 'pending';
+                (async () => {
+                    try {
+                        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                        const norm = (s) => (s || '').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
+                        const canonical = (s) => {
+                            const n = norm(s).replace(/^已選取/, '');
+                            if (n.includes('flashlite') || n.includes('31flashlite')) return 'flashlite';
+                            if (n.includes('35flash') || (n.endsWith('flash') && !n.includes('lite'))) return 'flash';
+                            if (n.includes('31pro') || n === 'pro') return 'pro';
+                            return n;
+                        };
+                        const target = canonical(__TARGET_MODEL__);
+                        if (!target) { window.__switch_model_status = 'error: empty target'; return; }
+                        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+                        await sleep(250);
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const modeButton = buttons.find((button) => /模式挑選器|model picker|mode picker/i.test([
+                            button.getAttribute('aria-label'),
+                            button.textContent
+                        ].filter(Boolean).join(' ')));
+                        if (!modeButton) { window.__switch_model_status = 'error: Gemini mode picker not found'; return; }
+                        modeButton.click();
+                        await sleep(800);
+                        const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"]'));
+                        let chosen = null;
+                        for (const item of items) {
+                            const label = item.innerText || item.textContent || item.getAttribute('aria-label') || '';
+                            if (canonical(label) === target || norm(label) === norm(__TARGET_MODEL__)) {
+                                chosen = item;
+                                break;
+                            }
+                        }
+                        if (!chosen) {
+                            window.__switch_model_status = 'error: model not found in menu';
+                            return;
+                        }
+                        chosen.click();
+                        await sleep(500);
+                        window.__switch_model_status = 'success:' + (chosen.innerText || chosen.textContent || '').trim();
+                    } catch (e) {
+                        window.__switch_model_status = 'error: ' + e.message;
+                    }
+                })();
+                return true;
+            }"#;
+            template.replace("__TARGET_MODEL__", &target_json)
+        }
+    };
 
     let start_res = call_mcp_tool(
         config_path,
@@ -1544,8 +2132,9 @@ fn switch_model(config_path: &str, model: &str, verbose: bool) -> Result<(), Str
     Ok(())
 }
 
-fn ensure_chatgpt_tab(
+fn ensure_provider_tab(
     config_path: &str,
+    provider: Provider,
     force_new: bool,
     headless: bool,
     verbose: bool,
@@ -1566,26 +2155,30 @@ fn ensure_chatgpt_tab(
     let pages = parse_pages(text);
 
     if force_new {
-        let old_chatgpt_ids: Vec<usize> = pages
+        let old_provider_ids: Vec<usize> = pages
             .iter()
-            .filter(|p| p.url.contains("chatgpt.com"))
+            .filter(|p| provider.owns_url(&p.url))
             .map(|p| p.id)
             .collect();
 
         if verbose {
-            println!("Opening a brand new ChatGPT session...");
+            println!("Opening a brand new {} session...", provider.display_name());
         }
         call_mcp_tool(
             config_path,
             "new_page",
             serde_json::json!({
-                "url": "https://chatgpt.com/"
+                "url": provider.home_url()
             }),
         )?;
 
-        for id in old_chatgpt_ids {
+        for id in old_provider_ids {
             if verbose {
-                println!("Closing old ChatGPT tab (ID: {})...", id);
+                println!(
+                    "Closing old {} tab (ID: {})...",
+                    provider.display_name(),
+                    id
+                );
             }
             let _ = call_mcp_tool(
                 config_path,
@@ -1611,12 +2204,13 @@ fn ensure_chatgpt_tab(
             })?;
         let refreshed_pages = parse_pages(refreshed_text);
 
-        if let Some(page) = refreshed_pages
-            .iter()
-            .find(|p| p.url.contains("chatgpt.com"))
-        {
+        if let Some(page) = refreshed_pages.iter().find(|p| provider.owns_url(&p.url)) {
             if verbose {
-                println!("Selecting new ChatGPT tab (ID: {})...", page.id);
+                println!(
+                    "Selecting new {} tab (ID: {})...",
+                    provider.display_name(),
+                    page.id
+                );
             }
             call_mcp_tool(
                 config_path,
@@ -1629,7 +2223,7 @@ fn ensure_chatgpt_tab(
 
             for stale_page in refreshed_pages.iter().filter(|p| p.id != page.id) {
                 if verbose {
-                    println!("Closing non-ChatGPT tab (ID: {})...", stale_page.id);
+                    println!("Closing non-selected tab (ID: {})...", stale_page.id);
                 }
                 let _ = call_mcp_tool(
                     config_path,
@@ -1641,15 +2235,17 @@ fn ensure_chatgpt_tab(
             }
         }
     } else {
-        // Find any existing chatgpt page
-        let chatgpt_page = pages.iter().find(|p| p.url.contains("chatgpt.com"));
+        // Find any existing page for the selected provider.
+        let provider_page = pages.iter().find(|p| provider.owns_url(&p.url));
 
-        match chatgpt_page {
+        match provider_page {
             Some(page) => {
                 if verbose {
                     println!(
-                        "Found ChatGPT tab (ID: {}, selected: {}). Selecting/focusing...",
-                        page.id, page.selected
+                        "Found {} tab (ID: {}, selected: {}). Selecting/focusing...",
+                        provider.display_name(),
+                        page.id,
+                        page.selected
                     );
                 }
                 call_mcp_tool(
@@ -1662,31 +2258,34 @@ fn ensure_chatgpt_tab(
                 )?;
             }
             None => {
-                // No ChatGPT tab. If there is only one blank tab, we navigate it. Otherwise, open a new page.
+                // No provider tab. If there is only one blank tab, navigate it. Otherwise open a new page.
                 if pages.len() == 1
                     && (pages[0].url == "about:blank"
                         || pages[0].url.contains("new-tab-page")
                         || pages[0].url.contains("chrome://welcome"))
                 {
                     if verbose {
-                        println!("Navigating existing blank tab to ChatGPT...");
+                        println!(
+                            "Navigating existing blank tab to {}...",
+                            provider.display_name()
+                        );
                     }
                     call_mcp_tool(
                         config_path,
                         "navigate_page",
                         serde_json::json!({
-                            "url": "https://chatgpt.com/"
+                            "url": provider.home_url()
                         }),
                     )?;
                 } else {
                     if verbose {
-                        println!("Opening a new tab for ChatGPT...");
+                        println!("Opening a new tab for {}...", provider.display_name());
                     }
                     call_mcp_tool(
                         config_path,
                         "new_page",
                         serde_json::json!({
-                            "url": "https://chatgpt.com/"
+                            "url": provider.home_url()
                         }),
                     )?;
                 }
@@ -1694,9 +2293,9 @@ fn ensure_chatgpt_tab(
         }
     }
 
-    // Wait for the prompt textarea to be present (the page is loaded)
+    // Wait for the provider composer to be present.
     if verbose {
-        println!("Waiting for ChatGPT to load...");
+        println!("Waiting for {} to load...", provider.display_name());
     }
     for attempt in 0..90 {
         if attempt > 0 && attempt % 10 == 0 {
@@ -1713,7 +2312,7 @@ fn ensure_chatgpt_tab(
                 .and_then(|text| {
                     parse_pages(&text)
                         .into_iter()
-                        .find(|p| p.url.contains("chatgpt.com"))
+                        .find(|p| provider.owns_url(&p.url))
                 });
             if let Some(page) = page_opt {
                 let _ = call_mcp_tool(
@@ -1731,14 +2330,18 @@ fn ensure_chatgpt_tab(
             config_path,
             "evaluate_script",
             serde_json::json!({
-                "function": "() => document.getElementById('prompt-textarea') !== null"
+                "function": provider.ready_check_js()
             }),
         );
         let ready_res = match ready_res {
             Ok(res) => res,
             Err(e) => {
                 if verbose {
-                    eprintln!("Warning: Failed to check ChatGPT readiness: {}", e);
+                    eprintln!(
+                        "Warning: Failed to check {} readiness: {}",
+                        provider.display_name(),
+                        e
+                    );
                 }
                 thread::sleep(Duration::from_millis(500));
                 continue;
@@ -1753,15 +2356,18 @@ fn ensure_chatgpt_tab(
         thread::sleep(Duration::from_millis(500));
     }
 
-    Err("Timeout waiting for ChatGPT page to load".to_string())
+    Err(format!(
+        "Timeout waiting for {} page to load",
+        provider.display_name()
+    ))
 }
 
-fn check_login_status(config_path: &str) -> Result<bool, String> {
+fn check_login_status(config_path: &str, provider: Provider) -> Result<bool, String> {
     let res = call_mcp_tool(
         config_path,
         "evaluate_script",
         serde_json::json!({
-            "function": "() => document.querySelector('[data-testid=\"login-button\"]') === null"
+            "function": provider.login_check_js()
         }),
     )?;
 
@@ -1774,6 +2380,12 @@ fn check_login_status(config_path: &str) -> Result<bool, String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Err(e) = validate_provider_feature_support(&cli) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
+    let provider = cli.provider;
     if !cli.verbose {
         // SAFETY: Called before spawning other threads and before loading MCP config.
         unsafe {
@@ -1812,12 +2424,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match command {
             Commands::Open { url } => {
                 if let Some(url) = url {
-                    if let Err(e) = open_url_tab(&config_path, &url, is_headless, cli.verbose) {
+                    let page_provider = Provider::from_url(&url).unwrap_or(provider);
+                    if let Err(e) =
+                        open_url_tab(&config_path, page_provider, &url, is_headless, cli.verbose)
+                    {
                         eprintln!("Error opening URL: {}", e);
                         std::process::exit(1);
                     }
 
-                    match copy_latest_markdown(&config_path) {
+                    match copy_latest_markdown(&config_path, page_provider) {
                         Ok(markdown) => {
                             if let Some(ref output_path) = cli.output {
                                 let _ = std::fs::write(output_path, &markdown).map_err(|e| {
@@ -1831,6 +2446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if let Err(e) = download_images_from_latest_message(
                                 &config_path,
+                                page_provider,
                                 cli.image_output.as_deref(),
                                 cli.verbose,
                             ) {
@@ -1844,31 +2460,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     if let Err(e) =
-                        ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose)
+                        ensure_provider_tab(&config_path, provider, false, is_headless, cli.verbose)
                     {
-                        eprintln!("Error ensuring ChatGPT tab: {}", e);
+                        eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                         std::process::exit(1);
                     }
-                    println!("Successfully opened ChatGPT!");
+                    println!("Successfully opened {}!", provider.display_name());
                 }
                 return Ok(());
             }
             Commands::Get { url } => {
+                let mut page_provider = provider;
                 if let Some(url) = url {
-                    if let Err(e) = open_url_tab(&config_path, &url, is_headless, cli.verbose) {
+                    page_provider = Provider::from_url(&url).unwrap_or(provider);
+                    if let Err(e) =
+                        open_url_tab(&config_path, page_provider, &url, is_headless, cli.verbose)
+                    {
                         eprintln!("Error opening URL: {}", e);
                         std::process::exit(1);
                     }
                 } else {
                     if let Err(e) =
-                        ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose)
+                        ensure_provider_tab(&config_path, provider, false, is_headless, cli.verbose)
                     {
-                        eprintln!("Error ensuring ChatGPT tab: {}", e);
+                        eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                         std::process::exit(1);
                     }
                 }
 
-                match copy_latest_markdown(&config_path) {
+                match copy_latest_markdown(&config_path, page_provider) {
                     Ok(markdown) => {
                         if let Some(ref output_path) = cli.output {
                             let _ = std::fs::write(output_path, &markdown).map_err(|e| {
@@ -1882,6 +2502,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if let Err(e) = download_images_from_latest_message(
                             &config_path,
+                            page_provider,
                             cli.image_output.as_deref(),
                             cli.verbose,
                         ) {
@@ -1896,8 +2517,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Login => {
-                if let Err(e) = ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose) {
-                    eprintln!("Error ensuring ChatGPT tab: {}", e);
+                if let Err(e) =
+                    ensure_provider_tab(&config_path, provider, false, is_headless, cli.verbose)
+                {
+                    eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
                 println!("\n========================================================");
@@ -1908,7 +2531,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut buffer = String::new();
                 io::stdin().read_line(&mut buffer)?;
 
-                match check_login_status(&config_path) {
+                match check_login_status(&config_path, provider) {
                     Ok(true) => println!(
                         "Success: Logged in successfully! You can now use the `ask` command."
                     ),
@@ -1921,8 +2544,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);
-                if let Err(e) = ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose) {
-                    eprintln!("Error ensuring ChatGPT tab: {}", e);
+                if let Err(e) =
+                    ensure_provider_tab(&config_path, provider, false, is_headless, cli.verbose)
+                {
+                    eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
                 let url_res = call_mcp_tool(
@@ -1950,8 +2575,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Screenshot => {
-                if let Err(e) = ensure_chatgpt_tab(&config_path, false, is_headless, cli.verbose) {
-                    eprintln!("Error ensuring ChatGPT tab: {}", e);
+                if let Err(e) =
+                    ensure_provider_tab(&config_path, provider, false, is_headless, cli.verbose)
+                {
+                    eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
                 let res = call_mcp_tool(&config_path, "take_screenshot", serde_json::json!({}))?;
@@ -2012,8 +2639,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    if let Err(e) = ensure_chatgpt_tab(&config_path, cli.new, is_headless, cli.verbose) {
-        eprintln!("Error ensuring ChatGPT tab: {}", e);
+    if let Err(e) = ensure_provider_tab(&config_path, provider, cli.new, is_headless, cli.verbose) {
+        eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
         std::process::exit(1);
     }
 
@@ -2025,11 +2652,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verify login
-    match check_login_status(&config_path) {
+    match check_login_status(&config_path, provider) {
         Ok(false) => {
-            eprintln!("\nError: You are not logged in to ChatGPT.");
             eprintln!(
-                "Please run `ask login` to log in manually first, and then run your query again.\n"
+                "\nError: You are not logged in to {}.",
+                provider.display_name()
+            );
+            eprintln!(
+                "Please run `ask --provider {} login` to log in manually first, and then run your query again.\n",
+                provider
             );
             std::process::exit(1);
         }
@@ -2043,29 +2674,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Switch model if requested (before uploading attachments / typing the prompt)
-    if let Some(m) = &cli.model {
-        if let Err(e) = switch_model(&config_path, m, cli.verbose) {
-            eprintln!("Error switching model: {}", e);
-            std::process::exit(1);
-        }
+    if let Some(m) = &cli.model
+        && let Err(e) = switch_model(&config_path, provider, m, cli.verbose)
+    {
+        eprintln!("Error switching model: {}", e);
+        std::process::exit(1);
     }
 
     // Upload any attached images/files before counting messages (so the UI is ready)
-    if !cli.images.is_empty() || !cli.files.is_empty() {
-        if let Err(e) =
-            upload_attachments_to_chatgpt(&config_path, &cli.images, &cli.files, cli.verbose)
-        {
-            eprintln!("Error attaching images/files: {}", e);
-            std::process::exit(1);
-        }
+    if (!cli.images.is_empty() || !cli.files.is_empty())
+        && let Err(e) = upload_attachments_to_provider(
+            &config_path,
+            provider,
+            &cli.images,
+            &cli.files,
+            cli.verbose,
+        )
+    {
+        eprintln!("Error attaching images/files: {}", e);
+        std::process::exit(1);
     }
 
     // Get initial number of assistant messages before submitting the prompt
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
     let count_res = call_mcp_tool(
         &config_path,
         "evaluate_script",
         serde_json::json!({
-            "function": "() => document.querySelectorAll('[data-message-author-role=\"assistant\"], .agent-turn').length"
+            "function": format!("() => document.querySelectorAll({}).length", assistant_selector)
         }),
     )?;
     let initial_assistant_count = parse_script_result(&count_res)
@@ -2076,114 +2713,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.verbose {
         println!("Setting prompt text and submitting...");
     }
-    let set_and_submit_js = format!(
-        "() => {{
+    let prompt_json = serde_json::to_string(&prompt).unwrap();
+    let set_and_submit_js = r#"() => {
             window.__submit_status = 'pending';
-            (async () => {{
-                try {{
-                    const el = document.getElementById('prompt-textarea');
-                    if (!el) {{
-                        window.__submit_status = 'error: textarea not found';
+            (async () => {
+                try {
+                    const composerSelectors = __COMPOSER_SELECTORS__;
+                    const sendSelectors = __SEND_SELECTORS__;
+                    const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+                    if (!el) {
+                        window.__submit_status = 'error: composer not found';
                         return;
-                    }}
+                    }
                     el.focus();
                     
-                    const value = {};
+                    const value = __PROMPT__;
                     el.focus();
                     
-                    // Select all content inside el so that whatever we insert replaces it
-                    try {{
+                    try {
                         const range = document.createRange();
                         range.selectNodeContents(el);
                         const sel = window.getSelection();
                         sel.removeAllRanges();
                         sel.addRange(range);
-                    }} catch (e) {{}}
+                    } catch (e) {}
                     
                     let pasted = false;
-                    try {{
+                    try {
                         const dataTransfer = new DataTransfer();
                         dataTransfer.setData('text/plain', value);
-                        const event = new ClipboardEvent('paste', {{
+                        const event = new ClipboardEvent('paste', {
                             bubbles: true,
                             cancelable: true
-                        }});
-                        Object.defineProperty(event, 'clipboardData', {{
+                        });
+                        Object.defineProperty(event, 'clipboardData', {
                             value: dataTransfer,
                             writable: false,
                             configurable: true
-                        }});
+                        });
                         el.dispatchEvent(event);
                         
-                        // Check if text was actually inserted successfully
-                        if (el.textContent && el.textContent.trim().length > 0) {{
+                        const currentText = typeof el.value !== 'undefined' ? el.value : el.textContent;
+                        if (currentText && currentText.trim().length > 0) {
                             pasted = true;
-                        }}
-                    }} catch (e) {{}}
+                        }
+                    } catch (e) {}
                     
-                    if (!pasted) {{
-                        // Fallback to execCommand('insertText') which naturally dispatches input/beforeinput
+                    if (!pasted) {
                         const success = document.execCommand('insertText', false, value);
-                        if (!success) {{
-                            if (typeof el.value !== 'undefined') {{
+                        if (!success) {
+                            if (typeof el.value !== 'undefined') {
                                 el.value = value;
-                                if (el._valueTracker) {{
+                                if (el._valueTracker) {
                                     el._valueTracker.setValue('');
-                                }}
-                            }} else {{
+                                }
+                            } else {
                                 el.innerText = value;
-                            }}
-                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                    }}
+                            }
+                            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
                     
-                    const findAndClickSendButton = () => {{
-                        const selectors = [
-                            '[data-testid=\"send-button\"]',
-                            '#composer-submit-button',
-                            'button[aria-label*=\"Send\"]',
-                            'button[aria-label*=\"傳送\"]',
-                            'button[aria-label*=\"发送\"]'
-                        ];
-                        
+                    const isVisible = (el) => {
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const findAndClickSendButton = () => {
                         let btn = null;
-                        for (const s of selectors) {{
+                        for (const s of sendSelectors) {
                             btn = document.querySelector(s);
-                            if (btn) break;
-                        }}
+                            if (isVisible(btn)) break;
+                        }
                         
-                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {{
+                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
                             btn.click();
-                            return {{ ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') }};
-                        }}
+                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                        }
                         return null;
-                    }};
+                    };
                     
                     let result = findAndClickSendButton();
-                    if (result) {{
+                    if (result) {
                         window.__submit_status = 'success:' + JSON.stringify(result);
                         return;
-                    }}
+                    }
 
-                    for (let i = 0; i < 150; i++) {{
+                    for (let i = 0; i < 150; i++) {
                         await new Promise(r => setTimeout(r, 100));
                         result = findAndClickSendButton();
-                        if (result) {{
+                        if (result) {
                             window.__submit_status = 'success:' + JSON.stringify(result);
                             return;
-                        }}
-                    }}
+                        }
+                    }
                     
                     window.__submit_status = 'error: Send button did not become active/enabled';
-                }} catch (e) {{
+                } catch (e) {
                     window.__submit_status = 'error: ' + e.message;
-                }}
-            }})();
+                }
+            })();
             return true;
-        }}",
-        serde_json::to_string(&prompt).unwrap()
-    );
+        }"#
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
+    .replace("__SEND_SELECTORS__", provider.send_button_selectors_json())
+    .replace("__PROMPT__", &prompt_json);
 
     let start_res = call_mcp_tool(
         &config_path,
@@ -2233,7 +2870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.verbose {
-        println!("Waiting for ChatGPT response...");
+        println!("Waiting for {} response...", provider.display_name());
     }
 
     let mut last_markdown = String::new();
@@ -2247,48 +2884,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Max 120 seconds (1200 * 100ms)
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
-            print!("\r\x1b[1;36m{}\x1b[0m 正在等待 ChatGPT 回應...", frame);
+            print!(
+                "\r\x1b[1;36m{}\x1b[0m 正在等待 {} 回應...",
+                frame,
+                provider.display_name()
+            );
             io::stdout().flush()?;
             spinner_idx += 1;
         }
 
         if wait_cycles % 5 == 0 {
-            let check_res = match call_mcp_tool(
-                &config_path,
-                "evaluate_script",
-                serde_json::json!({
-                    "function": format!(r#"() => {{
-                    const stopButton = document.querySelector('[data-testid="stop-button"]') || 
-                                       document.getElementById('composer-stop-button') ||
-                                       document.querySelector('button[aria-label="Stop generating"]');
-
-                    const isVisible = (el) => {{
+            let stop_selectors = provider.stop_button_selectors_json();
+            let assistant_selector = serde_json::to_string(provider.assistant_selector())
+                .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
+            let response_check_js = r#"() => {
+                    const stopSelectors = __STOP_SELECTORS__;
+                    const isVisible = (el) => {
                         if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                         const style = window.getComputedStyle(el);
                         if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
                         const rect = el.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0;
-                    }};
+                    };
+                    const stopButton = stopSelectors.map((selector) => document.querySelector(selector)).find(isVisible);
+                    const messages = document.querySelectorAll(__ASSISTANT_SELECTOR__);
+                    const isNew = messages.length > __INITIAL_COUNT__;
                     
-                    const messages = document.querySelectorAll('[data-message-author-role="assistant"], .agent-turn');
-                    const isNew = messages.length > {initial_assistant_count};
+                    if (isVisible(stopButton)) {
+                        return { status: "generating", isNew: isNew };
+                    }
                     
-                    if (isVisible(stopButton)) {{
-                        return {{ status: "generating", isNew: isNew }};
-                    }}
+                    if (isNew) {
+                        return { status: "done", isNew: isNew };
+                    }
                     
-                    if (isNew) {{
-                        return {{ status: "done", isNew: isNew }};
-                    }}
-                    
-                    return {{ status: "waiting", isNew: isNew }};
-                }}"#, initial_assistant_count = initial_assistant_count)
+                    return { status: "waiting", isNew: isNew };
+                }"#
+            .replace("__STOP_SELECTORS__", stop_selectors)
+            .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+            .replace("__INITIAL_COUNT__", &initial_assistant_count.to_string());
+            let check_res = match call_mcp_tool(
+                &config_path,
+                "evaluate_script",
+                serde_json::json!({
+                    "function": response_check_js
                 }),
             ) {
                 Ok(res) => res,
                 Err(e) => {
                     if cli.verbose {
-                        eprintln!("Warning: Failed to poll ChatGPT response: {}", e);
+                        eprintln!(
+                            "Warning: Failed to poll {} response: {}",
+                            provider.display_name(),
+                            e
+                        );
                     }
                     thread::sleep(Duration::from_millis(100));
                     wait_cycles += 1;
@@ -2326,14 +2975,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if finished {
         if cli.verbose {
-            println!("Copying final response from ChatGPT toolbar...");
+            println!(
+                "Copying final response from {} toolbar...",
+                provider.display_name()
+            );
         }
-        match copy_latest_markdown(&config_path) {
+        match copy_latest_markdown(&config_path, provider) {
             Ok(content) => {
                 last_markdown = content;
             }
             Err(e) => {
-                eprintln!("Error copying response from ChatGPT toolbar: {}", e);
+                eprintln!(
+                    "Error copying response from {} toolbar: {}",
+                    provider.display_name(),
+                    e
+                );
             }
         }
     }
@@ -2345,6 +3001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if finished {
         let _ = download_images_from_latest_message(
             &config_path,
+            provider,
             cli.image_output.as_deref(),
             cli.verbose,
         )

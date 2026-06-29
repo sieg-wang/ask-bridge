@@ -1,24 +1,25 @@
 # Ask ChatGPT Rust 版
 
-`ask` 是以 Rust 撰寫的輕量命令列工具，可透過真實 Chrome 瀏覽器自動操作 ChatGPT。它使用 Model Context Protocol MCP 與 Chrome DevTools Protocol CDP，並透過內建的 `doggy8088/mcp-cli` Rust library dependency 搭配 `chrome-devtools-mcp` 控制 Chrome、輸入 prompt、送出訊息，並將回覆即時串流輸出到終端機。
+`ask` 是以 Rust 撰寫的輕量命令列工具，可透過真實 Chrome 瀏覽器自動操作 ChatGPT 與 Gemini。它使用 Model Context Protocol MCP 與 Chrome DevTools Protocol CDP，並透過內建的 `doggy8088/mcp-cli` Rust library dependency 搭配 `chrome-devtools-mcp` 控制 Chrome、輸入 prompt、送出訊息，並將回覆輸出到終端機。預設 provider 為 ChatGPT，可用 `--provider gemini` 切換到 Gemini。
 
 不同於一般 API client，`ask` 會在真實 Chrome 瀏覽器中執行，並使用持久化的專屬使用者 profile。這表示：
 
 - 只需要手動登入一次，透過 `ask login` 完成。
-- 可處理 CAPTCHA、Cloudflare，並像一般使用者一樣存取 ChatGPT 方案功能與自訂 GPT。
+- 可處理 CAPTCHA、Cloudflare，並像一般使用者一樣存取所選 provider 的網頁功能。
 - Session cookies、登入狀態與對話紀錄會持久保存。
 
 ## 主要功能
 
 - **100% Rust 核心**：快速、輕量，編譯後即可執行。
+- **多 provider 支援**：使用 `--provider chatgpt|gemini` 選擇 ChatGPT 或 Gemini。
 - **真實瀏覽器自動化**：直接控制監聽 `9223` port 的 Chrome debug profile。
 - **持久登入狀態**：使用專屬本機 profile 目錄 `~/.config/ask-chatgpt/chrome-profile`，避免重複登入。
-- **即時串流輸出**：ChatGPT 產生回覆時，逐字將內容輸出到終端機。
-- **思考動畫**：等待 ChatGPT 回覆時，在終端機顯示旋轉 spinner，開始輸出內容後自動清除。
-- **智慧分頁管理**：可重用既有 ChatGPT 分頁、聚焦分頁，或開啟新分頁，避免分頁過度增加。
+- **回覆輸出**：所選 provider 產生回覆時，將內容輸出到終端機。
+- **思考動畫**：等待 provider 回覆時，在終端機顯示旋轉 spinner，開始輸出內容後自動清除。
+- **智慧分頁管理**：可重用既有 provider 分頁、聚焦分頁，或開啟新分頁，避免分頁過度增加。
 - **Pipe 與 stdin 支援**：支援透過 standard input 傳入 prompt，例如 `cat report.txt | ask "summarize this"`。
-- **圖片與文件上傳**：可透過 `--image` 附上本機圖片，或透過 `--file` 附上文件（PDF、Word、Excel、純文字、Markdown、JSON 等皆可），一次可指定多個檔案。
-- **模型切換**：使用 `--model` 在送出 prompt 前自動切換 ChatGPT 模型或思考強度（如 `GPT-5.4`、`o3`、`即時`）。
+- **圖片與文件上傳**：可透過 `--image` 附上 ChatGPT 圖片，或透過 `--file` 附上文件（PDF、Word、Excel、純文字、Markdown、JSON 等皆可），一次可指定多個檔案；Gemini 目前支援 `--file`，不支援 `--image` 圖片輸入。
+- **模型切換**：使用 `--model` 在送出 prompt 前自動切換 provider 模型（如 ChatGPT 的 `GPT-5.4`、`o3`，或 Gemini 的 `3.5 Flash`、`3.1 Pro`）。
 - **預設安靜模式與 verbose 模式**：預設只輸出最終回覆；加上 `--verbose` 可顯示背景瀏覽器控制流程。
 - **版本資訊**：使用 `-v` 或 `--version` 顯示目前版本號。
 
@@ -57,18 +58,24 @@ cargo build --release
 
 ## 使用方式
 
-### 1. 首次設定：登入 ChatGPT
+### 1. 首次設定：登入 provider
 
-送出 prompt 前，需要先登入 ChatGPT 帳號。執行：
+送出 prompt 前，需要先登入所選 provider。ChatGPT 為預設：
 
 ```bash
 ask login
 ```
 
+若要登入 Gemini：
+
+```bash
+ask --provider gemini login
+```
+
 此命令會：
 
 - 使用專屬且持久化的 debug profile 啟動 Google Chrome。
-- 開啟 `https://chatgpt.com/`。
+- 開啟所選 provider 頁面，例如 `https://chatgpt.com/` 或 `https://gemini.google.com/app`。
 - 等待你手動登入帳號。
 - 在你回到終端機按 Enter 後，驗證登入狀態並保存 profile。
 
@@ -80,25 +87,26 @@ ask login
 
 ```bash
 ask "Rust struct 和 tuple 有什麼差異？"
+ask --provider gemini "Rust struct 和 tuple 有什麼差異？"
 ```
 
 執行後：
 
-- Chrome 會開啟或聚焦 ChatGPT 分頁。
+- Chrome 會開啟或聚焦所選 provider 分頁。
 - Prompt 會自動輸入並送出。
-- ChatGPT 回覆會即時串流輸出到終端機。
+- 所選 provider 的回覆會輸出到終端機。
 
 ### 3. 開啟全新對話
 
-預設情況下，`ask` 會重用既有 ChatGPT 分頁，以避免建立過多分頁。
+預設情況下，`ask` 會重用既有所選 provider 分頁，以避免建立過多分頁。
 
-若要開啟全新的 ChatGPT 對話，使用 `--new`：
+若要開啟全新的 provider 對話，使用 `--new`：
 
 ```bash
 ask "誰是保哥？" --new
 ```
 
-此模式會開啟新的 ChatGPT 分頁，並清理先前的 ChatGPT 分頁。
+此模式會開啟新的所選 provider 分頁，並清理先前同一 provider 的分頁。
 
 ### 4. Headless 模式
 
@@ -110,11 +118,11 @@ ask "誰是保哥？" --new
 ask "誰是保哥？" --headless=false
 ```
 
-`ask login` 與 `ask open` 這類 subcommand 會強制使用 headful 模式，方便你和瀏覽器 UI 互動。
+`ask login` 會強制使用 headful 模式，方便你和瀏覽器 UI 互動；其他 subcommand 若要可見瀏覽器，請明確加上 `--headless=false`。
 
 ### 5. Verbose 模式
 
-預設情況下，`ask` 只輸出 ChatGPT 的最終回覆，隱藏背景控制訊息。
+預設情況下，`ask` 只輸出所選 provider 的最終回覆，隱藏背景控制訊息。
 
 若要查看完整瀏覽器自動化流程，加入 `--verbose`：
 
@@ -128,7 +136,7 @@ Verbose 模式會顯示類似以下流程：
 - 聚焦輸入欄位。
 - 輸入 prompt。
 - 送出訊息。
-- 等待 ChatGPT 回覆。
+- 等待 provider 回覆。
 
 ### 6. 顯示版本
 
@@ -154,11 +162,11 @@ cat src/main.rs | ask "這段 Rust code 有記憶體洩漏風險嗎？"
 
 ### 8. 附上圖片或文件
 
-除了把檔案內容透過 pipe 傳入 prompt，你也可以直接把本機檔案當作附件上傳給 ChatGPT。
+除了把檔案內容透過 pipe 傳入 prompt，你也可以直接把本機檔案當作附件上傳給所選 provider。
 
 #### 附上圖片
 
-使用 `--image` 附上一或多張本機圖片（可重複指定）：
+使用 `--image` 附上一或多張本機圖片（可重複指定）。此功能目前支援 ChatGPT；Gemini 圖片輸入尚未支援，搭配 `--provider gemini` 使用會立即回報錯誤。
 
 ```bash
 ask "請描述這張圖片的內容。" --image screenshot.png
@@ -169,7 +177,7 @@ ask "比較這兩張圖的差異。" --image v1.png --image v2.png
 
 #### 附上文件
 
-使用 `--file` 附上一或多份本機文件（可重複指定），例如 PDF、Word、Excel、PowerPoint、純文字、Markdown、CSV、JSON、程式碼等：
+使用 `--file` 附上一或多份本機文件（可重複指定），例如 PDF、Word、Excel、PowerPoint、純文字、Markdown、CSV、JSON、程式碼等。ChatGPT 與 Gemini 都支援此流程。
 
 ```bash
 ask "請摘要這份 PDF 的重點。" --file report.pdf
@@ -185,31 +193,35 @@ ask "請對照這張設計圖與規格文件，指出不一致的地方。" --im
 
 #### 顯示上傳結果
 
-ChatGPT 回覆後，可使用 `-i` / `--image-output` 指定 ChatGPT 生成圖片的下載路徑（資料夾或檔案路徑）。
+provider 回覆後，可使用 `-i` / `--image-output` 指定生成圖片的下載路徑（資料夾或檔案路徑）。
 
 ### 9. 切換模型
 
-使用 `--model` 在送出 prompt 前自動切換 ChatGPT 的模型或思考強度。比對時不分大小寫與標點符號（`-`、`.`、空格 等）。
+使用 `--model` 在送出 prompt 前自動切換 provider 的模型。比對時不分大小寫與標點符號（`-`、`.`、空格 等）。
 
 ```bash
 ask "用幾句話介紹 Rust。" --model GPT-5.4
 ask "證明這個數學問題。" --model o3
 ask "快速翻譯這段話。" --model 即時
+ask --provider gemini "用幾句話介紹 Rust。" --model "3.5 Flash"
+ask --provider gemini "用幾句話介紹 Rust。" --model "3.1 Pro"
 ```
 
-可用的模型名稱（視帳號權限而定）：
+可用的模型名稱（視帳號權限與 provider UI 而定）：
 
-- **模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
+- **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 
 > 若指定的名稱在選單中找不到，`ask` 會回報 `Model switch failed: error: model not found in menu` 並中止，不會送出 prompt。
 
-### 10. 只開啟 ChatGPT
+### 10. 只開啟 provider
 
-若只想快速開啟瀏覽器並進入 ChatGPT：
+若只想快速開啟瀏覽器並進入所選 provider：
 
 ```bash
 ask open
+ask --provider gemini open
 ```
 
 ## 運作原理
@@ -217,7 +229,7 @@ ask open
 1. **瀏覽器初始化**：`ask` 會檢查 Chrome 是否正在監聽 debug port `9223`。若沒有，會以專屬 profile 目錄 `~/.config/ask-chatgpt/chrome-profile` 啟動 Google Chrome。
 2. **MCP Bridge 設定**：啟動時會自動寫入 `~/.config/ask-chatgpt/mcp_servers.json`，預設設定 Chrome DevTools MCP server，使用 `chrome-devtools-mcp@latest` 與 `--browser-url=http://127.0.0.1:9223`。
 3. **Client 呼叫**：`ask` 透過內建的 `doggy8088/mcp-cli` Rust library dependency 呼叫 MCP tools，例如 `list_pages`、`select_page`、`type_text` 與 `evaluate_script`，不依賴系統上的外部 `mcp-cli` 命令。
-4. **狀態輪詢**：ChatGPT 產生回覆期間，工具會以 JavaScript 檢查送出與停止按鈕狀態，擷取回覆元素的文字內容，並將差異串流輸出到 `stdout`。
+4. **狀態輪詢**：provider 產生回覆期間，工具會以 JavaScript 檢查送出與停止按鈕狀態，擷取回覆元素的文字內容，並輸出到 `stdout`。
 
 ## 相關文件
 

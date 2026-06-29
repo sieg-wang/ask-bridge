@@ -1,10 +1,10 @@
 # Ask ChatGPT (Rust Version) 🦀
 
-`ask` is a powerful, lightweight command-line tool written in **Rust** that automates ChatGPT directly in your real Chrome browser. It uses the **Model Context Protocol (MCP)** and **Chrome DevTools Protocol (CDP)** via the embedded `doggy8088/mcp-cli` Rust library dependency and `chrome-devtools-mcp` to control Chrome, input prompts, click submit, and **stream the response back to your terminal in real-time**.
+`ask` is a powerful, lightweight command-line tool written in **Rust** that automates ChatGPT or Gemini directly in your real Chrome browser. It uses the **Model Context Protocol (MCP)** and **Chrome DevTools Protocol (CDP)** via the embedded `doggy8088/mcp-cli` Rust library dependency and `chrome-devtools-mcp` to control Chrome, input prompts, click submit, and print the response back to your terminal. ChatGPT is the default provider; use `--provider gemini` to switch to Gemini.
 
-Unlike typical API clients, `ask` operates inside a real, headful Chrome browser with a **persistent user profile**. This means:
+Unlike typical API clients, `ask` operates inside a real Chrome browser with a **persistent user profile**. This means:
 - You log in manually **once** (`ask login`).
-- You can solve CAPTCHAs, bypass Cloudflare, and access GPT-4o or your custom GPTs exactly like a human would.
+- You can solve CAPTCHAs, pass provider-side browser checks, and access the selected provider's web features like a normal user.
 - Your session cookies, login state, and chat history are saved persistently.
 
 ---
@@ -12,14 +12,15 @@ Unlike typical API clients, `ask` operates inside a real, headful Chrome browser
 ## 🌟 Key Features
 
 - **🦀 100% Rust Core**: Extremely fast, lightweight, and compile-once, run-anywhere binary.
+- **Multi-provider support**: Choose ChatGPT or Gemini with `--provider chatgpt|gemini`.
 - **🌐 Real Browser Automation**: Directly interacts with Chrome on port `9223` (isolated debug profile).
 - **🔒 Persistent Login**: Uses a dedicated local profile directory (`~/.config/ask-chatgpt/chrome-profile`) so you never lose your login state.
-- **⚡ Real-time Streaming**: Streams ChatGPT's response character-by-character as it's generated, with a beautiful live-typing effect.
-- **🌀 TUI Thinking Animation**: Displays a gorgeous, fluid rotating braille spinner (`⠋ 正在思考中 🧠...`) while waiting for ChatGPT to think and reply, which clears automatically the instant the streaming response starts.
-- **🧠 Intelligent Tab Management**: Reuses existing ChatGPT tabs if open, focuses them, or opens new ones, avoiding tab clutter.
+- **Response Output**: Prints the selected provider's response back to your terminal.
+- **🌀 TUI Thinking Animation**: Displays a rotating spinner while waiting for the provider to reply, then clears it once output starts.
+- **🧠 Intelligent Tab Management**: Reuses existing provider tabs if open, focuses them, or opens new ones, avoiding tab clutter.
 - **🖥️ Pipe & Stdin Support**: Supports piping prompts via `stdin` (e.g. `cat report.txt | ask "summarize this"`).
-- **📎 Image & File Attachments**: Attach local images with `--image` or documents (PDF, Word, Excel, plain text, Markdown, JSON, etc.) with `--file`; each flag can be specified multiple times.
-- **🔀 Model Switching**: Use `--model` to switch the ChatGPT model or thinking level (e.g. `GPT-5.4`, `o3`, `即時`) before the prompt is sent.
+- **📎 Image & File Attachments**: Attach local images to ChatGPT with `--image`, or documents (PDF, Word, Excel, plain text, Markdown, JSON, etc.) with `--file`; Gemini currently supports `--file` and rejects `--image`.
+- **🔀 Model Switching**: Use `--model` to switch the provider model before the prompt is sent, such as ChatGPT `GPT-5.4` or Gemini `3.5 Flash`.
 - **🔍 Quiet by Default & Verbose Mode**: Quiet and clean output by default (displaying only the generated response), with an optional `--verbose` flag to display full browser state logs if needed.
 - **Version Info**: Use `-v` or `--version` to print the current version number.
 
@@ -62,16 +63,22 @@ The compiled binary will be located at `target/release/ask-chatgpt`.
 
 ## 📖 Usage Guide
 
-### 1. First Time Setup: Login to ChatGPT
+### 1. First Time Setup: Login to a provider
 
-Before sending prompts, you need to log in to your ChatGPT account. Run:
+Before sending prompts, you need to log in to the selected provider. ChatGPT is the default:
 
 ```bash
 ask login
 ```
 
+For Gemini:
+
+```bash
+ask --provider gemini login
+```
+
 - This will automatically launch Google Chrome with a dedicated, persistent debug profile.
-- Log in manually to `https://chatgpt.com/` using your account (Google, Apple, Email, etc.).
+- Log in manually to the selected provider page, such as `https://chatgpt.com/` or `https://gemini.google.com/app`.
 - Once logged in, return to your terminal and press **`[Enter]`**.
 - The tool will verify your login status and save your profile. You only need to do this **once**!
 
@@ -81,15 +88,16 @@ Simply pass your prompt as an argument:
 
 ```bash
 ask "What is the difference between a struct and a tuple in Rust?"
+ask --provider gemini "What is the difference between a struct and a tuple in Rust?"
 ```
 
-- Chrome will open or focus on your ChatGPT tab.
+- Chrome will open or focus on your selected provider tab.
 - The prompt will be typed out and submitted.
-- The AI's response will **stream live inside your terminal**!
+- The selected provider's response will be printed in your terminal.
 
 ### 3. Open a Brand New Session (`--new`)
 
-By default, `ask` will reuse any existing open ChatGPT tab to avoid cluttering your browser with too many tabs.
+By default, `ask` will reuse any existing open tab for the selected provider to avoid cluttering your browser with too many tabs.
 
 If you want to start a **completely fresh conversation session** (equivalent to clicking "New Chat" in the sidebar), use the `--new` flag:
 
@@ -97,8 +105,8 @@ If you want to start a **completely fresh conversation session** (equivalent to 
 ask "誰是保哥？" --new
 ```
 
-- This will open a **brand new ChatGPT tab**.
-- It will **automatically close all previous ChatGPT tabs** to keep your workspace clean and organized.
+- This will open a **brand new selected-provider tab**.
+- It will **automatically close previous tabs for the same provider** to keep your workspace clean and organized.
 
 ### 4. Headless Mode (Default: True)
 
@@ -110,11 +118,11 @@ If you want to watch Chrome work in real-time or need to manually check what's h
 ask "誰是保哥？" --headless=false
 ```
 
-*Note: Subcommands like `ask login` and `ask open` always override the default and run in **headful mode** so you can interact with the UI.*
+*Note: `ask login` always overrides the default and runs in **headful mode** so you can interact with the UI. For other subcommands, pass `--headless=false` when you want a visible browser.*
 
 ### 5. Verbose Mode (`--verbose`)
 
-By default, `ask` runs in a **quiet, clean mode** that hides all background browser-control logs (such as "Checking open Chrome tabs...", "Typing prompt...", etc.) and only displays the final streamed markdown answer. However, it still plays a beautiful, animated rotating spinner in your terminal while waiting for ChatGPT to generate a response.
+By default, `ask` runs in a **quiet, clean mode** that hides all background browser-control logs (such as "Checking open Chrome tabs...", "Typing prompt...", etc.) and only displays the final markdown answer. However, it still plays an animated rotating spinner in your terminal while waiting for the provider to generate a response.
 
 If you want to see detailed step-by-step status logs of what `ask` is doing behind the scenes, add the `--verbose` flag:
 
@@ -127,7 +135,7 @@ This will print every stage of the browser automation:
 - Focusing input field...
 - Typing your prompt...
 - Submitting...
-- Waiting for ChatGPT response...
+- Waiting for provider response...
 
 ### 6. Version Info
 
@@ -153,11 +161,11 @@ cat src/main.rs | ask "Are there any memory leaks in this Rust code?"
 
 ### 8. Attaching Images or Files
 
-Instead of piping file contents into the prompt, you can upload local files as attachments directly to ChatGPT.
+Instead of piping file contents into the prompt, you can upload local files as attachments directly to the selected provider.
 
 #### Attach images
 
-Use `--image` (repeatable) to attach one or more local images:
+Use `--image` (repeatable) to attach one or more local images. This currently supports ChatGPT; Gemini image input is not enabled and exits with an explicit error when used with `--provider gemini`.
 
 ```bash
 ask "Describe this image." --image screenshot.png
@@ -168,7 +176,7 @@ Supported formats include PNG, JPEG, GIF, WebP, SVG, BMP, and more.
 
 #### Attach documents
 
-Use `--file` (repeatable) to attach documents such as PDF, Word, Excel, PowerPoint, plain text, Markdown, CSV, JSON, or source code:
+Use `--file` (repeatable) to attach documents such as PDF, Word, Excel, PowerPoint, plain text, Markdown, CSV, JSON, or source code. This flow supports both ChatGPT and Gemini.
 
 ```bash
 ask "Summarize this PDF." --file report.pdf
@@ -184,27 +192,31 @@ ask "Compare this design image against the spec document and list inconsistencie
 
 ### 9. Switch Model
 
-Use `--model` to automatically switch the ChatGPT model or thinking level before the prompt is sent. Matching is case- and punctuation-insensitive (`-`, `.`, spaces, etc. are ignored).
+Use `--model` to automatically switch the provider model before the prompt is sent. Matching is case- and punctuation-insensitive (`-`, `.`, spaces, etc. are ignored).
 
 ```bash
 ask "Introduce Rust in a few sentences." --model GPT-5.4
 ask "Prove this math problem." --model o3
 ask "Quickly translate this." --model 即時
+ask --provider gemini "Introduce Rust in a few sentences." --model "3.5 Flash"
+ask --provider gemini "Introduce Rust in a few sentences." --model "3.1 Pro"
 ```
 
-Available model names (depending on your account entitlements):
+Available model names (depending on your account entitlements and provider UI):
 
-- **Models**: `GPT-5.5`, `GPT-5.4`, `GPT-5.3`, `o3`
-- **Thinking levels**: `智慧`, `即時`, `中等`, `高`, `超高`, `專業`
+- **ChatGPT models**: `GPT-5.5`, `GPT-5.4`, `GPT-5.3`, `o3`
+- **ChatGPT thinking levels**: `智慧`, `即時`, `中等`, `高`, `超高`, `專業`
+- **Gemini modes**: `3.5 Flash`, `3.1 Flash-Lite`, `3.1 Pro`
 
 > If the requested name is not found in the menu, `ask` reports `Model switch failed: error: model not found in menu` and aborts without submitting the prompt.
 
-### 10. Just Open ChatGPT
+### 10. Just Open a Provider
 
-To quickly launch the browser and open ChatGPT without sending any query:
+To quickly launch the browser and open the selected provider without sending any query:
 
 ```bash
 ask open
+ask --provider gemini open
 ```
 
 ---
@@ -214,7 +226,7 @@ ask open
 1. **Browser Initialization**: `ask` checks if Chrome is listening on debugging port `9223`. If not, it spawns Google Chrome as a background process with a custom profile directory (`~/.config/ask-chatgpt/chrome-profile`).
 2. **MCP Bridge Config**: On startup, it automatically writes a custom `mcp_servers.json` to `~/.config/ask-chatgpt/mcp_servers.json`, configuring the Chrome DevTools MCP server by default with `chrome-devtools-mcp@latest` and `--browser-url=http://127.0.0.1:9223`.
 3. **Client Call**: `ask` calls the embedded `doggy8088/mcp-cli` Rust library dependency, invoking `list_pages`, `select_page`, `type_text`, and `evaluate_script` tools to automate the DOM without relying on an external `mcp-cli` executable.
-4. **State Polling**: During generation, a lightweight JavaScript engine checks ChatGPT's send/stop button states and extracts response element inner-text, streaming the delta to `stdout`.
+4. **State Polling**: During generation, a lightweight JavaScript engine checks the provider's send/stop button states and extracts response element inner-text for terminal output.
 
 ---
 

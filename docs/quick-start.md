@@ -1,6 +1,6 @@
 # 快速開始
 
-本文件說明如何安裝 `ask`，並透過 Chrome 自動操作 ChatGPT。
+本文件說明如何安裝 `ask`，並透過 Chrome 自動操作 ChatGPT 或 Gemini。預設 provider 為 ChatGPT，可用 `--provider gemini` 切換。
 
 ## 前置需求
 
@@ -42,15 +42,24 @@ Chrome 會使用專屬 profile 開啟，profile 路徑為：
 
 在瀏覽器視窗登入 ChatGPT 後，回到終端機按 Enter。
 
+若要登入 Gemini：
+
+```sh
+ask --provider gemini login
+```
+
+在瀏覽器視窗登入 Gemini 後，回到終端機按 Enter。
+
 ## 提問
 
 執行：
 
 ```sh
 ask "用一段話解釋 Rust ownership。"
+ask --provider gemini "用一段話解釋 Rust ownership。"
 ```
 
-一般提問預設會使用 headless Chrome，並把 ChatGPT 回覆串流輸出到終端機。
+一般提問預設會使用 headless Chrome，並把所選 provider 的回覆輸出到終端機。
 
 ## 使用可見瀏覽器
 
@@ -62,7 +71,7 @@ ask "請示範一個簡短 Markdown 表格。" --headless=false
 
 這會在自動化執行期間保持 Chrome 視窗可見。
 
-## 開啟新的 ChatGPT 對話
+## 開啟新的 provider 對話
 
 執行：
 
@@ -70,7 +79,7 @@ ask "請示範一個簡短 Markdown 表格。" --headless=false
 ask "開始一個關於 async Rust 的新主題。" --new
 ```
 
-`--new` 會開啟新的 ChatGPT 對話，而不是重用既有的 ChatGPT 分頁。
+`--new` 會開啟新的所選 provider 對話，而不是重用既有的同 provider 分頁。
 
 ## 透過 pipe 傳入內容
 
@@ -84,11 +93,11 @@ cat README.md | ask "摘要這份文件。"
 
 ## 附上圖片或文件
 
-`ask` 支援把本機檔案當作附件直接上傳給 ChatGPT，不必透過 pipe 把內容塞進 prompt。
+`ask` 支援把本機檔案當作附件直接上傳給所選 provider，不必透過 pipe 把內容塞進 prompt。Gemini 目前支援 `--file` 文件附件；`--image` 圖片輸入目前僅支援 ChatGPT。
 
 ### 附上圖片
 
-使用 `--image`（可重複指定）：
+使用 `--image`（可重複指定）。此功能目前僅支援 ChatGPT；搭配 `--provider gemini` 使用會立即回報錯誤。
 
 ```sh
 ask "請描述這張圖片。" --image screenshot.png
@@ -113,18 +122,20 @@ ask "對照這張設計圖與規格文件，指出不一致處。" --image desig
 
 ## 切換模型
 
-使用 `--model` 在送出 prompt 前自動切換 ChatGPT 模型或思考強度（不分大小寫與標點）：
+使用 `--model` 在送出 prompt 前自動切換 provider 模型（不分大小寫與標點）：
 
 ```sh
 ask "用幾句話介紹 Rust。" --model GPT-5.4
 ask "證明這個數學問題。" --model o3
 ask "快速翻譯這段話。" --model 即時
+ask --provider gemini "用幾句話介紹 Rust。" --model "3.5 Flash"
 ```
 
-可用名稱（視帳號權限）：
+可用名稱（視帳號權限與 provider UI）：
 
-- **模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
+- **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 
 ## MCP 行為
 
