@@ -153,6 +153,12 @@ You can pipe text or files directly into `ask`:
 echo "Explain quantum computing in one sentence" | ask
 ```
 
+When you also pass a prompt argument, `ask` uses the prompt first and then appends stdin content after two newlines:
+
+```bash
+cat /Users/will/.copilot/session-state/46cc0f1c-79fd-4622-9548-a0b7fa3794be/research/does-cursor-support-byok.md | ask 'What is this?'
+```
+
 Or read files:
 
 ```bash

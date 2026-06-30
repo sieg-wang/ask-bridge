@@ -154,6 +154,12 @@ ask -v
 echo "用一句話解釋 quantum computing" | ask
 ```
 
+若同時提供 prompt argument，`ask` 會先送出該 prompt，接著加上兩個換行後再附加管道內容：
+
+```bash
+cat /Users/will/.copilot/session-state/46cc0f1c-79fd-4622-9548-a0b7fa3794be/research/does-cursor-support-byok.md | ask 'What is this?'
+```
+
 也可以讀取檔案內容：
 
 ```bash

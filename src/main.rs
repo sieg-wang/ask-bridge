@@ -181,7 +181,9 @@ impl fmt::Display for Provider {
 #[command(disable_version_flag = true)]
 #[command(about = "AI browser CLI - Ask ChatGPT or Gemini from your Terminal with your subscription", long_about = None)]
 struct Cli {
-    /// The prompt to send to the selected provider. If empty, reads from standard input.
+    /// The prompt to send to the selected provider.
+    /// If standard input is piped and this value is present, they are combined as:
+    /// `prompt + "\\n\\n" + stdin`.
     prompt: Option<String>,
 
     /// AI provider to automate.
@@ -2694,16 +2696,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Read prompt from arguments or stdin
-    let mut prompt = String::new();
-    if let Some(p) = cli.prompt {
-        prompt = p;
-    } else {
-        // Check if stdin is a pipe (not a tty)
-        if !std::io::stdin().is_terminal() {
-            io::stdin().read_to_string(&mut prompt)?;
-        }
+    // Read prompt from arguments and optionally append piped stdin content.
+    let mut stdin_prompt = String::new();
+
+    // Check if stdin is a pipe (not a tty)
+    if !std::io::stdin().is_terminal() {
+        io::stdin().read_to_string(&mut stdin_prompt)?;
     }
+
+    let prompt = match cli.prompt {
+        Some(mut p) => {
+            if !stdin_prompt.is_empty() {
+                p.push_str("\n\n");
+                p.push_str(&stdin_prompt);
+            }
+            p
+        }
+        None => stdin_prompt,
+    };
 
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {

@@ -91,6 +91,8 @@ cat README.md | ask "摘要這份文件。"
 
 若未提供 prompt argument，`ask` 會從 standard input 讀取內容。
 
+若同時提供 prompt argument，`ask` 會先將 prompt 輸出，並在後方接上兩個換行後再接上標準輸入內容。
+
 ## 附上圖片或文件
 
 `ask` 支援把本機檔案當作附件直接上傳給所選 provider，不必透過 pipe 把內容塞進 prompt。Gemini 目前支援 `--file` 文件附件；`--image` 圖片輸入目前僅支援 ChatGPT。
