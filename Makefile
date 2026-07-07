@@ -64,6 +64,20 @@ open: build ## Launch Chrome and open ChatGPT page
 
 ##@ Installation
 
+.PHONY: check-node
+check-node: ## Verify that Node.js and npx are installed (required to launch Chrome DevTools MCP)
+	@if ! command -v node >/dev/null 2>&1; then \
+		echo "$(YELLOW)Error: Node.js is not installed.$(RESET)"; \
+		echo "$(YELLOW)Please install Node.js first (from https://nodejs.org/ or using your package manager).$(RESET)"; \
+		exit 1; \
+	fi
+	@if ! command -v npx >/dev/null 2>&1; then \
+		echo "$(YELLOW)Error: npx is not installed (npx is required to launch chrome-devtools-mcp).$(RESET)"; \
+		echo "$(YELLOW)Please ensure NPM/npx is installed and available in your PATH.$(RESET)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)Node.js and npx are installed.$(RESET)"
+
 .PHONY: install-browser
 install-browser: ## Install Google Chrome if it is missing (required by Chrome DevTools MCP)
 	@if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then \
@@ -78,7 +92,7 @@ install-browser: ## Install Google Chrome if it is missing (required by Chrome D
 	fi
 
 .PHONY: install
-install: install-browser release ## Install required browser, build release, and create an 'ask' symlink in ~/.local/bin/
+install: check-node install-browser release ## Install required dependencies, build release, and create an 'ask' symlink in ~/.local/bin/
 	@echo "$(CYAN)Installing binary symlink to ~/.local/bin/ask...$(RESET)"
 	@mkdir -p ~/.local/bin
 	@ln -sf "$$(pwd)/target/release/ask-bridge" ~/.local/bin/ask
