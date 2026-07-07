@@ -34,19 +34,36 @@
 
 ## 安裝與建置
 
-### 1. 安裝工具
+### 1. 快速安裝 (推薦)
 
-在專案目錄執行：
+若您只想使用已編譯好的 Release 版本（不需要安裝 Rust 工具鏈），可直接使用以下一鍵安裝腳本。安裝腳本會自動檢查 Node.js 需求、下載適合您系統架構的 ask-bridge binary，並將其放入 `~/.local/bin/` 目錄中。
+
+#### macOS / Linux
+請開啟終端機執行：
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh | bash
+```
+
+#### Windows
+請開啟 PowerShell (建議以系統管理員身分) 執行：
+```powershell
+irm https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.ps1 | iex
+```
+
+> [!NOTE]
+> 請確保安裝路徑（macOS/Linux 為 `~/.local/bin`；Windows 為 `$HOME\.local\bin`）已加入您的系統 `PATH` 環境變數中。
+
+### 2. 從原始碼建置與安裝 (適用於開發者)
+
+若您想從原始碼編譯並安裝，請在複製本專案後，在專案目錄下執行：
 
 ```bash
 make install
 ```
 
-此命令會安裝必要的 Chrome 瀏覽器、建置最佳化 binary，並建立 `~/.local/bin/ask` symlink。
+此命令會自動檢查 Node.js 環境、檢查與安裝 Chrome 瀏覽器、建置最佳化的 binary，並在 `~/.local/bin/ask` 建立符號連結 (symlink)。
 
-請確認 `~/.local/bin` 已加入 shell 的 `PATH`。
-
-### 2. 只建置不安裝
+### 3. 只建置不安裝
 
 若只想建置 binary：
 

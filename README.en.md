@@ -39,17 +39,36 @@ You do **not** need a global `mcp-cli` executable. The Rust binary uses `mcp-cli
 
 ## 🚀 Installation & Build
 
-### 1. Build the Rust Project
+### 1. Quick Installation (Recommended)
 
-Clone or navigate to the project directory and install with Make:
+If you only want to use the pre-compiled Release version (without installing the Rust toolchain), you can run one of the following one-liner installation scripts. They will automatically verify the Node.js requirement, download the appropriate binary for your system architecture, and place it in your `~/.local/bin/` folder.
+
+#### macOS / Linux
+Open your terminal and run:
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh | bash
+```
+
+#### Windows
+Open PowerShell (recommended to Run as Administrator) and run:
+```powershell
+irm https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.ps1 | iex
+```
+
+> [!NOTE]
+> Make sure the installation path (`~/.local/bin` for macOS/Linux, and `$HOME\.local\bin` for Windows) is added to your system's `PATH` environment variable.
+
+### 2. Build & Install from Source (For Developers)
+
+Clone or navigate to the project directory and build/install with Make:
 
 ```bash
 make install
 ```
 
-This installs the required Chrome browser when needed, builds the optimized binary, and links it to `~/.local/bin/ask`.
+This verifies the Node.js environment, installs the required Chrome browser if needed, builds the optimized binary, and links it to `~/.local/bin/ask`.
 
-### 2. Add to PATH
+### 3. Build Only
 
 If you only want to build without installing:
 
