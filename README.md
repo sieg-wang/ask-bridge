@@ -90,6 +90,22 @@ cargo build --release
 
 編譯後的 binary 會位於 `target/release/ask-bridge`。
 
+### 4. 安裝 Agent Skill
+
+本專案提供 `ask-bridge` Agent Skill，讓支援 Skills 的 Coding Agent 可以在適合的情境下，自主使用 `ask` 將探索性研究、摘要、文件分析或方案比較等工作委派給 ChatGPT 或 Gemini 網站。
+
+請使用 `npx skills` 安裝，不需要手動複製 `skills/` 目錄：
+
+```bash
+npx skills add doggy8088/ask-bridge --skill ask-bridge
+```
+
+若要安裝到 Codex 的全域 Skills 目錄，可指定 agent 與 global scope：
+
+```bash
+npx skills add doggy8088/ask-bridge --skill ask-bridge --agent codex --global
+```
+
 ## 使用方式
 
 ### 1. 首次設定：登入 provider

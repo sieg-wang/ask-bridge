@@ -95,6 +95,22 @@ cargo build --release
 
 The compiled binary will be located at `target/release/ask-bridge`.
 
+### 4. Install the Agent Skill
+
+This repository provides an `ask-bridge` Agent Skill so Skills-compatible Coding Agents can use `ask` to delegate exploratory research, summarization, document analysis, or option comparison tasks to the ChatGPT or Gemini websites.
+
+Install it with `npx skills`; you do not need to copy the `skills/` directory manually:
+
+```bash
+npx skills add doggy8088/ask-bridge --skill ask-bridge
+```
+
+To install it globally for Codex, specify the agent and global scope:
+
+```bash
+npx skills add doggy8088/ask-bridge --skill ask-bridge --agent codex --global
+```
+
 ---
 
 ## 📖 Usage Guide
