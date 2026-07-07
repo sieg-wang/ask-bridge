@@ -17,7 +17,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
       - name: Update npm to latest
         run: npm install -g npm@latest
       - name: Align npm version with release tag
@@ -29,6 +28,5 @@ jobs:
       - name: Publish
         run: npm publish --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           ASK_CHATGPT_RELEASE_ASSET_RETRIES: 12
           ASK_CHATGPT_RELEASE_ASSET_RETRY_DELAY_MS: 10000
