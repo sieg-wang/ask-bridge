@@ -2,6 +2,23 @@
 
 `ask` 是以 Rust 撰寫的輕量命令列工具，可透過真實 Chrome 瀏覽器自動操作 ChatGPT 與 Gemini。它使用 Model Context Protocol MCP 與 Chrome DevTools Protocol CDP，並透過內建的 `doggy8088/mcp-cli` Rust library dependency 搭配 `chrome-devtools-mcp` 控制 Chrome、輸入 prompt、送出訊息，並將回覆輸出到終端機。預設 provider 為 ChatGPT，可用 `--provider gemini` 切換到 Gemini。
 
+## 設計意圖
+
+`ask` 的核心目的不是取代 ChatGPT、Gemini 或任何 Coding Agent，而是把它們橋接在一起。開發過程中常會出現大量探索性的 AI 需求，例如查資料、整理文件、比較方案、摘要錯誤訊息、分析程式片段、產生初稿或協助釐清不確定的技術問題。這類任務通常不一定需要由主要 Coding Agent 親自完成，也不一定值得消耗與程式碼編輯、測試、重構等高價值工作相同的 agent 額度。
+
+透過 `ask`，Coding Agent 可以把這些低風險、探索性、可委派的研究工作轉交給 ChatGPT 或 Gemini 網站處理，再把網站回覆取回終端機或後續工作流程中。由於 ChatGPT、Gemini 網站的使用額度與 Coding Agent 的執行額度通常分開計算，`ask` 可以讓開發者更有彈性地分配 AI 資源：主要 agent 專注在理解專案、修改程式、執行測試與整合結果；網站型 AI 則負責背景研究、文字處理與候選方案產出。
+
+換句話說，`ask` 是一個給 AI Agent 使用的外部研究橋接器：它把原本需要人類切換瀏覽器、貼上 prompt、等待回覆、再複製結果的流程，包裝成可由命令列驅動的自動化能力。這讓 agent 可以在不離開本機工作流程的情況下，自主向 ChatGPT 或 Gemini 發出請求，取得輔助資訊，並將其納入後續判斷。
+
+此工具特別適合：
+
+- 將大型文件、錯誤訊息或程式片段交給網站型 AI 做摘要、比對或初步分析。
+- 讓 Coding Agent 在實作前先委外蒐集背景資料、整理替代方案或產生檢查清單。
+- 把不需要直接修改專案檔案的 AI 任務移出主要 agent 執行流程。
+- 利用既有 ChatGPT 或 Gemini 網頁帳號的能力，處理 API 以外的互動式網站功能。
+
+`ask` 不保證網站 provider 的輸出一定正確，也不應取代本機測試、官方文件查證或人工審查。它的定位是降低探索性 AI 工作的操作成本，讓主要 Coding Agent 能以更低摩擦取得外部 AI 協助。
+
 不同於一般 API client，`ask` 會在真實 Chrome 瀏覽器中執行，並使用持久化的專屬使用者 profile。這表示：
 
 - 只需要手動登入一次，透過 `ask login` 完成。
