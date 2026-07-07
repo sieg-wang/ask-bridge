@@ -1,14 +1,14 @@
 # Ask Bridge 🦀
 
-`ask` is a powerful, lightweight command-line tool written in **Rust** that automates ChatGPT or Gemini directly in your real Chrome browser. It uses the **Model Context Protocol (MCP)** and **Chrome DevTools Protocol (CDP)** via the embedded `doggy8088/mcp-cli` Rust library dependency and `chrome-devtools-mcp` to control Chrome, input prompts, click submit, and print the response back to your terminal. ChatGPT is the default provider; use `--provider gemini` to switch to Gemini.
+`ask-bridge` is a powerful, lightweight command-line tool written in **Rust** that automates ChatGPT or Gemini directly in your real Chrome browser. It uses the **Model Context Protocol (MCP)** and **Chrome DevTools Protocol (CDP)** via the embedded `doggy8088/mcp-cli` Rust library dependency and `chrome-devtools-mcp` to control Chrome, input prompts, click submit, and print the response back to your terminal. ChatGPT is the default provider; use `--provider gemini` to switch to Gemini.
 
 ## Design Intent
 
-The core purpose of `ask` is not to replace ChatGPT, Gemini, or any Coding Agent. It is to bridge them together. During software development, many AI-assisted tasks are exploratory: researching background information, summarizing documents, comparing options, digesting error messages, analyzing code snippets, drafting text, or clarifying uncertain technical questions. These tasks do not always need to be handled directly by the primary Coding Agent, and they do not always justify using the same agent budget that should be reserved for code editing, testing, refactoring, and integration work.
+The core purpose of `ask-bridge` is not to replace ChatGPT, Gemini, or any Coding Agent. It is to bridge them together. During software development, many AI-assisted tasks are exploratory: researching background information, summarizing documents, comparing options, digesting error messages, analyzing code snippets, drafting text, or clarifying uncertain technical questions. These tasks do not always need to be handled directly by the primary Coding Agent, and they do not always justify using the same agent budget that should be reserved for code editing, testing, refactoring, and integration work.
 
-With `ask`, a Coding Agent can delegate low-risk, exploratory, and research-oriented tasks to the ChatGPT or Gemini websites, then bring the website response back into the terminal or the next step of the local workflow. Because ChatGPT and Gemini website usage quotas are typically separate from Coding Agent execution quotas, `ask` gives developers a more flexible way to allocate AI resources: the primary agent can focus on understanding the repository, modifying code, running tests, and integrating results, while website-based AI handles background research, text processing, and candidate solution generation.
+With `ask-bridge`, a Coding Agent can delegate low-risk, exploratory, and research-oriented tasks to the ChatGPT or Gemini websites, then bring the website response back into the terminal or the next step of the local workflow. Because ChatGPT and Gemini website usage quotas are typically separate from Coding Agent execution quotas, `ask-bridge` gives developers a more flexible way to allocate AI resources: the primary agent can focus on understanding the repository, modifying code, running tests, and integrating results, while website-based AI handles background research, text processing, and candidate solution generation.
 
-In other words, `ask` is an external research bridge for AI Agents. It turns the manual workflow of switching to a browser, pasting a prompt, waiting for a response, and copying the result back into a command-line-driven automation capability. This lets an agent request help from ChatGPT or Gemini without leaving the local development workflow, then use the response as supporting context for its own judgment.
+In other words, `ask-bridge` is an external research bridge for AI Agents. It turns the manual workflow of switching to a browser, pasting a prompt, waiting for a response, and copying the result back into a command-line-driven automation capability. This lets an agent request help from ChatGPT or Gemini without leaving the local development workflow, then use the response as supporting context for its own judgment.
 
 This tool is especially useful for:
 
@@ -17,10 +17,10 @@ This tool is especially useful for:
 - Moving AI tasks that do not directly modify project files out of the primary agent workflow.
 - Reusing existing ChatGPT or Gemini web accounts for interactive website features outside an API workflow.
 
-`ask` does not guarantee that provider output is correct, and it should not replace local tests, official documentation checks, or human review. Its role is to reduce the operational cost of exploratory AI work and let the primary Coding Agent obtain external AI assistance with less friction.
+`ask-bridge` does not guarantee that provider output is correct, and it should not replace local tests, official documentation checks, or human review. Its role is to reduce the operational cost of exploratory AI work and let the primary Coding Agent obtain external AI assistance with less friction.
 
-Unlike typical API clients, `ask` operates inside a real Chrome browser with a **persistent user profile**. This means:
-- You log in manually **once** (`ask login`).
+Unlike typical API clients, `ask-bridge` operates inside a real Chrome browser with a **persistent user profile**. This means:
+- You log in manually **once** (`ask-bridge login`).
 - You can solve CAPTCHAs, pass provider-side browser checks, and access the selected provider's web features like a normal user.
 - Your session cookies, login state, and chat history are saved persistently.
 
@@ -35,7 +35,7 @@ Unlike typical API clients, `ask` operates inside a real Chrome browser with a *
 - **Response Output**: Prints the selected provider's response back to your terminal.
 - **🌀 TUI Thinking Animation**: Displays a rotating spinner while waiting for the provider to reply, then clears it once output starts.
 - **🧠 Intelligent Tab Management**: Reuses existing provider tabs if open, focuses them, or opens new ones, avoiding tab clutter.
-- **🖥️ Pipe & Stdin Support**: Supports piping prompts via `stdin` (e.g. `cat report.txt | ask "summarize this"`).
+- **🖥️ Pipe & Stdin Support**: Supports piping prompts via `stdin` (e.g. `cat report.txt | ask-bridge "summarize this"`).
 - **📎 Image & File Attachments**: Attach local images to ChatGPT with `--image`, or documents (PDF, Word, Excel, plain text, Markdown, JSON, etc.) with `--file`; Gemini currently supports `--file` and rejects `--image`.
 - **🔀 Model Switching**: Use `--model` to switch the provider model before the prompt is sent, such as ChatGPT `GPT-5.4` or Gemini `3.5 Flash`.
 - **🔍 Quiet by Default & Verbose Mode**: Quiet and clean output by default (displaying only the generated response), with an optional `--verbose` flag to display full browser state logs if needed.
@@ -74,6 +74,7 @@ irm https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.ps1 | ie
 
 > [!NOTE]
 > Make sure the installation path (`~/.local/bin` for macOS/Linux, and `$HOME\.local\bin` for Windows) is added to your system's `PATH` environment variable.
+> The formal CLI command is `ask-bridge`; the installer also provides `ask` as a backward-compatible alias. The examples below use `ask-bridge`.
 
 ### 2. Build & Install from Source (For Developers)
 
@@ -83,7 +84,7 @@ Clone or navigate to the project directory and build/install with Make:
 make install
 ```
 
-This verifies the Node.js environment, installs the required Chrome browser if needed, builds the optimized binary, and links it to `~/.local/bin/ask`.
+This verifies the Node.js environment, installs the required Chrome browser if needed, builds the optimized binary, links the formal command to `~/.local/bin/ask-bridge`, and also creates the `ask` alias.
 
 ### 3. Build Only
 
@@ -97,7 +98,7 @@ The compiled binary will be located at `target/release/ask-bridge`.
 
 ### 4. Install the Agent Skill
 
-This repository provides an `ask-bridge` Agent Skill so Skills-compatible Coding Agents can use `ask` to delegate exploratory research, summarization, document analysis, or option comparison tasks to the ChatGPT or Gemini websites.
+This repository provides an `ask-bridge` Agent Skill so Skills-compatible Coding Agents can use `ask-bridge` to delegate exploratory research, summarization, document analysis, or option comparison tasks to the ChatGPT or Gemini websites.
 
 Install it with `npx skills`; you do not need to copy the `skills/` directory manually:
 
@@ -120,13 +121,13 @@ npx skills add doggy8088/ask-bridge --skill ask-bridge --agent codex --global
 Before sending prompts, you need to log in to the selected provider. ChatGPT is the default:
 
 ```bash
-ask login
+ask-bridge login
 ```
 
 For Gemini:
 
 ```bash
-ask --provider gemini login
+ask-bridge --provider gemini login
 ```
 
 - This will automatically launch Google Chrome with a dedicated, persistent debug profile.
@@ -139,8 +140,8 @@ ask --provider gemini login
 Simply pass your prompt as an argument:
 
 ```bash
-ask "What is the difference between a struct and a tuple in Rust?"
-ask --provider gemini "What is the difference between a struct and a tuple in Rust?"
+ask-bridge "What is the difference between a struct and a tuple in Rust?"
+ask-bridge --provider gemini "What is the difference between a struct and a tuple in Rust?"
 ```
 
 - Chrome will open or focus on your selected provider tab.
@@ -149,12 +150,12 @@ ask --provider gemini "What is the difference between a struct and a tuple in Ru
 
 ### 3. Open a Brand New Session (`--new`)
 
-By default, `ask` will reuse any existing open tab for the selected provider to avoid cluttering your browser with too many tabs.
+By default, `ask-bridge` will reuse any existing open tab for the selected provider to avoid cluttering your browser with too many tabs.
 
 If you want to start a **completely fresh conversation session** (equivalent to clicking "New Chat" in the sidebar), use the `--new` flag:
 
 ```bash
-ask "誰是保哥？" --new
+ask-bridge "誰是保哥？" --new
 ```
 
 - This will open a **brand new selected-provider tab**.
@@ -167,19 +168,19 @@ By default, standard queries run Chrome in **headless mode** (`--headless=true`)
 If you want to watch Chrome work in real-time or need to manually check what's happening on the page, you can run in **headful mode** by setting `--headless=false`:
 
 ```bash
-ask "誰是保哥？" --headless=false
+ask-bridge "誰是保哥？" --headless=false
 ```
 
-*Note: `ask login` always overrides the default and runs in **headful mode** so you can interact with the UI. For other subcommands, pass `--headless=false` when you want a visible browser.*
+*Note: `ask-bridge login` always overrides the default and runs in **headful mode** so you can interact with the UI. For other subcommands, pass `--headless=false` when you want a visible browser.*
 
 ### 5. Verbose Mode (`--verbose`)
 
-By default, `ask` runs in a **quiet, clean mode** that hides all background browser-control logs (such as "Checking open Chrome tabs...", "Typing prompt...", etc.) and only displays the final markdown answer. However, it still plays an animated rotating spinner in your terminal while waiting for the provider to generate a response.
+By default, `ask-bridge` runs in a **quiet, clean mode** that hides all background browser-control logs (such as "Checking open Chrome tabs...", "Typing prompt...", etc.) and only displays the final markdown answer. However, it still plays an animated rotating spinner in your terminal while waiting for the provider to generate a response.
 
-If you want to see detailed step-by-step status logs of what `ask` is doing behind the scenes, add the `--verbose` flag:
+If you want to see detailed step-by-step status logs of what `ask-bridge` is doing behind the scenes, add the `--verbose` flag:
 
 ```bash
-ask "誰是保哥？" --verbose
+ask-bridge "誰是保哥？" --verbose
 ```
 
 This will print every stage of the browser automation:
@@ -194,27 +195,27 @@ This will print every stage of the browser automation:
 Use `-v` or `--version` to print the current version number:
 
 ```bash
-ask -v
+ask-bridge -v
 ```
 
 ### 7. Piping & Stdin Support
 
-You can pipe text or files directly into `ask`:
+You can pipe text or files directly into `ask-bridge`:
 
 ```bash
-echo "Explain quantum computing in one sentence" | ask
+echo "Explain quantum computing in one sentence" | ask-bridge
 ```
 
-When you also pass a prompt argument, `ask` uses the prompt first and then appends stdin content after two newlines:
+When you also pass a prompt argument, `ask-bridge` uses the prompt first and then appends stdin content after two newlines:
 
 ```bash
-cat /Users/will/.copilot/session-state/46cc0f1c-79fd-4622-9548-a0b7fa3794be/research/does-cursor-support-byok.md | ask 'What is this?'
+cat /Users/will/.copilot/session-state/46cc0f1c-79fd-4622-9548-a0b7fa3794be/research/does-cursor-support-byok.md | ask-bridge 'What is this?'
 ```
 
 Or read files:
 
 ```bash
-cat src/main.rs | ask "Are there any memory leaks in this Rust code?"
+cat src/main.rs | ask-bridge "Are there any memory leaks in this Rust code?"
 ```
 
 ### 8. Attaching Images or Files
@@ -226,8 +227,8 @@ Instead of piping file contents into the prompt, you can upload local files as a
 Use `--image` (repeatable) to attach one or more local images. This currently supports ChatGPT; Gemini image input is not enabled and exits with an explicit error when used with `--provider gemini`.
 
 ```bash
-ask "Describe this image." --image screenshot.png
-ask "Compare these two images." --image v1.png --image v2.png
+ask-bridge "Describe this image." --image screenshot.png
+ask-bridge "Compare these two images." --image v1.png --image v2.png
 ```
 
 Supported formats include PNG, JPEG, GIF, WebP, SVG, BMP, and more.
@@ -237,15 +238,15 @@ Supported formats include PNG, JPEG, GIF, WebP, SVG, BMP, and more.
 Use `--file` (repeatable) to attach documents such as PDF, Word, Excel, PowerPoint, plain text, Markdown, CSV, JSON, or source code. This flow supports both ChatGPT and Gemini.
 
 ```bash
-ask "Summarize this PDF." --file report.pdf
-ask "How many rows are in this CSV?" --file data.csv
-ask "Check this code for issues." --file src/main.rs
+ask-bridge "Summarize this PDF." --file report.pdf
+ask-bridge "How many rows are in this CSV?" --file data.csv
+ask-bridge "Check this code for issues." --file src/main.rs
 ```
 
 You can attach images and documents at the same time:
 
 ```bash
-ask "Compare this design image against the spec document and list inconsistencies." --image design.png --file spec.docx
+ask-bridge "Compare this design image against the spec document and list inconsistencies." --image design.png --file spec.docx
 ```
 
 ### 9. Switch Model
@@ -253,11 +254,11 @@ ask "Compare this design image against the spec document and list inconsistencie
 Use `--model` to automatically switch the provider model before the prompt is sent. Matching is case- and punctuation-insensitive (`-`, `.`, spaces, etc. are ignored).
 
 ```bash
-ask "Introduce Rust in a few sentences." --model GPT-5.4
-ask "Prove this math problem." --model o3
-ask "Quickly translate this." --model 即時
-ask --provider gemini "Introduce Rust in a few sentences." --model "3.5 Flash"
-ask --provider gemini "Introduce Rust in a few sentences." --model "3.1 Pro"
+ask-bridge "Introduce Rust in a few sentences." --model GPT-5.4
+ask-bridge "Prove this math problem." --model o3
+ask-bridge "Quickly translate this." --model 即時
+ask-bridge --provider gemini "Introduce Rust in a few sentences." --model "3.5 Flash"
+ask-bridge --provider gemini "Introduce Rust in a few sentences." --model "3.1 Pro"
 ```
 
 Available model names (depending on your account entitlements and provider UI):
@@ -266,34 +267,34 @@ Available model names (depending on your account entitlements and provider UI):
 - **ChatGPT thinking levels**: `智慧`, `即時`, `中等`, `高`, `超高`, `專業`
 - **Gemini modes**: `3.5 Flash`, `3.1 Flash-Lite`, `3.1 Pro`
 
-> If the requested name is not found in the menu, `ask` reports `Model switch failed: error: model not found in menu` and aborts without submitting the prompt.
+> If the requested name is not found in the menu, `ask-bridge` reports `Model switch failed: error: model not found in menu` and aborts without submitting the prompt.
 
 ### 10. Just Open a Provider
 
 To quickly launch the browser and open the selected provider without sending any query:
 
 ```bash
-ask open
-ask --provider gemini open
+ask-bridge open
+ask-bridge --provider gemini open
 ```
 
 ### 11. Close the Browser Instance
 
-To close the Chrome debug profile instance managed by `ask`:
+To close the Chrome debug profile instance managed by `ask-bridge`:
 
 ```bash
-ask close
+ask-bridge close
 ```
 
-`close` only shuts down the `ask` Chrome instance that uses `~/.config/ask-bridge/chrome-profile` and listens on debug port `9223`. If that port is occupied by a non-`ask` Chrome process, it reports an error instead of closing it.
+`close` only shuts down the `ask-bridge` Chrome instance that uses `~/.config/ask-bridge/chrome-profile` and listens on debug port `9223`. If that port is occupied by a non-`ask-bridge` Chrome process, it reports an error instead of closing it.
 
 ---
 
 ## ⚙️ How It Works (Under the Hood)
 
-1. **Browser Initialization**: `ask` checks if Chrome is listening on debugging port `9223`. If not, it spawns Google Chrome as a background process with a custom profile directory (`~/.config/ask-bridge/chrome-profile`).
+1. **Browser Initialization**: `ask-bridge` checks if Chrome is listening on debugging port `9223`. If not, it spawns Google Chrome as a background process with a custom profile directory (`~/.config/ask-bridge/chrome-profile`).
 2. **MCP Bridge Config**: On startup, it automatically writes a custom `mcp_servers.json` to `~/.config/ask-bridge/mcp_servers.json`, configuring the Chrome DevTools MCP server by default with `chrome-devtools-mcp@latest` and `--browser-url=http://127.0.0.1:9223`.
-3. **Client Call**: `ask` calls the embedded `doggy8088/mcp-cli` Rust library dependency, invoking `list_pages`, `select_page`, `type_text`, and `evaluate_script` tools to automate the DOM without relying on an external `mcp-cli` executable.
+3. **Client Call**: `ask-bridge` calls the embedded `doggy8088/mcp-cli` Rust library dependency, invoking `list_pages`, `select_page`, `type_text`, and `evaluate_script` tools to automate the DOM without relying on an external `mcp-cli` executable.
 4. **State Polling**: During generation, a lightweight JavaScript engine checks the provider's send/stop button states and extracts response element inner-text for terminal output.
 
 ---
