@@ -361,8 +361,9 @@ fn write_global_provider_config(provider: Provider) -> Result<(), String> {
         })?;
     }
 
-    let content = serde_json::to_string_pretty(&serde_json::json!({"provider": provider.to_string()}))
-        .map_err(|e| format!("Failed to serialize provider config: {}", e))?;
+    let content =
+        serde_json::to_string_pretty(&serde_json::json!({"provider": provider.to_string()}))
+            .map_err(|e| format!("Failed to serialize provider config: {}", e))?;
     std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
         format!(
             "Failed to write config file {}: {}",
@@ -398,7 +399,10 @@ fn run_config_command(cli_provider: Option<Provider>) -> Result<(), String> {
             if config_path.exists() {
                 println!("Config file: {}", config_path.to_string_lossy());
             } else {
-                println!("Config file not created yet: {}", config_path.to_string_lossy());
+                println!(
+                    "Config file not created yet: {}",
+                    config_path.to_string_lossy()
+                );
             }
             println!("Set default provider with: ask-bridge config --provider <chatgpt|gemini>");
             println!("This is a one-time override example: ask-bridge --provider gemini <prompt>");
