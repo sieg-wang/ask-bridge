@@ -29,5 +29,6 @@ jobs:
       - name: Publish
         run: npm publish --provenance --access public
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           ASK_CHATGPT_RELEASE_ASSET_RETRIES: 12
           ASK_CHATGPT_RELEASE_ASSET_RETRY_DELAY_MS: 10000
