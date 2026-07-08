@@ -503,6 +503,42 @@ fn chrome_profile_path() -> Result<String, String> {
     Ok(profile_dir.to_string_lossy().to_string())
 }
 
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CHROME_COMMANDS: &[&str] = &["google-chrome", "google-chrome-stable"];
+
+#[cfg(any(target_os = "linux", test))]
+fn first_existing_path(paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find(|path| Path::new(path).exists())
+        .map(|path| (*path).to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn find_command_in_path(command: &str, path_env: Option<&std::ffi::OsStr>) -> Option<String> {
+    let path_env = path_env?;
+
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join(command))
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn find_chrome_command_in_path(path_env: Option<&std::ffi::OsStr>) -> Option<String> {
+    LINUX_CHROME_COMMANDS
+        .iter()
+        .find_map(|command| find_command_in_path(command, path_env))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn find_linux_chrome_path(
+    path_env: Option<&std::ffi::OsStr>,
+    path_candidates: &[&str],
+) -> Option<String> {
+    find_chrome_command_in_path(path_env).or_else(|| first_existing_path(path_candidates))
+}
+
 fn find_chrome_path() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
@@ -543,7 +579,7 @@ fn find_chrome_path() -> Result<String, String> {
         Err("Google Chrome was not found in standard Windows installation paths. Please install Google Chrome.".to_string())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         let path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
         if std::path::Path::new(path).exists() {
@@ -551,6 +587,27 @@ fn find_chrome_path() -> Result<String, String> {
         } else {
             Err("Google Chrome not found at /Applications/Google Chrome.app".to_string())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        const LINUX_CHROME_PATHS: &[&str] = &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/local/bin/google-chrome",
+            "/usr/local/bin/google-chrome-stable",
+            "/opt/google/chrome/google-chrome",
+        ];
+
+        let path_env = std::env::var_os("PATH");
+        find_linux_chrome_path(path_env.as_deref(), LINUX_CHROME_PATHS).ok_or_else(|| {
+            "Google Chrome was not found in PATH or standard Linux installation paths. Please install Google Chrome or add google-chrome to PATH.".to_string()
+        })
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err("Google Chrome auto-detection is not supported on this operating system. Please use macOS, Windows, or Linux.".to_string())
     }
 }
 
@@ -997,6 +1054,19 @@ fn validate_provider_feature_support(provider: Provider, cli: &Cli) -> Result<()
 mod tests {
     use super::*;
 
+    fn make_test_dir(name: &str) -> std::path::PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ask_bridge_{}_{}_{}",
+            name,
+            std::process::id(),
+            timestamp
+        ))
+    }
+
     #[test]
     fn parses_provider_as_global_argument() {
         let cli = Cli::try_parse_from(["ask-bridge", "--provider", "gemini", "login"]).unwrap();
@@ -1182,6 +1252,51 @@ mod tests {
         ])
         .unwrap();
         assert!(validate_provider_feature_support(Provider::Gemini, &cli).is_ok());
+    }
+
+    #[test]
+    fn finds_linux_google_chrome_command_from_path() {
+        let root = make_test_dir("chrome_path");
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+
+        let stable_path = first_dir.join("google-chrome-stable");
+        let chrome_path = second_dir.join("google-chrome");
+        std::fs::write(&stable_path, "").unwrap();
+        std::fs::write(&chrome_path, "").unwrap();
+
+        let path_env = std::env::join_paths([first_dir.as_os_str(), second_dir.as_os_str()])
+            .expect("test PATH should be joinable");
+
+        let found = find_linux_chrome_path(Some(path_env.as_os_str()), &[]);
+
+        assert_eq!(found, Some(chrome_path.to_string_lossy().to_string()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finds_linux_chrome_from_standard_candidates_when_path_misses() {
+        let root = make_test_dir("chrome_candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let chrome_path = root.join("google-chrome");
+        std::fs::write(&chrome_path, "").unwrap();
+
+        let chrome_path_str = chrome_path.to_string_lossy().to_string();
+        let candidates = [chrome_path_str.as_str()];
+
+        let found = find_linux_chrome_path(None, &candidates);
+
+        assert_eq!(found, Some(chrome_path_str));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn returns_none_when_linux_chrome_is_missing() {
+        assert_eq!(find_linux_chrome_path(None, &[]), None);
     }
 }
 

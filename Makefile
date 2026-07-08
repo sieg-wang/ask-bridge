@@ -80,14 +80,29 @@ check-node: ## Verify that Node.js and npx are installed (required to launch Chr
 
 .PHONY: install-browser
 install-browser: ## Install Google Chrome if it is missing (required by Chrome DevTools MCP)
-	@if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then \
-		echo "$(GREEN)Google Chrome is already installed.$(RESET)"; \
-	elif command -v brew >/dev/null 2>&1; then \
-		echo "$(CYAN)Installing Google Chrome with Homebrew...$(RESET)"; \
-		brew install --cask google-chrome; \
+	@OS="$$(uname -s)"; \
+	if [ "$$OS" = "Darwin" ]; then \
+		if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then \
+			echo "$(GREEN)Google Chrome is already installed.$(RESET)"; \
+		elif command -v brew >/dev/null 2>&1; then \
+			echo "$(CYAN)Installing Google Chrome with Homebrew...$(RESET)"; \
+			brew install --cask google-chrome; \
+		else \
+			echo "$(YELLOW)Google Chrome is required by Chrome DevTools MCP but was not found.$(RESET)"; \
+			echo "$(YELLOW)Install Homebrew or install Chrome manually from https://www.google.com/chrome/ and rerun make install.$(RESET)"; \
+			exit 1; \
+		fi; \
+	elif [ "$$OS" = "Linux" ]; then \
+		if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1 || [ -x "/usr/bin/google-chrome" ] || [ -x "/usr/bin/google-chrome-stable" ] || [ -x "/opt/google/chrome/google-chrome" ]; then \
+			echo "$(GREEN)Google Chrome is already installed.$(RESET)"; \
+		else \
+			echo "$(YELLOW)Google Chrome is required by Chrome DevTools MCP but was not found in PATH or standard Linux paths.$(RESET)"; \
+			echo "$(YELLOW)Install Google Chrome Stable and ensure google-chrome is available in PATH.$(RESET)"; \
+			exit 1; \
+		fi; \
 	else \
-		echo "$(YELLOW)Google Chrome is required by Chrome DevTools MCP but was not found.$(RESET)"; \
-		echo "$(YELLOW)Install Homebrew or install Chrome manually from https://www.google.com/chrome/ and rerun make install.$(RESET)"; \
+		echo "$(YELLOW)Unsupported OS for automatic Chrome detection: $$OS.$(RESET)"; \
+		echo "$(YELLOW)Please install Google Chrome manually and verify ask-bridge can find it.$(RESET)"; \
 		exit 1; \
 	fi
 
