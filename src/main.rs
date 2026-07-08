@@ -229,6 +229,42 @@ impl fmt::Display for Provider {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ChatGptAgentPrompt<'a> {
+    agent_mention: &'a str,
+    body: &'a str,
+}
+
+fn parse_chatgpt_agent_prompt(prompt: &str) -> Option<ChatGptAgentPrompt<'_>> {
+    let rest = prompt.strip_prefix('@')?;
+    let mut agent_chars = 0usize;
+
+    for (idx, ch) in rest.char_indices() {
+        if ch.is_whitespace() {
+            if agent_chars == 0 || agent_chars > 10 {
+                return None;
+            }
+
+            let body = rest[idx + ch.len_utf8()..].trim_start_matches(char::is_whitespace);
+            if body.is_empty() {
+                return None;
+            }
+
+            return Some(ChatGptAgentPrompt {
+                agent_mention: &prompt[..idx + 1],
+                body,
+            });
+        }
+
+        agent_chars += 1;
+        if agent_chars > 10 {
+            return None;
+        }
+    }
+
+    None
+}
+
 #[derive(Parser)]
 #[command(name = "ask-bridge")]
 #[command(version = "0.1.5")]
@@ -1304,6 +1340,50 @@ mod tests {
             Some(Provider::Gemini)
         );
         assert_eq!(Provider::from_url("https://example.com"), None);
+    }
+
+    #[test]
+    fn parses_chatgpt_agent_prompt_with_chinese_agent_name() {
+        assert_eq!(
+            parse_chatgpt_agent_prompt(
+                "@智慧 研究多奇數位創意有限公司的發展沿革與創辦人的豐功偉業"
+            ),
+            Some(ChatGptAgentPrompt {
+                agent_mention: "@智慧",
+                body: "研究多奇數位創意有限公司的發展沿革與創辦人的豐功偉業"
+            })
+        );
+    }
+
+    #[test]
+    fn parses_chatgpt_agent_prompt_with_ten_character_agent_name() {
+        assert_eq!(
+            parse_chatgpt_agent_prompt("@一二三四五六七八九十 查資料"),
+            Some(ChatGptAgentPrompt {
+                agent_mention: "@一二三四五六七八九十",
+                body: "查資料"
+            })
+        );
+    }
+
+    #[test]
+    fn trims_extra_whitespace_between_chatgpt_agent_and_body() {
+        assert_eq!(
+            parse_chatgpt_agent_prompt("@智慧 \n\t查資料").unwrap().body,
+            "查資料"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_chatgpt_agent_prompt_shapes() {
+        assert_eq!(parse_chatgpt_agent_prompt("智慧 查資料"), None);
+        assert_eq!(parse_chatgpt_agent_prompt("@ 查資料"), None);
+        assert_eq!(parse_chatgpt_agent_prompt("@智慧"), None);
+        assert_eq!(parse_chatgpt_agent_prompt("@智慧   "), None);
+        assert_eq!(
+            parse_chatgpt_agent_prompt("@一二三四五六七八九十甲 查資料"),
+            None
+        );
     }
 
     #[test]
@@ -2797,6 +2877,502 @@ fn switch_model(
     Ok(())
 }
 
+fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
+    let mut wait_cycles = 0;
+    let mut status = String::from("pending");
+
+    // Page-side submission scripts may wait up to 15s for ChatGPT/Gemini to
+    // enable the send button, so keep this host-side polling window longer.
+    while status == "pending" && wait_cycles < 180 {
+        thread::sleep(Duration::from_millis(100));
+        let check_res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => window.__submit_status || 'pending'"
+            }),
+        )?;
+        if let Some(s) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|p| p.as_str().map(|str_ref| str_ref.to_string()))
+        {
+            status = s;
+        }
+        wait_cycles += 1;
+    }
+
+    if status.starts_with("error:") {
+        return Err(status);
+    }
+
+    if status == "pending" {
+        return Err("Timed out waiting for send button to activate and submit".to_string());
+    }
+
+    Ok(status)
+}
+
+fn focus_and_clear_composer(config_path: &str, provider: Provider) -> Result<(), String> {
+    let js = r#"() => {
+            const composerSelectors = __COMPOSER_SELECTORS__;
+            const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+            if (!el) {
+                return { ok: false, error: 'composer not found' };
+            }
+
+            el.focus();
+            try {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('delete');
+            } catch (e) {}
+
+            const currentText = typeof el.value !== 'undefined' ? el.value : (el.innerText || el.textContent || '');
+            if ((currentText || '').trim().length > 0) {
+                if (typeof el.value !== 'undefined') {
+                    el.value = '';
+                    if (el._valueTracker) {
+                        el._valueTracker.setValue('');
+                    }
+                } else {
+                    el.innerHTML = '<p><br></p>';
+                }
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            el.focus();
+            return { ok: true };
+        }"#
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json());
+
+    let res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": js }),
+    )?;
+    let parsed = parse_script_result(&res)?;
+    if parsed
+        .get("ok")
+        .and_then(|ok| ok.as_bool())
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(parsed
+            .get("error")
+            .and_then(|err| err.as_str())
+            .unwrap_or("failed to focus and clear composer")
+            .to_string())
+    }
+}
+
+fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
+    let js = r#"() => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const composer = document.querySelector('#prompt-textarea');
+            const composerRect = composer ? composer.getBoundingClientRect() : null;
+            const isNearComposer = (el) => {
+                if (!composerRect) return true;
+                const rect = el.getBoundingClientRect();
+                const itemCenterX = (rect.left + rect.right) / 2;
+                const composerCenterX = (composerRect.left + composerRect.right) / 2;
+                const maxHorizontalDistance = Math.max(500, composerRect.width);
+                return Math.abs(itemCenterX - composerCenterX) <= maxHorizontalDistance &&
+                    Math.abs(rect.top - composerRect.bottom) <= 500;
+            };
+            const items = Array.from(document.querySelectorAll(
+                '.popover .__menu-item, [class*="popover"] .__menu-item, [role="menuitem"], [role="option"], [cmdk-item]'
+            ))
+                .filter((el) => isVisible(el) && isNearComposer(el))
+                .map((el) => (el.innerText || el.textContent || '').trim())
+                .filter(Boolean);
+
+            return { ok: items.length > 0, items: items.slice(0, 5) };
+        }"#;
+
+    let mut last_state = String::new();
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(125));
+        let res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": js }),
+        )?;
+        let parsed = parse_script_result(&res)?;
+        if parsed
+            .get("ok")
+            .and_then(|ok| ok.as_bool())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        last_state = parsed.to_string();
+    }
+
+    Err(format!(
+        "Timed out waiting for ChatGPT agent menu after typing mention ({})",
+        last_state
+    ))
+}
+
+fn wait_for_chatgpt_agent_selection(config_path: &str) -> Result<(), String> {
+    let js = r#"() => {
+            const composer = document.querySelector('#prompt-textarea');
+            if (!composer) {
+                return { ok: false, error: 'composer not found' };
+            }
+            const agentPill = composer.querySelector(
+                '[data-id="agent"], [data-system-hint-type="agent"], [data-symbol="ecosystemMention"], [data-inline-selection-pill][contenteditable="false"]'
+            );
+            return {
+                ok: Boolean(agentPill),
+                text: (composer.innerText || composer.textContent || '').trim(),
+                keyword: agentPill ? (agentPill.getAttribute('data-keyword') || agentPill.textContent || '').trim() : ''
+            };
+        }"#;
+
+    let mut last_state = String::new();
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(125));
+        let res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": js }),
+        )?;
+        let parsed = parse_script_result(&res)?;
+        if parsed
+            .get("ok")
+            .and_then(|ok| ok.as_bool())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        last_state = parsed.to_string();
+    }
+
+    Err(format!(
+        "Timed out waiting for ChatGPT agent selection after Tab ({})",
+        last_state
+    ))
+}
+
+fn submit_regular_prompt(
+    config_path: &str,
+    provider: Provider,
+    prompt: &str,
+) -> Result<String, String> {
+    let prompt_json = serde_json::to_string(prompt)
+        .map_err(|e| format!("Failed to serialize prompt text: {}", e))?;
+    let set_and_submit_js = r#"() => {
+            window.__submit_status = 'pending';
+            (async () => {
+                try {
+                    const composerSelectors = __COMPOSER_SELECTORS__;
+                    const sendSelectors = __SEND_SELECTORS__;
+                    const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+                    if (!el) {
+                        window.__submit_status = 'error: composer not found';
+                        return;
+                    }
+                    el.focus();
+                    
+                    const value = __PROMPT__;
+                    el.focus();
+                    
+                    try {
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    } catch (e) {}
+                    
+                    let pasted = false;
+                    try {
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.setData('text/plain', value);
+                        const event = new ClipboardEvent('paste', {
+                            bubbles: true,
+                            cancelable: true
+                        });
+                        Object.defineProperty(event, 'clipboardData', {
+                            value: dataTransfer,
+                            writable: false,
+                            configurable: true
+                        });
+                        el.dispatchEvent(event);
+                        
+                        const currentText = typeof el.value !== 'undefined' ? el.value : el.textContent;
+                        if (currentText && currentText.trim().length > 0) {
+                            pasted = true;
+                        }
+                    } catch (e) {}
+                    
+                    if (!pasted) {
+                        const success = document.execCommand('insertText', false, value);
+                        if (!success) {
+                            if (typeof el.value !== 'undefined') {
+                                el.value = value;
+                                if (el._valueTracker) {
+                                    el._valueTracker.setValue('');
+                                }
+                            } else {
+                                el.innerText = value;
+                            }
+                            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+                    
+                    const isVisible = (el) => {
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const findAndClickSendButton = () => {
+                        let btn = null;
+                        for (const s of sendSelectors) {
+                            btn = document.querySelector(s);
+                            if (isVisible(btn)) break;
+                        }
+                        
+                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                            btn.click();
+                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                        }
+                        return null;
+                    };
+                    
+                    let result = findAndClickSendButton();
+                    if (result) {
+                        window.__submit_status = 'success:' + JSON.stringify(result);
+                        return;
+                    }
+
+                    for (let i = 0; i < 150; i++) {
+                        await new Promise(r => setTimeout(r, 100));
+                        result = findAndClickSendButton();
+                        if (result) {
+                            window.__submit_status = 'success:' + JSON.stringify(result);
+                            return;
+                        }
+                    }
+                    
+                    window.__submit_status = 'error: Send button did not become active/enabled';
+                } catch (e) {
+                    window.__submit_status = 'error: ' + e.message;
+                }
+            })();
+            return true;
+        }"#
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
+    .replace("__SEND_SELECTORS__", provider.send_button_selectors_json())
+    .replace("__PROMPT__", &prompt_json);
+
+    let start_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": set_and_submit_js
+        }),
+    )?;
+
+    let start_parsed = parse_script_result(&start_res)?;
+    if !start_parsed.as_bool().unwrap_or(false) {
+        return Err("Failed to initiate text entry and submission script".to_string());
+    }
+
+    wait_for_submit_status(config_path)
+}
+
+fn submit_chatgpt_agent_prompt(
+    config_path: &str,
+    parts: &ChatGptAgentPrompt<'_>,
+    verbose: bool,
+) -> Result<String, String> {
+    if verbose {
+        println!(
+            "Selecting ChatGPT agent '{}' before submitting prompt...",
+            parts.agent_mention
+        );
+    }
+
+    focus_and_clear_composer(config_path, Provider::ChatGpt)?;
+    call_mcp_tool(
+        config_path,
+        "type_text",
+        serde_json::json!({
+            "text": parts.agent_mention
+        }),
+    )?;
+    wait_for_chatgpt_agent_menu(config_path)?;
+    call_mcp_tool(
+        config_path,
+        "press_key",
+        serde_json::json!({
+            "key": "Tab",
+            "includeSnapshot": false
+        }),
+    )?;
+    wait_for_chatgpt_agent_selection(config_path)?;
+
+    let body_json = serde_json::to_string(parts.body)
+        .map_err(|e| format!("Failed to serialize prompt body: {}", e))?;
+    let paste_and_submit_js = r#"() => {
+            window.__submit_status = 'pending';
+            (async () => {
+                try {
+                    const sendSelectors = __SEND_SELECTORS__;
+                    const el = document.querySelector('#prompt-textarea');
+                    if (!el) {
+                        window.__submit_status = 'error: composer not found';
+                        return;
+                    }
+                    const agentPill = el.querySelector(
+                        '[data-id="agent"], [data-system-hint-type="agent"], [data-symbol="ecosystemMention"], [data-inline-selection-pill][contenteditable="false"]'
+                    );
+                    if (!agentPill) {
+                        window.__submit_status = 'error: ChatGPT agent was not selected into the composer';
+                        return;
+                    }
+
+                    const body = __BODY__;
+                    const currentText = el.textContent || '';
+                    const value = currentText && !/\s$/.test(currentText) ? ' ' + body : body;
+                    el.focus();
+
+                    try {
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    } catch (e) {}
+
+                    let pasted = false;
+                    try {
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.setData('text/plain', value);
+                        const event = new ClipboardEvent('paste', {
+                            bubbles: true,
+                            cancelable: true
+                        });
+                        Object.defineProperty(event, 'clipboardData', {
+                            value: dataTransfer,
+                            writable: false,
+                            configurable: true
+                        });
+                        el.dispatchEvent(event);
+                        const afterPasteText = el.innerText || el.textContent || '';
+                        pasted = afterPasteText.includes(body);
+                    } catch (e) {}
+
+                    if (!pasted) {
+                        const success = document.execCommand('insertText', false, value);
+                        if (!success) {
+                            el.appendChild(document.createTextNode(value));
+                            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+
+                    const afterText = el.innerText || el.textContent || '';
+                    if (!afterText.includes(body)) {
+                        window.__submit_status = 'error: prompt body was not pasted after ChatGPT agent selection';
+                        return;
+                    }
+
+                    const isVisible = (el) => {
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const findAndClickSendButton = () => {
+                        let btn = null;
+                        for (const s of sendSelectors) {
+                            btn = document.querySelector(s);
+                            if (isVisible(btn)) break;
+                        }
+                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                            btn.click();
+                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                        }
+                        return null;
+                    };
+
+                    let result = findAndClickSendButton();
+                    if (result) {
+                        window.__submit_status = 'success:' + JSON.stringify(result);
+                        return;
+                    }
+
+                    for (let i = 0; i < 150; i++) {
+                        await new Promise(r => setTimeout(r, 100));
+                        result = findAndClickSendButton();
+                        if (result) {
+                            window.__submit_status = 'success:' + JSON.stringify(result);
+                            return;
+                        }
+                    }
+
+                    window.__submit_status = 'error: Send button did not become active/enabled';
+                } catch (e) {
+                    window.__submit_status = 'error: ' + e.message;
+                }
+            })();
+            return true;
+        }"#
+    .replace(
+        "__SEND_SELECTORS__",
+        Provider::ChatGpt.send_button_selectors_json(),
+    )
+    .replace("__BODY__", &body_json);
+
+    let start_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": paste_and_submit_js
+        }),
+    )?;
+    let start_parsed = parse_script_result(&start_res)?;
+    if !start_parsed.as_bool().unwrap_or(false) {
+        return Err("Failed to initiate ChatGPT agent prompt submission script".to_string());
+    }
+
+    wait_for_submit_status(config_path)
+}
+
+fn submit_prompt_to_provider(
+    config_path: &str,
+    provider: Provider,
+    prompt: &str,
+    verbose: bool,
+) -> Result<String, String> {
+    if provider == Provider::ChatGpt
+        && let Some(parts) = parse_chatgpt_agent_prompt(prompt)
+    {
+        return submit_chatgpt_agent_prompt(config_path, &parts, verbose);
+    }
+
+    submit_regular_prompt(config_path, provider, prompt)
+}
+
 fn ensure_provider_tab(
     config_path: &str,
     provider: Provider,
@@ -3426,157 +4002,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.verbose {
         println!("Setting prompt text and submitting...");
     }
-    let prompt_json = serde_json::to_string(&prompt).unwrap();
-    let set_and_submit_js = r#"() => {
-            window.__submit_status = 'pending';
-            (async () => {
-                try {
-                    const composerSelectors = __COMPOSER_SELECTORS__;
-                    const sendSelectors = __SEND_SELECTORS__;
-                    const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
-                    if (!el) {
-                        window.__submit_status = 'error: composer not found';
-                        return;
-                    }
-                    el.focus();
-                    
-                    const value = __PROMPT__;
-                    el.focus();
-                    
-                    try {
-                        const range = document.createRange();
-                        range.selectNodeContents(el);
-                        const sel = window.getSelection();
-                        sel.removeAllRanges();
-                        sel.addRange(range);
-                    } catch (e) {}
-                    
-                    let pasted = false;
-                    try {
-                        const dataTransfer = new DataTransfer();
-                        dataTransfer.setData('text/plain', value);
-                        const event = new ClipboardEvent('paste', {
-                            bubbles: true,
-                            cancelable: true
-                        });
-                        Object.defineProperty(event, 'clipboardData', {
-                            value: dataTransfer,
-                            writable: false,
-                            configurable: true
-                        });
-                        el.dispatchEvent(event);
-                        
-                        const currentText = typeof el.value !== 'undefined' ? el.value : el.textContent;
-                        if (currentText && currentText.trim().length > 0) {
-                            pasted = true;
-                        }
-                    } catch (e) {}
-                    
-                    if (!pasted) {
-                        const success = document.execCommand('insertText', false, value);
-                        if (!success) {
-                            if (typeof el.value !== 'undefined') {
-                                el.value = value;
-                                if (el._valueTracker) {
-                                    el._valueTracker.setValue('');
-                                }
-                            } else {
-                                el.innerText = value;
-                            }
-                            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-                    
-                    const isVisible = (el) => {
-                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-                    const findAndClickSendButton = () => {
-                        let btn = null;
-                        for (const s of sendSelectors) {
-                            btn = document.querySelector(s);
-                            if (isVisible(btn)) break;
-                        }
-                        
-                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-                            btn.click();
-                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
-                        }
-                        return null;
-                    };
-                    
-                    let result = findAndClickSendButton();
-                    if (result) {
-                        window.__submit_status = 'success:' + JSON.stringify(result);
-                        return;
-                    }
-
-                    for (let i = 0; i < 150; i++) {
-                        await new Promise(r => setTimeout(r, 100));
-                        result = findAndClickSendButton();
-                        if (result) {
-                            window.__submit_status = 'success:' + JSON.stringify(result);
-                            return;
-                        }
-                    }
-                    
-                    window.__submit_status = 'error: Send button did not become active/enabled';
-                } catch (e) {
-                    window.__submit_status = 'error: ' + e.message;
-                }
-            })();
-            return true;
-        }"#
-    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
-    .replace("__SEND_SELECTORS__", provider.send_button_selectors_json())
-    .replace("__PROMPT__", &prompt_json);
-
-    let start_res = call_mcp_tool(
-        &config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": set_and_submit_js
-        }),
-    )?;
-
-    let start_parsed = parse_script_result(&start_res)?;
-    if !start_parsed.as_bool().unwrap_or(false) {
-        return Err("Failed to initiate text entry and submission script".into());
-    }
-
-    let mut wait_cycles = 0;
-    let mut status = String::from("pending");
-    // JS retry loop waits up to 15s for the send button to activate; poll at least that long
-    // (plus margin) so we don't time out before the page-side retry completes.
-    while status == "pending" && wait_cycles < 180 {
-        thread::sleep(Duration::from_millis(100));
-        let check_res = call_mcp_tool(
-            &config_path,
-            "evaluate_script",
-            serde_json::json!({
-                "function": "() => window.__submit_status || 'pending'"
-            }),
-        )?;
-        if let Some(s) = parse_script_result(&check_res)
-            .ok()
-            .and_then(|p| p.as_str().map(|str_ref| str_ref.to_string()))
-        {
-            status = s;
-        }
-        wait_cycles += 1;
-    }
-
-    if status.starts_with("error:") {
-        return Err(format!("Text entry or submission failed: {}", status).into());
-    }
-
-    if status == "pending" {
-        return Err("Timed out waiting for send button to activate and submit".into());
-    }
+    let status = submit_prompt_to_provider(&config_path, provider, &prompt, cli.verbose)
+        .map_err(|e| format!("Text entry or submission failed: {}", e))?;
 
     if cli.verbose {
         println!("Prompt submitted successfully: {}", status);
