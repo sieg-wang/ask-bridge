@@ -186,7 +186,7 @@ impl fmt::Display for Provider {
 
 #[derive(Parser)]
 #[command(name = "ask-bridge")]
-#[command(version = "0.1.1")]
+#[command(version = "0.1.2")]
 #[command(disable_version_flag = true)]
 #[command(about = "AI browser CLI - Ask ChatGPT or Gemini from your Terminal with your subscription", long_about = None)]
 struct Cli {
@@ -503,6 +503,57 @@ fn chrome_profile_path() -> Result<String, String> {
     Ok(profile_dir.to_string_lossy().to_string())
 }
 
+fn find_chrome_path() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        // 1. Program Files
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let path = format!(r"{}\Google\Chrome\Application\chrome.exe", pf);
+            if std::path::Path::new(&path).exists() {
+                return Ok(path);
+            }
+        } else {
+            let path = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+            if std::path::Path::new(path).exists() {
+                return Ok(path.to_string());
+            }
+        }
+
+        // 2. Program Files (x86)
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            let path = format!(r"{}\Google\Chrome\Application\chrome.exe", pf86);
+            if std::path::Path::new(&path).exists() {
+                return Ok(path);
+            }
+        } else {
+            let path = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
+            if std::path::Path::new(path).exists() {
+                return Ok(path.to_string());
+            }
+        }
+
+        // 3. LocalAppData
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let path = format!(r"{}\Google\Chrome\Application\chrome.exe", local_app_data);
+            if std::path::Path::new(&path).exists() {
+                return Ok(path);
+            }
+        }
+
+        Err("Google Chrome was not found in standard Windows installation paths. Please install Google Chrome.".to_string())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        if std::path::Path::new(path).exists() {
+            Ok(path.to_string())
+        } else {
+            Err("Google Chrome not found at /Applications/Google Chrome.app".to_string())
+        }
+    }
+}
+
 fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
@@ -510,18 +561,21 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         if !headless || is_debug_chrome_background(&profile_path) {
             if headless {
                 // Force hide any existing background Chrome PIDs asynchronously just in case they are currently visible
-                let pids = debug_port_listener_pids();
-                thread::spawn(move || {
-                    for pid_str in pids {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            let script = format!(
-                                "tell application \"System Events\" to set visible of first application process whose unix id is {} to false",
-                                pid
-                            );
-                            let _ = Command::new("osascript").arg("-e").arg(&script).status();
+                #[cfg(target_os = "macos")]
+                {
+                    let pids = debug_port_listener_pids();
+                    thread::spawn(move || {
+                        for pid_str in pids {
+                            if let Ok(pid) = pid_str.parse::<u32>() {
+                                let script = format!(
+                                    "tell application \"System Events\" to set visible of first application process whose unix id is {} to false",
+                                    pid
+                                );
+                                let _ = Command::new("osascript").arg("-e").arg(&script).status();
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
             return Ok(());
         }
@@ -541,12 +595,9 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         );
     }
 
-    let chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    if !std::path::Path::new(chrome_path).exists() {
-        return Err("Google Chrome not found at /Applications/Google Chrome.app".to_string());
-    }
+    let chrome_path = find_chrome_path()?;
 
-    let mut cmd = Command::new(chrome_path);
+    let mut cmd = Command::new(&chrome_path);
     cmd.arg("--remote-debugging-port=9223")
         .arg(format!("--user-data-dir={}", profile_path))
         .arg("--no-first-run")
@@ -566,19 +617,24 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to start Google Chrome: {}", e))?;
 
     if headless {
-        let pid = child.id();
-        thread::spawn(move || {
-            // Rapidly set visibility to false during startup to prevent window from flashing or drawing
-            for _ in 0..40 {
-                let script = format!(
-                    "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
-                    pid
-                );
-                let _ = Command::new("osascript").arg("-e").arg(&script).status();
-                thread::sleep(Duration::from_millis(50));
-            }
-        });
+        #[cfg(target_os = "macos")]
+        {
+            let pid = child.id();
+            thread::spawn(move || {
+                // Rapidly set visibility to false during startup to prevent window from flashing or drawing
+                for _ in 0..40 {
+                    let script = format!(
+                        "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
+                        pid
+                    );
+                    let _ = Command::new("osascript").arg("-e").arg(&script).status();
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
     }
+
+    let _ = child; // Avoid unused variable warning on non-macOS platforms
 
     // Wait for Chrome to listen on port 9223
     for _ in 0..50 {
@@ -595,32 +651,103 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
 }
 
 fn debug_port_listener_pids() -> Vec<String> {
-    let output = Command::new("lsof")
-        .args(["-tiTCP:9223", "-sTCP:LISTEN"])
-        .output();
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("netstat")
+            .args(["-ano", "-p", "tcp"])
+            .output();
 
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut pids = Vec::new();
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if line.contains(":9223") && line.contains("LISTENING") {
+                        if let Some(pid) = line.split_whitespace().last() {
+                            if !pids.contains(&pid.to_string()) {
+                                pids.push(pid.to_string());
+                            }
+                        }
+                    }
+                }
+                pids
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("lsof")
+            .args(["-tiTCP:9223", "-sTCP:LISTEN"])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
 fn process_command(pid: &str) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-p", pid, "-o", "command="])
-        .output()
-        .ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("wmic")
+            .args(["process", "where", &format!("processid={}", pid), "get", "commandline"])
+            .output();
 
-    if !output.status.success() {
-        return None;
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut cmd_lines = stdout.lines().skip(1);
+                if let Some(cmd) = cmd_lines.next() {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() {
+                        return Some(cmd.to_string());
+                    }
+                }
+            }
+        }
+
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').CommandLine", pid),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !stdout.is_empty() {
+                    return Some(stdout);
+                }
+            }
+        }
+
+        None
     }
 
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", pid, "-o", "command="])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 fn is_debug_chrome_background(profile_path: &str) -> bool {
@@ -657,7 +784,14 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     }
 
     for pid in ask_pids {
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("taskkill").args(["/F", "/PID", &pid]).status();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        }
     }
 
     for _ in 0..50 {
