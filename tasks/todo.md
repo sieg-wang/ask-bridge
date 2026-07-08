@@ -70,9 +70,9 @@
 - [x] Analyze bump type
 - [x] Update version files
 - [x] Run verification
-- [ ] Commit release bump
-- [ ] Create and push tag
-- [ ] Summarize release outcome
+- [x] Commit release bump
+- [x] Create and push tag
+- [x] Summarize release outcome
 
 ## Results
 - Synchronized version `0.1.4` in `Cargo.toml`, `package.json`, `src/main.rs`, `install.ps1`, `install.sh`, and `scripts/ask.sh`.
@@ -84,3 +84,8 @@
   - `CARGO_TARGET_DIR=%TEMP%\ask-bridge-target cargo test` (`21 passed`)
   - `CARGO_TARGET_DIR=/mnt/c/Users/wakau/AppData/Local/Temp/ask-bridge-target-wsl cargo test` (`21 passed`)
   - `npm test` (`4 passed`)
+- Git results:
+  - Bug fix commit: `94c1912`
+  - Release commit: `58cb9ca`
+  - Pushed `main` to `origin/main`
+  - Created and pushed annotated tag `v0.1.4`
