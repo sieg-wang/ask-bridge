@@ -2,6 +2,14 @@
 
 本專案的所有重要變更皆會記錄於本文件中。
 
+## [0.1.4] - 2026-07-09
+
+### 🔧 修復 (Fixed)
+- 修正 Linux/WSL 執行 `ask-bridge --verbose login` 時誤尋找 macOS Chrome 路徑的問題，現在會偵測 `PATH` 中的 `google-chrome` / `google-chrome-stable`，並支援 `/usr/bin/google-chrome` 等常見安裝路徑。
+- 修正 `make install` 在 Linux/WSL 環境下的 Chrome 檢查邏輯，避免套用 macOS-only 的 `/Applications/Google Chrome.app` 偵測。
+
+---
+
 ## [0.1.3] - 2026-07-08
 
 ### 🔧 變更 (Changed)

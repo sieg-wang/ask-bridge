@@ -3,7 +3,7 @@
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 show_version() {
   echo "$(basename "$0") version $VERSION"

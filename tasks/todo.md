@@ -40,3 +40,47 @@
   - Windows-hosted verification passed with `CARGO_TARGET_DIR=%TEMP%\ask-bridge-target cargo test` (`21 passed`).
   - WSL/Linux verification passed with `CARGO_TARGET_DIR=/mnt/c/Users/wakau/AppData/Local/Temp/ask-bridge-target-wsl cargo test` (`21 passed`).
 - Manual WSL Chrome launch was not verified in this environment because `Ubuntu-24.04` reports `google-chrome: command not found`; the user's reported `/usr/bin/google-chrome` path is covered by the new Linux fallback list.
+
+---
+
+# 2026-07-09 bump-and-release 0.1.4
+
+## Goal + Acceptance Criteria
+- [ ] Release patch version `0.1.4` for the WSL/Linux Chrome path fix.
+- [ ] Keep the required 6 version locations synchronized: `Cargo.toml`, `package.json`, `src/main.rs`, `install.ps1`, `install.sh`, `scripts/ask.sh`.
+- [ ] Update `Cargo.lock` through Cargo verification.
+- [ ] Update `CHANGELOG.md` with the release entry.
+- [ ] Commit version bump, create annotated tag `v0.1.4`, push branch and tag.
+
+## Risk & Rollback
+- Risk level: low
+- Affected components: package metadata, installer download version, CLI version display, changelog.
+- Rollback strategy: revert the version bump commit and delete `v0.1.4` locally/remotely if the release must be withdrawn.
+
+## Dependencies & Environment
+- Cargo and npm available locally.
+- `G:` has insufficient free space for Cargo target output; use `%TEMP%` / `/mnt/c/...` target directories for heavy Cargo commands.
+- Git remote is `origin https://github.com/doggy8088/ask-bridge.git`.
+
+## Working Notes
+- Patch bump is appropriate because the preceding change is a bug fix without breaking API/CLI behavior.
+- Existing WSL Chrome fix was committed separately as `94c1912` before release version changes.
+
+## Checklist
+- [x] Analyze bump type
+- [x] Update version files
+- [x] Run verification
+- [ ] Commit release bump
+- [ ] Create and push tag
+- [ ] Summarize release outcome
+
+## Results
+- Synchronized version `0.1.4` in `Cargo.toml`, `package.json`, `src/main.rs`, `install.ps1`, `install.sh`, and `scripts/ask.sh`.
+- Updated `Cargo.lock` through `cargo check`.
+- Added `CHANGELOG.md` entry for `0.1.4`.
+- Verification passed:
+  - `CARGO_TARGET_DIR=%TEMP%\ask-bridge-target cargo check`
+  - `cargo fmt --all -- --check`
+  - `CARGO_TARGET_DIR=%TEMP%\ask-bridge-target cargo test` (`21 passed`)
+  - `CARGO_TARGET_DIR=/mnt/c/Users/wakau/AppData/Local/Temp/ask-bridge-target-wsl cargo test` (`21 passed`)
+  - `npm test` (`4 passed`)
