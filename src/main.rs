@@ -653,9 +653,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
 fn debug_port_listener_pids() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("netstat")
-            .args(["-ano", "-p", "tcp"])
-            .output();
+        let output = Command::new("netstat").args(["-ano", "-p", "tcp"]).output();
 
         match output {
             Ok(output) if output.status.success() => {
@@ -699,7 +697,13 @@ fn process_command(pid: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         let output = Command::new("wmic")
-            .args(["process", "where", &format!("processid={}", pid), "get", "commandline"])
+            .args([
+                "process",
+                "where",
+                &format!("processid={}", pid),
+                "get",
+                "commandline",
+            ])
             .output();
 
         if let Ok(out) = output {
@@ -719,7 +723,10 @@ fn process_command(pid: &str) -> Option<String> {
             .args([
                 "-NoProfile",
                 "-Command",
-                &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').CommandLine", pid),
+                &format!(
+                    "(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').CommandLine",
+                    pid
+                ),
             ])
             .output();
 
