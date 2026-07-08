@@ -45,8 +45,21 @@
 
 執行此工具需要：
 
-1. 已安裝 `node` 與 `npx`，用於自動啟動 `chrome-devtools-mcp` server。
+1. 已安裝 **Node.js 20.19.0 LTS 以上，或更新的 LTS 版本**，並確保 `node` 與 `npx` 可在目前 shell 的 `PATH` 中執行。`ask-bridge` 會透過 `npx` 啟動 `chrome-devtools-mcp@latest`；若 Node.js 版本過舊，例如 `v20.11.0`，MCP server 會在 `initialize` 階段直接退出。
 2. 已安裝 Google Chrome。macOS 預設路徑通常是 `/Applications/Google Chrome.app`。若缺少 Chrome，且系統有 Homebrew，`make install` 會自動安裝。
+
+可用以下命令確認目前 shell 看到的 Node.js 版本：
+
+```bash
+node -v
+npx -v
+```
+
+| 平台 | 注意事項 |
+| --- | --- |
+| macOS | 可使用 Homebrew 或 nvm 安裝 Node.js LTS。若使用 nvm，請確認執行 `ask-bridge` 的同一個 shell 已載入 nvm，且 `node -v` 顯示 `v20.19.0` 以上。Chrome 預設偵測 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`。 |
+| Windows | 可使用 Node.js 官方安裝程式、winget 或 nvm-windows 安裝 Node.js LTS。安裝後請重新開啟 PowerShell，並確認 `node -v` 與 `npx -v` 可執行。Chrome 會優先偵測 `Program Files`、`Program Files (x86)` 與 `%LOCALAPPDATA%` 底下的標準安裝路徑。 |
+| Linux | 許多發行版內建套件庫可能提供較舊的 Node.js；建議使用 NodeSource、nvm 或官方 Node.js LTS 來源安裝。請安裝 Google Chrome Stable，並確認 `google-chrome` 或 `google-chrome-stable` 位於 `PATH` 中；Snap、Flatpak 或 Chromium 安裝方式可能不符合預設偵測邏輯。 |
 
 不需要安裝全域 `mcp-cli` 執行檔。Rust binary 會透過 Cargo 從 `https://github.com/doggy8088/mcp-cli` 使用 `mcp-cli` 作為 dependency。
 

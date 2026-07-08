@@ -74,7 +74,7 @@ body {
 }
 h1, h2, h3, h4 { font-family: var(--f-display); font-weight: 600; line-height: 1.08; letter-spacing: -0.02em; margin: 0; text-wrap: balance; }
 p { margin: 0; }
-.prose, .hero__sub, .why__lead, .why__points p, .feat p, .how__timeline p, .usage__step > p, .cta__copy p { text-wrap: pretty; }
+.prose, .hero__sub, .why__lead, .why__points p, .feat p, .how__timeline p, .usage__step > p, .install__req > p, .install__platform p, .cta__copy p { text-wrap: pretty; }
 a { color: inherit; text-decoration: none; }
 img { max-width: 100%; display: block; }
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
@@ -352,6 +352,50 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .how__timeline p { color: var(--muted); font-size: 0.97rem; max-width: 38em; }
 
 /* ---- install tabs ---- */
+.install__req {
+  max-width: 58rem;
+  margin: -0.2rem 0 2rem;
+  padding: clamp(1.25rem, 3vw, 1.8rem);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.install__req h3 {
+  font-size: 1.25rem;
+  letter-spacing: 0;
+  margin-bottom: 0.45rem;
+}
+.install__req > p {
+  color: var(--muted);
+  font-size: 0.96rem;
+  max-width: 62rem;
+}
+.install__check {
+  max-width: 18rem;
+  margin-top: 1rem;
+  font-size: 0.82rem;
+}
+.install__platforms {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-top: 1.2rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--line-soft);
+}
+.install__platform {
+  min-width: 0;
+}
+.install__platform h4 {
+  font-size: 1rem;
+  letter-spacing: 0;
+  margin-bottom: 0.35rem;
+}
+.install__platform p {
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
 .tabs__bar { display: flex; flex-wrap: wrap; gap: 0.3rem; border-bottom: 1px solid var(--line); margin-bottom: 1.4rem; }
 .tab { padding: 0.6rem 1rem; font-size: 0.92rem; color: var(--muted); border-radius: 8px 8px 0 0; position: relative; transition: color 0.2s; }
 .tab:hover { color: var(--ink); }
@@ -456,6 +500,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   .feat--wide { grid-column: span 1; }
   .usage__grid { grid-template-columns: 1fr; }
   .how__timeline li { grid-template-columns: 3.4rem 1fr; gap: 0.8rem; }
+  .install__platforms { grid-template-columns: 1fr; }
   .install-strip { max-width: none; }
   .section { padding: clamp(3rem, 9vw, 4.5rem) var(--gut); }
 }

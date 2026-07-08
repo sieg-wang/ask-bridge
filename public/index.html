@@ -278,6 +278,27 @@ ask-bridge --provider gemini "翻譯這段" --model "3.1 Pro"</code><button clas
         <h2 class="section__title" data-i18n="install.title">馬上開始</h2>
       </div>
 
+      <div class="install__req">
+        <h3 data-i18n="install.req.title">前置需求</h3>
+        <p data-i18n="install.req.lead">需要 Node.js 20.19.0 LTS 以上或更新的 LTS 版本，且 node 與 npx 必須可在目前 shell 的 PATH 中執行。ask-bridge 會透過 npx 啟動 chrome-devtools-mcp@latest；Node.js 版本過舊時，MCP server 可能在 initialize 階段直接退出。</p>
+        <pre class="code code--blk install__check" data-copy><code id="reqc">node -v
+npx -v</code><button class="copy" data-copy-target="reqc" data-i18n-aria="nav.copy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 15V5.5A1.5 1.5 0 0 1 6.5 4H15" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button></pre>
+        <div class="install__platforms">
+          <article class="install__platform">
+            <h4 data-i18n="install.req.mac.title">macOS</h4>
+            <p data-i18n="install.req.mac.body">可使用 Homebrew 或 nvm 安裝 Node.js LTS。若使用 nvm，請確認執行 ask-bridge 的同一個 shell 已載入 nvm。Chrome 預設偵測 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome。</p>
+          </article>
+          <article class="install__platform">
+            <h4 data-i18n="install.req.win.title">Windows</h4>
+            <p data-i18n="install.req.win.body">可使用官方安裝程式、winget 或 nvm-windows 安裝 Node.js LTS。安裝後請重新開啟 PowerShell，並確認 node 與 npx 可執行。Chrome 會偵測標準安裝路徑。</p>
+          </article>
+          <article class="install__platform">
+            <h4 data-i18n="install.req.linux.title">Linux</h4>
+            <p data-i18n="install.req.linux.body">發行版內建套件庫可能提供較舊的 Node.js；建議使用 NodeSource、nvm 或官方 LTS 來源。請安裝 Google Chrome Stable，並確認 google-chrome 或 google-chrome-stable 位於 PATH。</p>
+          </article>
+        </div>
+      </div>
+
       <div class="tabs" id="installTabs">
         <div class="tabs__bar" role="tablist" data-i18n-aria="install.tabsLabel">
           <button class="tab tab--active" role="tab" id="tab-mac" data-tab="mac" aria-selected="true" aria-controls="panel-mac" tabindex="0" data-i18n="install.t1">macOS / Linux</button>

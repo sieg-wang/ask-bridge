@@ -48,8 +48,21 @@ Unlike typical API clients, `ask-bridge` operates inside a real Chrome browser w
 
 To run this tool, you need:
 
-1. **`node`/`npx`** installed to automatically launch the `chrome-devtools-mcp` server.
+1. **Node.js 20.19.0 LTS or newer LTS**, with both `node` and `npx` available in the current shell's `PATH`. `ask-bridge` starts `chrome-devtools-mcp@latest` through `npx`; older Node.js versions, such as `v20.11.0`, can cause the MCP server to exit during `initialize`.
 2. **Google Chrome** installed (normally located at `/Applications/Google Chrome.app` on macOS). `make install` installs it with Homebrew when it is missing and Homebrew is available.
+
+Check the Node.js version visible to your current shell:
+
+```bash
+node -v
+npx -v
+```
+
+| Platform | Notes |
+| --- | --- |
+| macOS | Install a Node.js LTS release with Homebrew or nvm. If you use nvm, make sure the same shell that runs `ask-bridge` has loaded nvm and that `node -v` reports `v20.19.0` or newer. Chrome is detected at `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` by default. |
+| Windows | Install a Node.js LTS release with the official installer, winget, or nvm-windows. Reopen PowerShell after installation, then verify that `node -v` and `npx -v` work. Chrome is detected from the standard `Program Files`, `Program Files (x86)`, and `%LOCALAPPDATA%` install paths. |
+| Linux | Distribution package repositories may provide an older Node.js version. Prefer NodeSource, nvm, or an official Node.js LTS source. Install Google Chrome Stable and make sure `google-chrome` or `google-chrome-stable` is available in `PATH`; Snap, Flatpak, or Chromium installs may not match the default detection logic. |
 
 You do **not** need a global `mcp-cli` executable. The Rust binary uses `mcp-cli` as a Cargo dependency from `https://github.com/doggy8088/mcp-cli`.
 
