@@ -70,7 +70,7 @@
 5. `install.sh` (`VERSION` 變數)
 6. `scripts/ask.sh` (`VERSION` 變數)
 
-*修改完後，必須執行 `cargo check` 或 `cargo build` 來自動更新 `Cargo.lock`。*
+*修改完後，必須執行 `cargo check` 或 `cargo build` 來自動更新 `Cargo.lock`。最後，完成 Git 提交（Commit）與推送（Push）後，必須建立帶有 `vX.Y.Z` 格式的 Git Tag 並推送到遠端倉庫。*
 
 ---
 
