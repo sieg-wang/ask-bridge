@@ -1396,6 +1396,62 @@ fn find_chrome_path() -> Result<String, String> {
     }
 }
 
+/// If `binary` is the executable inside a macOS `.app` bundle
+/// (…/Foo.app/Contents/MacOS/<exe>), return the `.app` bundle path. Used to launch
+/// the browser via `open -g` (background, no focus steal) instead of exec'ing the
+/// binary directly, which macOS foregrounds/activates on launch.
+#[cfg(any(target_os = "macos", test))]
+fn app_bundle_from_binary(binary: &str) -> Option<String> {
+    let macos_dir = Path::new(binary).parent()?;
+    if macos_dir.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+    let contents = macos_dir.parent()?;
+    if contents.file_name()?.to_str()? != "Contents" {
+        return None;
+    }
+    let app = contents.parent()?;
+    let app_str = app.to_str()?;
+    if app_str.ends_with(".app") {
+        Some(app_str.to_string())
+    } else {
+        None
+    }
+}
+
+/// Rewrite a Chromium `Default/Preferences` JSON body so the next launch does not
+/// show the "didn't shut down correctly / restore pages?" bubble: force
+/// `profile.exit_type = "Normal"` and `profile.exited_cleanly = true`, preserving
+/// all other keys. Returns the serialized JSON, or `None` if `content` is not a
+/// JSON object (caller then leaves the file untouched).
+fn preferences_marked_clean(content: &str) -> Option<String> {
+    let mut root: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = root.as_object_mut()?;
+    let profile = obj
+        .entry("profile")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let pobj = profile.as_object_mut()?;
+    pobj.insert(
+        "exit_type".to_string(),
+        serde_json::Value::String("Normal".to_string()),
+    );
+    pobj.insert("exited_cleanly".to_string(), serde_json::Value::Bool(true));
+    serde_json::to_string(&root).ok()
+}
+
+/// Patch `<profile>/Default/Preferences` in place so the crash-restore bubble is
+/// suppressed on the next launch. No-op if the file is missing (fresh profile) or
+/// not a JSON object. Only call when the ask-bridge browser is not running.
+fn mark_profile_exited_cleanly(profile_path: &str) {
+    let prefs = Path::new(profile_path).join("Default").join("Preferences");
+    let Ok(content) = std::fs::read_to_string(&prefs) else {
+        return;
+    };
+    if let Some(patched) = preferences_marked_clean(&content) {
+        let _ = std::fs::write(&prefs, patched);
+    }
+}
+
 fn start_chrome_if_needed(
     headless: bool,
     verbose: bool,
@@ -1434,7 +1490,8 @@ fn start_chrome_if_needed(
             // if a *different* browser already owns the debug port we reuse it,
             // so tell the user why their override appears to do nothing.
             if let Some(override_path) = browser_override {
-                let running_matches = ask_pids
+                let running_matches = snapshot
+                    .ask_pids
                     .iter()
                     .filter_map(|pid| process_command(pid))
                     .any(|cmd| command_uses_browser(&cmd, override_path));
@@ -1492,61 +1549,121 @@ fn start_chrome_if_needed(
     };
     let _ = remove_chrome_pid_file();
 
-    let mut cmd = Command::new(&chrome_path);
-    cmd.arg("--remote-debugging-port=9223")
-        .arg(format!("--user-data-dir={}", profile_path))
-        .arg(ASK_BRIDGE_CHROME_MARKER)
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
+    // (B) Suppress the "didn't shut down correctly / restore?" bubble by forcing a
+    // clean exit_type in the profile before launch — deterministic regardless of
+    // how the previous instance died. Safe here: port 9223 is confirmed closed, so
+    // no ask-bridge browser is holding this profile.
+    mark_profile_exited_cleanly(&profile_path);
 
-    #[cfg(target_os = "windows")]
-    {
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
+    let mut args: Vec<String> = vec![
+        "--remote-debugging-port=9223".to_string(),
+        format!("--user-data-dir={}", profile_path),
+        ASK_BRIDGE_CHROME_MARKER.to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        // (B) belt-and-suspenders alongside the Preferences patch.
+        "--hide-crash-restore-bubble".to_string(),
+    ];
     if headless {
-        cmd.arg("--ask-bridge-background")
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--window-size=1440,1200")
-            .arg("--window-position=-2000,-2000");
+        args.push("--ask-bridge-background".to_string());
+        args.push("--disable-blink-features=AutomationControlled".to_string());
+        args.push("--window-size=1440,1200".to_string());
+        args.push("--window-position=-2000,-2000".to_string());
     }
 
-    let child = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start browser '{}': {}", chrome_path, e))?;
+    // (A) On macOS, launch a `.app` bundle in the BACKGROUND via `open -g` so it
+    // never activates/steals foreground; `-n` forces a new instance on our
+    // dedicated profile even if the same browser is the user's daily driver.
+    // Exec'ing the binary directly (the fallback below) makes macOS foreground it.
+    #[cfg(target_os = "macos")]
+    let launched_via_open = match app_bundle_from_binary(&chrome_path) {
+        Some(app) => {
+            let mut open_cmd = Command::new("open");
+            open_cmd.arg("-g").arg("-n").arg("-a").arg(&app).arg("--args");
+            for a in &args {
+                open_cmd.arg(a);
+            }
+            open_cmd
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("Failed to launch browser via `open` ('{}'): {}", app, e))?;
+            true
+        }
+        None => false,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let launched_via_open = false;
 
-    let child_pid = child.id();
+    // With `open` the browser is detached — there is no child handle; the real
+    // listener PID is recorded from the debug port below.
+    let mut child_pid: Option<u32> = None;
+    if !launched_via_open {
+        let mut cmd = Command::new(&chrome_path);
+        for a in &args {
+            cmd.arg(a);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+
+        let child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start browser '{}': {}", chrome_path, e))?;
+        child_pid = Some(child.id());
+    }
 
     if verbose {
-        println!(
-            "Started ask-bridge Chrome PID {} with profile {}.",
-            child_pid, profile_path
-        );
+        match child_pid {
+            Some(pid) => println!(
+                "Started ask-bridge Chrome PID {} with profile {}.",
+                pid, profile_path
+            ),
+            None => println!(
+                "Started ask-bridge browser via `open` with profile {}.",
+                profile_path
+            ),
+        }
     }
 
-    if headless {
-        #[cfg(target_os = "macos")]
-        {
-            let pid = child.id();
+    // (A) Hide the window as a secondary mitigation (the off-screen position is
+    // clamped back on-screen by macOS). Re-keyed off the debug-port PID because
+    // `open` detaches — its child PID is not the browser — and this also dampens
+    // the per-CDP-command re-activation (chrome-devtools-mcp#1254) no flag fixes.
+    #[cfg(target_os = "macos")]
+    {
+        if headless {
+            let profile = profile_path.clone();
             thread::spawn(move || {
-                // Rapidly set visibility to false during startup to prevent window from flashing or drawing
-                for _ in 0..40 {
-                    let script = format!(
-                        "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
-                        pid
-                    );
-                    let _ = Command::new("osascript").arg("-e").arg(&script).status();
-                    thread::sleep(Duration::from_millis(50));
+                for _ in 0..60 {
+                    let pids = ask_chrome_pids_on_debug_port(&profile);
+                    if !pids.is_empty() {
+                        for _ in 0..40 {
+                            for pid in &pids {
+                                if let Ok(p) = pid.parse::<u32>() {
+                                    let script = format!(
+                                        "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
+                                        p
+                                    );
+                                    let _ =
+                                        Command::new("osascript").arg("-e").arg(&script).status();
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
                 }
             });
         }
     }
-
-    let _ = child; // Avoid unused variable warning on non-macOS platforms
 
     // Wait for Chrome to listen and prove that the listener belongs to this launch.
     let startup_deadline = Instant::now() + Duration::from_secs(15);
@@ -1563,11 +1680,13 @@ fn start_chrome_if_needed(
                         error
                     ));
                 }
-                if verbose && record.pid != child_pid {
-                    println!(
-                        "Recorded actual Chrome listener PID {} (launcher PID {}).",
-                        record.pid, child_pid
-                    );
+                if let Some(launcher_pid) = child_pid {
+                    if verbose && record.pid != launcher_pid {
+                        println!(
+                            "Recorded actual Chrome listener PID {} (launcher PID {}).",
+                            record.pid, launcher_pid
+                        );
+                    }
                 }
                 if verbose {
                     println!("Chrome started and listening on port 9223.");
@@ -2921,6 +3040,49 @@ mod tests {
         // the real ~/.config file.
         let err = resolve_browser_override(Some("/no/such/browser-xyz".to_string())).unwrap_err();
         assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    #[test]
+    fn app_bundle_from_binary_extracts_bundle_path() {
+        assert_eq!(
+            app_bundle_from_binary("/Applications/Brave Origin.app/Contents/MacOS/Brave Origin"),
+            Some("/Applications/Brave Origin.app".to_string())
+        );
+        assert_eq!(
+            app_bundle_from_binary("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Some("/Applications/Google Chrome.app".to_string())
+        );
+        // A bare executable (no .app bundle) -> None, so the launcher falls back
+        // to a direct spawn instead of `open -a`.
+        assert_eq!(app_bundle_from_binary("/usr/bin/chromium"), None);
+        // Right structure but the bundle dir does not end in .app.
+        assert_eq!(app_bundle_from_binary("/opt/foo/Contents/MacOS/foo"), None);
+    }
+
+    #[test]
+    fn preferences_marked_clean_forces_normal_and_preserves_keys() {
+        let out = preferences_marked_clean(
+            r#"{"profile":{"exit_type":"Crashed","name":"Person 1"},"other":1}"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["profile"]["exit_type"], "Normal");
+        assert_eq!(v["profile"]["exited_cleanly"], true);
+        assert_eq!(v["profile"]["name"], "Person 1"); // untouched key preserved
+        assert_eq!(v["other"], 1); // top-level key preserved
+    }
+
+    #[test]
+    fn preferences_marked_clean_creates_profile_and_rejects_non_object() {
+        let out = preferences_marked_clean("{}").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["profile"]["exit_type"], "Normal");
+        assert_eq!(v["profile"]["exited_cleanly"], true);
+
+        // Non-object (or invalid) bodies are left untouched (None).
+        assert!(preferences_marked_clean("[]").is_none());
+        assert!(preferences_marked_clean("\"hi\"").is_none());
+        assert!(preferences_marked_clean("not json").is_none());
     }
 
     #[test]
