@@ -635,6 +635,47 @@ fn load_configured_browser() -> Result<Option<String>, String> {
 /// Resolve a browser value (an executable path or a macOS `.app` bundle) into a
 /// concrete executable path. Errors if it cannot be resolved to an existing file
 /// so a misconfigured browser fails loudly instead of silently using Chrome.
+/// True if `path` is a regular file with an executable bit set. On non-unix the
+/// executable bit is unavailable, so it degrades to "is a regular file".
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// First executable file inside `dir` in sorted (deterministic) order, skipping
+/// dotfiles like `.DS_Store`. Used as the fallback when a bundle's executable
+/// name doesn't match the bundle name.
+fn first_executable_in_dir(dir: &Path) -> Option<String> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !n.starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .find(|p| is_executable_file(p))
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 fn resolve_browser_binary(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -642,25 +683,32 @@ fn resolve_browser_binary(value: &str) -> Result<String, String> {
     }
 
     let without_slash = trimmed.trim_end_matches('/');
-    if without_slash.ends_with(".app") {
+    // `.app` is matched case-insensitively: the default macOS volume is
+    // case-insensitive, so "Foo.APP" and "Foo.app" name the same bundle.
+    let is_app_bundle = Path::new(without_slash)
+        .extension()
+        .map(|ext| ext.eq_ignore_ascii_case("app"))
+        .unwrap_or(false);
+    if is_app_bundle {
         let app_dir = Path::new(without_slash);
+        if !app_dir.exists() {
+            return Err(format!(
+                "Browser bundle not found at '{}'. Provide an installed .app bundle or an executable path.",
+                trimmed
+            ));
+        }
         let macos_dir = app_dir.join("Contents/MacOS");
         // macOS convention: the executable is the bundle name minus ".app"
-        // (e.g. "Brave Origin.app" -> "Brave Origin"). Fall back to the single
-        // entry inside Contents/MacOS if that convention does not hold.
+        // (e.g. "Brave Origin.app" -> "Brave Origin"). Fall back to the first
+        // executable inside Contents/MacOS if that convention does not hold.
         if let Some(stem) = app_dir.file_stem().and_then(|s| s.to_str()) {
             let candidate = macos_dir.join(stem);
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Ok(candidate.to_string_lossy().to_string());
             }
         }
-        if let Ok(entries) = std::fs::read_dir(&macos_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    return Ok(path.to_string_lossy().to_string());
-                }
-            }
+        if let Some(exe) = first_executable_in_dir(&macos_dir) {
+            return Ok(exe);
         }
         return Err(format!(
             "No executable found inside '{}'. Is '{}' a valid Chromium browser bundle?",
@@ -669,8 +717,15 @@ fn resolve_browser_binary(value: &str) -> Result<String, String> {
         ));
     }
 
-    if Path::new(trimmed).exists() {
+    let path = Path::new(trimmed);
+    if path.is_file() {
         return Ok(trimmed.to_string());
+    }
+    if path.is_dir() {
+        return Err(format!(
+            "'{}' is a directory, not an executable. Point --browser / config \"browser\" at a browser executable or a macOS .app bundle.",
+            trimmed
+        ));
     }
 
     Err(format!(
@@ -715,11 +770,15 @@ fn merged_config_json(
     let mut obj = if existing.trim().is_empty() {
         serde_json::Map::new()
     } else {
-        serde_json::from_str::<serde_json::Value>(existing)
+        match serde_json::from_str::<serde_json::Value>(existing)
             .map_err(|e| format!("Failed to parse existing config.json: {}", e))?
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
+        {
+            serde_json::Value::Object(map) => map,
+            // A valid-but-non-object body (e.g. hand-edited to `[]`) would be
+            // silently discarded by unwrap_or_default(), wiping saved fields;
+            // fail loud instead so the merge-preserving guarantee holds.
+            _ => return Err("Existing config.json is not a JSON object.".to_string()),
+        }
     };
 
     if let Some(provider) = provider {
@@ -751,7 +810,21 @@ fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Res
         })?;
     }
 
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // Only a missing file means "start fresh". Any other read error (permission
+    // bits, transient I/O on a cloud-backed home dir, invalid UTF-8) must fail
+    // loud — treating it as empty would rewrite the file and drop the other
+    // field, defeating the merge-preserving guarantee.
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "Failed to read existing config file {}: {}",
+                config_path.to_string_lossy(),
+                e
+            ))
+        }
+    };
     let provider_str = provider.map(|p| p.to_string());
     let content = merged_config_json(&existing, provider_str.as_deref(), browser)?;
     std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
@@ -770,6 +843,13 @@ fn run_config_command(
     cli_browser: Option<String>,
 ) -> Result<(), String> {
     if cli_provider.is_some() || cli_browser.is_some() {
+        if let Some(browser) = &cli_browser {
+            // Fail loudly at set-time if the path can't be resolved, instead of
+            // silently persisting a typo that breaks every later run. The
+            // ORIGINAL value (e.g. the .app path) is stored, not the resolved
+            // binary, so bundle-internal layout changes still work later.
+            resolve_browser_binary(browser)?;
+        }
         write_global_config(cli_provider, cli_browser.as_deref())?;
         let config_path = config_file_path()?;
         if let Some(provider) = cli_provider {
@@ -1350,6 +1430,21 @@ fn start_chrome_if_needed(
                     });
                 }
             }
+            // A --browser/config override only takes effect on a fresh launch;
+            // if a *different* browser already owns the debug port we reuse it,
+            // so tell the user why their override appears to do nothing.
+            if let Some(override_path) = browser_override {
+                let running_matches = ask_pids
+                    .iter()
+                    .filter_map(|pid| process_command(pid))
+                    .any(|cmd| command_uses_browser(&cmd, override_path));
+                if !running_matches {
+                    eprintln!(
+                        "Note: an ask-bridge browser is already running on port 9223 with a different binary than the configured '{}'; reusing the running one. Run `ask-bridge close` first to switch browsers.",
+                        override_path
+                    );
+                }
+            }
             if verbose && headless && !is_debug_chrome_background(&profile_path) {
                 println!(
                     "Reusing existing ask-bridge Chrome on port 9223. Run `ask-bridge close` if you want to restart it in background mode."
@@ -1422,7 +1517,7 @@ fn start_chrome_if_needed(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start Google Chrome: {}", e))?;
+        .map_err(|e| format!("Failed to start browser '{}': {}", chrome_path, e))?;
 
     let child_pid = child.id();
 
@@ -1492,7 +1587,10 @@ fn start_chrome_if_needed(
             "Failed to identify active Chrome listener: {}",
             error
         )),
-        None => Err("Timed out waiting for Chrome to start on port 9223".to_string()),
+        None => Err(format!(
+            "Timed out waiting for browser '{}' to start on port 9223",
+            chrome_path
+        )),
     }
 }
 
@@ -1642,6 +1740,32 @@ fn inspect_chrome_debug_port(profile_path: &str) -> ChromeDebugSnapshot {
         record,
         browser_id,
         ask_pids,
+    }
+}
+
+/// Whether the running listener's command line refers to the given resolved
+/// browser executable. Used to warn when a --browser/config override differs
+/// from the browser already occupying the debug port.
+fn command_uses_browser(command: &str, browser_path: &str) -> bool {
+    let command = normalize_profile_match_text(command);
+    let browser_path = normalize_profile_match_text(browser_path);
+    !browser_path.is_empty() && command.contains(&browser_path)
+}
+
+/// Whether a single open tab is a "blank"/new-tab page that ask-bridge may
+/// navigate directly instead of opening a new tab. Matches about:blank, the
+/// Chrome new-tab-page marker, and browser-internal welcome/newtab pages
+/// (chrome://, brave://, edge://, ...) — but NOT an ordinary http(s) URL whose
+/// host merely starts with "newtab" (e.g. https://newtab.example.com).
+fn is_blank_tab_url(url: &str) -> bool {
+    if url == "about:blank" || url.contains("new-tab-page") {
+        return true;
+    }
+    match url.split_once("://") {
+        Some((scheme, rest)) if scheme != "http" && scheme != "https" => {
+            rest.starts_with("newtab") || rest.starts_with("welcome")
+        }
+        _ => false,
     }
 }
 
@@ -2666,6 +2790,140 @@ mod tests {
     }
 
     #[test]
+    fn merged_config_json_rejects_non_object() {
+        let err = merged_config_json("[]", Some("gemini"), None).unwrap_err();
+        assert!(err.contains("not a JSON object"), "got: {}", err);
+        let err2 = merged_config_json("\"hello\"", None, Some("/b")).unwrap_err();
+        assert!(err2.contains("not a JSON object"), "got: {}", err2);
+    }
+
+    #[test]
+    fn resolve_browser_binary_rejects_directory() {
+        let dir = make_test_dir("browser_plain_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = resolve_browser_binary(dir.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("is a directory"), "got: {}", err);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_browser_binary_errors_on_nonexistent_app() {
+        let err = resolve_browser_binary("/no/such/Brave.app").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_browser_binary_errors_on_app_without_macos_dir() {
+        let dir = make_test_dir("browser_empty_app");
+        let app = dir.join("Empty.app");
+        std::fs::create_dir_all(&app).unwrap();
+        let err = resolve_browser_binary(app.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("No executable found inside"), "got: {}", err);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_browser_binary_handles_uppercase_app_extension() {
+        let dir = make_test_dir("browser_upper_app");
+        let macos = dir.join("Foo.APP/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exec = macos.join("Foo");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        let app = dir.join("Foo.APP");
+        let resolved = resolve_browser_binary(app.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, exec.to_string_lossy().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_browser_binary_accepts_app_bundle_with_trailing_slash() {
+        let dir = make_test_dir("browser_app_slash");
+        let macos = dir.join("Brave Test.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exec = macos.join("Brave Test");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        let app_with_slash = format!("{}/", dir.join("Brave Test.app").to_str().unwrap());
+        let resolved = resolve_browser_binary(&app_with_slash).unwrap();
+        assert_eq!(resolved, exec.to_string_lossy().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_browser_binary_falls_back_to_first_executable_skipping_dotfiles() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = make_test_dir("browser_fallback");
+        let macos = dir.join("Renamed.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        // A dotfile and a non-executable file that must both be skipped.
+        std::fs::write(macos.join(".DS_Store"), b"junk").unwrap();
+        std::fs::write(macos.join("Info.plist"), b"<plist/>").unwrap();
+        // The real executable, whose name differs from the bundle stem "Renamed".
+        let bin = macos.join("ActualBinary");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved =
+            resolve_browser_binary(dir.join("Renamed.app").to_str().unwrap()).unwrap();
+        assert_eq!(resolved, bin.to_string_lossy().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn command_uses_browser_detects_match_and_mismatch() {
+        let brave = "/Applications/Brave Origin.app/Contents/MacOS/Brave Origin";
+        let chrome_cmd = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9223 --user-data-dir=/x";
+        assert!(!command_uses_browser(chrome_cmd, brave));
+        let brave_cmd = format!("{} --remote-debugging-port=9223 --user-data-dir=/x", brave);
+        assert!(command_uses_browser(&brave_cmd, brave));
+        // An empty override path never matches (avoids matching every command).
+        assert!(!command_uses_browser(chrome_cmd, ""));
+    }
+
+    #[test]
+    fn is_blank_tab_url_matches_blank_and_internal_pages() {
+        assert!(is_blank_tab_url("about:blank"));
+        assert!(is_blank_tab_url("chrome://newtab/"));
+        assert!(is_blank_tab_url("brave://newtab/"));
+        assert!(is_blank_tab_url("edge://newtab/"));
+        assert!(is_blank_tab_url("chrome://welcome"));
+        assert!(is_blank_tab_url("chrome://new-tab-page/"));
+    }
+
+    #[test]
+    fn is_blank_tab_url_rejects_real_https_and_content() {
+        // Regression: a real https host starting with "newtab" must NOT be
+        // treated as a blank tab (the old contains("://newtab") over-matched).
+        assert!(!is_blank_tab_url("https://newtab.example.com"));
+        assert!(!is_blank_tab_url("https://chatgpt.com/"));
+        assert!(!is_blank_tab_url("https://gemini.google.com/app"));
+        assert!(!is_blank_tab_url("about:settings"));
+    }
+
+    #[test]
+    fn rejects_non_string_browser_in_config_json() {
+        let err = parse_configured_browser(r#"{"browser": 42}"#).unwrap_err();
+        assert!(err.contains("Failed to parse config.json"), "got: {}", err);
+        assert_eq!(parse_configured_browser(r#"{"browser": null}"#).unwrap(), None);
+        // A wrong-typed browser value also breaks provider loading (same struct).
+        assert!(parse_configured_provider(r#"{"provider":"gemini","browser":42}"#).is_err());
+    }
+
+    #[test]
+    fn browser_config_error_propagates_when_cli_missing() {
+        let err = select_browser_value_with(None, || Err("boom".to_string())).unwrap_err();
+        assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn resolve_browser_override_rejects_bad_cli_path() {
+        // A bad --browser value fails loudly and never silently falls back to
+        // Chrome. Some(cli) short-circuits config loading, so this never reads
+        // the real ~/.config file.
+        let err = resolve_browser_override(Some("/no/such/browser-xyz".to_string())).unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    #[test]
     fn parses_close_command() {
         let cli = Cli::try_parse_from(["ask-bridge", "close"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Close)));
@@ -3526,12 +3784,7 @@ fn open_url_tab(
         .ok_or_else(|| format!("Invalid list_pages response structure: {:?}", list_res))?;
 
     let pages = parse_pages(text);
-    if pages.len() == 1
-        && (pages[0].url == "about:blank"
-            || pages[0].url.contains("new-tab-page")
-            || pages[0].url.contains("chrome://welcome")
-            || pages[0].url.contains("://newtab"))
-    {
+    if pages.len() == 1 && is_blank_tab_url(&pages[0].url) {
         call_mcp_tool(
             config_path,
             "navigate_page",
@@ -5411,12 +5664,7 @@ fn ensure_provider_tab(
             }
             None => {
                 // No provider tab. If there is only one blank tab, navigate it. Otherwise open a new page.
-                if pages.len() == 1
-                    && (pages[0].url == "about:blank"
-                        || pages[0].url.contains("new-tab-page")
-                        || pages[0].url.contains("chrome://welcome")
-                        || pages[0].url.contains("://newtab"))
-                {
+                if pages.len() == 1 && is_blank_tab_url(&pages[0].url) {
                     if verbose {
                         println!(
                             "Navigating existing blank tab to {}...",
