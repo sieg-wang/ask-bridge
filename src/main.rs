@@ -441,6 +441,12 @@ struct Cli {
     #[arg(long, short = 'p', value_enum, global = true)]
     provider: Option<Provider>,
 
+    /// Chromium-based browser to automate: an executable path or a macOS .app
+    /// bundle (e.g. "/Applications/Brave Origin.app"). Overrides the "browser"
+    /// field in ~/.config/ask-bridge/config.json. Defaults to Google Chrome.
+    #[arg(long, value_name = "PATH", global = true)]
+    browser: Option<String>,
+
     /// Run Chrome in headless mode. Defaults to true.
     #[arg(long, require_equals = true, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     headless: bool,
@@ -513,7 +519,8 @@ enum Commands {
     Login,
     /// Close the managed Chrome browser instance
     Close,
-    /// Set or show the global default provider used when --provider is not specified.
+    /// Set or show the global default provider and browser used when
+    /// --provider / --browser are not specified.
     Config,
     /// Reinstall ask-bridge using the recommended README installation command
     Update,
@@ -529,6 +536,7 @@ enum Commands {
 #[serde(default)]
 struct AppConfig {
     provider: Option<String>,
+    browser: Option<String>,
 }
 
 fn config_file_path() -> Result<PathBuf, String> {
@@ -598,7 +606,140 @@ fn resolve_provider(cli_provider: Option<Provider>) -> Result<Provider, String> 
     resolve_provider_with(cli_provider, load_configured_provider)
 }
 
-fn write_global_provider_config(provider: Provider) -> Result<(), String> {
+fn parse_configured_browser(content: &str) -> Result<Option<String>, String> {
+    let config: AppConfig =
+        serde_json::from_str(content).map_err(|e| format!("Failed to parse config.json: {}", e))?;
+    Ok(config
+        .browser
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty()))
+}
+
+fn load_configured_browser() -> Result<Option<String>, String> {
+    let config_path = config_file_path()?;
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&config_path).map_err(|e| {
+        format!(
+            "Failed to read config file {}: {}",
+            config_path.to_string_lossy(),
+            e
+        )
+    })?;
+
+    parse_configured_browser(&content)
+}
+
+/// Resolve a browser value (an executable path or a macOS `.app` bundle) into a
+/// concrete executable path. Errors if it cannot be resolved to an existing file
+/// so a misconfigured browser fails loudly instead of silently using Chrome.
+fn resolve_browser_binary(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Configured browser value is empty.".to_string());
+    }
+
+    let without_slash = trimmed.trim_end_matches('/');
+    if without_slash.ends_with(".app") {
+        let app_dir = Path::new(without_slash);
+        let macos_dir = app_dir.join("Contents/MacOS");
+        // macOS convention: the executable is the bundle name minus ".app"
+        // (e.g. "Brave Origin.app" -> "Brave Origin"). Fall back to the single
+        // entry inside Contents/MacOS if that convention does not hold.
+        if let Some(stem) = app_dir.file_stem().and_then(|s| s.to_str()) {
+            let candidate = macos_dir.join(stem);
+            if candidate.exists() {
+                return Ok(candidate.to_string_lossy().to_string());
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&macos_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    return Ok(path.to_string_lossy().to_string());
+                }
+            }
+        }
+        return Err(format!(
+            "No executable found inside '{}'. Is '{}' a valid Chromium browser bundle?",
+            macos_dir.to_string_lossy(),
+            trimmed
+        ));
+    }
+
+    if Path::new(trimmed).exists() {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(format!(
+        "Configured browser not found at '{}'. Provide an executable path or a macOS .app bundle via --browser or the \"browser\" field in config.json.",
+        trimmed
+    ))
+}
+
+/// Select the raw browser value with CLI taking precedence over config. An
+/// explicit `--browser` short-circuits config loading, mirroring `--provider`.
+fn select_browser_value_with<F>(
+    cli_browser: Option<String>,
+    load_browser: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<Option<String>, String>,
+{
+    if let Some(browser) = cli_browser {
+        return Ok(Some(browser));
+    }
+    load_browser()
+}
+
+/// Resolve the effective browser override to a concrete executable path.
+/// Returns `None` when neither CLI nor config set one (caller falls back to the
+/// auto-detected Chrome path).
+fn resolve_browser_override(cli_browser: Option<String>) -> Result<Option<String>, String> {
+    match select_browser_value_with(cli_browser, load_configured_browser)? {
+        Some(value) => resolve_browser_binary(&value).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Merge `provider`/`browser` into an existing config JSON body, preserving any
+/// fields not being changed so `config --provider` cannot wipe a saved `browser`
+/// (and vice versa).
+fn merged_config_json(
+    existing: &str,
+    provider: Option<&str>,
+    browser: Option<&str>,
+) -> Result<String, String> {
+    let mut obj = if existing.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str::<serde_json::Value>(existing)
+            .map_err(|e| format!("Failed to parse existing config.json: {}", e))?
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    if let Some(provider) = provider {
+        obj.insert(
+            "provider".to_string(),
+            serde_json::Value::String(provider.to_string()),
+        );
+    }
+    if let Some(browser) = browser {
+        obj.insert(
+            "browser".to_string(),
+            serde_json::Value::String(browser.to_string()),
+        );
+    }
+
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("Failed to serialize config: {}", e))
+}
+
+fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Result<(), String> {
     let config_path = config_file_path()?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -610,9 +751,9 @@ fn write_global_provider_config(provider: Provider) -> Result<(), String> {
         })?;
     }
 
-    let content =
-        serde_json::to_string_pretty(&serde_json::json!({"provider": provider.to_string()}))
-            .map_err(|e| format!("Failed to serialize provider config: {}", e))?;
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let provider_str = provider.map(|p| p.to_string());
+    let content = merged_config_json(&existing, provider_str.as_deref(), browser)?;
     std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
         format!(
             "Failed to write config file {}: {}",
@@ -621,45 +762,56 @@ fn write_global_provider_config(provider: Provider) -> Result<(), String> {
         )
     })?;
 
-    println!(
-        "Set default provider to '{}' in {}",
-        provider,
-        config_path.to_string_lossy()
-    );
-
     Ok(())
 }
 
-fn run_config_command(cli_provider: Option<Provider>) -> Result<(), String> {
-    match cli_provider {
-        Some(provider) => write_global_provider_config(provider),
-        None => {
-            let config_path = config_file_path()?;
-            let configured_provider = load_configured_provider()?;
-            match configured_provider {
-                Some(provider) => {
-                    println!("Current default provider: {}", provider);
-                }
-                None => {
-                    println!("No default provider configured.");
-                    println!("The effective provider is ChatGPT.");
-                }
-            }
-            if config_path.exists() {
-                println!("Config file: {}", config_path.to_string_lossy());
-            } else {
-                println!(
-                    "Config file not created yet: {}",
-                    config_path.to_string_lossy()
-                );
-            }
+fn run_config_command(
+    cli_provider: Option<Provider>,
+    cli_browser: Option<String>,
+) -> Result<(), String> {
+    if cli_provider.is_some() || cli_browser.is_some() {
+        write_global_config(cli_provider, cli_browser.as_deref())?;
+        let config_path = config_file_path()?;
+        if let Some(provider) = cli_provider {
             println!(
-                "Set default provider with: ask-bridge config --provider <chatgpt|gemini|claude>"
+                "Set default provider to '{}' in {}",
+                provider,
+                config_path.to_string_lossy()
             );
-            println!("This is a one-time override example: ask-bridge --provider gemini <prompt>");
-            Ok(())
+        }
+        if let Some(browser) = &cli_browser {
+            println!(
+                "Set default browser to '{}' in {}",
+                browser,
+                config_path.to_string_lossy()
+            );
+        }
+        return Ok(());
+    }
+
+    let config_path = config_file_path()?;
+    match load_configured_provider()? {
+        Some(provider) => println!("Current default provider: {}", provider),
+        None => {
+            println!("No default provider configured.");
+            println!("The effective provider is ChatGPT.");
         }
     }
+    match load_configured_browser()? {
+        Some(browser) => println!("Current default browser: {}", browser),
+        None => println!("No default browser configured (using auto-detected Google Chrome)."),
+    }
+    if config_path.exists() {
+        println!("Config file: {}", config_path.to_string_lossy());
+    } else {
+        println!(
+            "Config file not created yet: {}",
+            config_path.to_string_lossy()
+        );
+    }
+    println!("Set default provider with: ask-bridge config --provider <chatgpt|gemini|claude>");
+    println!("Set default browser with:  ask-bridge config --browser <path-or-.app>");
+    Ok(())
 }
 
 fn run_update_command() -> Result<(), String> {
@@ -1164,7 +1316,11 @@ fn find_chrome_path() -> Result<String, String> {
     }
 }
 
-fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
+fn start_chrome_if_needed(
+    headless: bool,
+    verbose: bool,
+    browser_override: Option<&str>,
+) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
     if TcpStream::connect("127.0.0.1:9223").is_ok() {
@@ -1233,7 +1389,12 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         );
     }
 
-    let chrome_path = find_chrome_path()?;
+    // An explicit override (already resolved to a concrete executable) wins;
+    // otherwise fall back to auto-detecting Google Chrome.
+    let chrome_path = match browser_override {
+        Some(path) => path.to_string(),
+        None => find_chrome_path()?,
+    };
     let _ = remove_chrome_pid_file();
 
     let mut cmd = Command::new(&chrome_path);
@@ -2400,6 +2561,111 @@ mod tests {
     }
 
     #[test]
+    fn parses_browser_as_global_argument() {
+        let cli = Cli::try_parse_from(["ask-bridge", "--browser", "/tmp/x", "login"]).unwrap();
+        assert_eq!(cli.browser.as_deref(), Some("/tmp/x"));
+        assert!(matches!(cli.command, Some(Commands::Login)));
+
+        let cli = Cli::try_parse_from(["ask-bridge", "login", "--browser", "/tmp/x"]).unwrap();
+        assert_eq!(cli.browser.as_deref(), Some("/tmp/x"));
+    }
+
+    #[test]
+    fn parses_config_command_with_browser() {
+        let cli = Cli::try_parse_from(["ask-bridge", "config", "--browser", "/tmp/x"]).unwrap();
+        assert_eq!(cli.browser.as_deref(), Some("/tmp/x"));
+        assert!(matches!(cli.command, Some(Commands::Config)));
+    }
+
+    #[test]
+    fn parses_browser_from_config_json() {
+        assert_eq!(
+            parse_configured_browser(r#"{"browser":"/Applications/Brave Origin.app"}"#).unwrap(),
+            Some("/Applications/Brave Origin.app".to_string())
+        );
+        assert_eq!(
+            parse_configured_browser(r#"{"provider":"gemini","browser":"/x"}"#).unwrap(),
+            Some("/x".to_string())
+        );
+        assert_eq!(parse_configured_browser(r#"{}"#).unwrap(), None);
+        assert_eq!(parse_configured_browser(r#"{"browser":"  "}"#).unwrap(), None);
+    }
+
+    #[test]
+    fn browser_cli_takes_precedence_over_config() {
+        let selected = select_browser_value_with(Some("/cli".to_string()), || {
+            Err("config should not be loaded".to_string())
+        })
+        .unwrap();
+        assert_eq!(selected, Some("/cli".to_string()));
+    }
+
+    #[test]
+    fn browser_falls_back_to_config_when_cli_missing() {
+        let selected =
+            select_browser_value_with(None, || Ok(Some("/from-config".to_string()))).unwrap();
+        assert_eq!(selected, Some("/from-config".to_string()));
+
+        let none = select_browser_value_with(None, || Ok(None)).unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn resolve_browser_binary_resolves_macos_app_bundle() {
+        let dir = make_test_dir("browser_app");
+        let macos = dir.join("Brave Test.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exec = macos.join("Brave Test");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+
+        let app_path = dir.join("Brave Test.app");
+        let resolved = resolve_browser_binary(app_path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, exec.to_string_lossy().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_browser_binary_accepts_direct_executable_path() {
+        let dir = make_test_dir("browser_bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("chromium");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+
+        let resolved = resolve_browser_binary(exec.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, exec.to_string_lossy().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_browser_binary_errors_on_missing() {
+        let err = resolve_browser_binary("/no/such/browser-xyz").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn merged_config_json_preserves_untouched_fields() {
+        // Setting browser must not drop an existing provider...
+        let merged = merged_config_json(r#"{"provider":"gemini"}"#, None, Some("/b")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["provider"], "gemini");
+        assert_eq!(value["browser"], "/b");
+
+        // ...and setting provider must not drop an existing browser.
+        let merged = merged_config_json(r#"{"browser":"/b"}"#, Some("chatgpt"), None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["provider"], "chatgpt");
+        assert_eq!(value["browser"], "/b");
+
+        // Empty existing body starts fresh.
+        let merged = merged_config_json("", Some("chatgpt"), Some("/b")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["provider"], "chatgpt");
+        assert_eq!(value["browser"], "/b");
+    }
+
+    #[test]
     fn parses_close_command() {
         let cli = Cli::try_parse_from(["ask-bridge", "close"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Close)));
@@ -3263,7 +3529,8 @@ fn open_url_tab(
     if pages.len() == 1
         && (pages[0].url == "about:blank"
             || pages[0].url.contains("new-tab-page")
-            || pages[0].url.contains("chrome://welcome"))
+            || pages[0].url.contains("chrome://welcome")
+            || pages[0].url.contains("://newtab"))
     {
         call_mcp_tool(
             config_path,
@@ -5147,7 +5414,8 @@ fn ensure_provider_tab(
                 if pages.len() == 1
                     && (pages[0].url == "about:blank"
                         || pages[0].url.contains("new-tab-page")
-                        || pages[0].url.contains("chrome://welcome"))
+                        || pages[0].url.contains("chrome://welcome")
+                        || pages[0].url.contains("://newtab"))
                 {
                     if verbose {
                         println!(
@@ -5441,7 +5709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     FORWARD_MCP_STDERR.store(command_verbose, std::sync::atomic::Ordering::Relaxed);
 
     if matches!(cli.command, Some(Commands::Config)) {
-        if let Err(e) = run_config_command(cli.provider) {
+        if let Err(e) = run_config_command(cli.provider, cli.browser.clone()) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -5525,8 +5793,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Err(e) = start_chrome_if_needed(is_headless, command_verbose) {
-        eprintln!("Error starting Chrome: {}", e);
+    let browser_override = match resolve_browser_override(cli.browser.clone()) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = start_chrome_if_needed(is_headless, command_verbose, browser_override.as_deref()) {
+        eprintln!("Error starting browser: {}", e);
         std::process::exit(1);
     }
 
