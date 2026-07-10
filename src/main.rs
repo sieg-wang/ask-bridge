@@ -708,8 +708,8 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
             ]
         })
     } else if quiet_mcp && cfg!(target_os = "windows") {
-        // Windows: wrap with PowerShell so we can redirect stderr to $null
-        let mut ps_args = vec![
+        // Windows: wrap with cmd.exe so we can redirect stderr to nul
+        let mut cmd_args = vec![
             "-y".to_string(),
             "chrome-devtools-mcp@latest".to_string(),
             "--browser-url=http://127.0.0.1:9223".to_string(),
@@ -719,17 +719,15 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
             format!("\"{}\"", log_path),
         ];
         if headless {
-            ps_args.push("--headless".to_string());
+            cmd_args.push("--headless".to_string());
         }
-        let ps_cmd = format!("npx {} 2>$null", ps_args.join(" "));
+        let cmd_str = format!("npx {} 2>nul", cmd_args.join(" "));
 
         serde_json::json!({
-            "command": "powershell.exe",
+            "command": "cmd.exe",
             "args": [
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                ps_cmd
+                "/c",
+                cmd_str
             ]
         })
     } else {
