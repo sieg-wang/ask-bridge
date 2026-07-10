@@ -356,6 +356,16 @@ ask-bridge close
 
 `close` 只會關閉使用 `~/.config/ask-bridge/chrome-profile` 且監聽 debug port `9223` 的 `ask-bridge` Chrome instance；若該 port 被非 `ask-bridge` Chrome 程序占用，會回報錯誤而不會關閉它。
 
+### 12. 更新 ask-bridge
+
+若要直接自動更新目前安裝的 `ask-bridge`，可直接執行：
+
+```bash
+ask-bridge update
+```
+
+此命令會依作業系統重新執行 README 建議的官方安裝命令（macOS / Linux 或 Windows）。
+
 ## 運作原理
 
 1. **瀏覽器初始化**：`ask-bridge` 會檢查 Chrome 是否正在監聽 debug port `9223`。若沒有，會以專屬 profile 目錄 `~/.config/ask-bridge/chrome-profile` 啟動 Google Chrome。

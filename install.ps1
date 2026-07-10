@@ -8,6 +8,120 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "Starting Ask Bridge installation for Windows..." -ForegroundColor Cyan
 
+function Get-AskBridgeParentPid {
+    try {
+        $currentPid = $PID
+        $seen = @{}
+
+        for ($depth = 0; $depth -lt 16; $depth++) {
+            $current = Get-CimInstance Win32_Process -Filter "ProcessId = $currentPid" -ErrorAction SilentlyContinue
+            if (-not $current -or -not $current.ParentProcessId) {
+                return $null
+            }
+
+            if ($seen.ContainsKey([int]$currentPid)) {
+                return $null
+            }
+            $seen[[int]$currentPid] = $true
+
+            $parentPid = [int]$current.ParentProcessId
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $parentPid" -ErrorAction SilentlyContinue
+            if (-not $parent) {
+                return $null
+            }
+
+            $parentCommand = $parent.CommandLine
+            if ($parent.Name -in @("ask.exe", "ask-bridge.exe")) {
+                return [int]$parent.ProcessId
+            }
+
+            if ($parentCommand -and $parentCommand -match '\b(?:\.\\)?ask(?:-bridge)?(?:\.exe)?\b.*\bupdate\b') {
+                return [int]$parent.ProcessId
+            }
+
+            $currentPid = $parentPid
+        }
+    } catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Stop-AskBridgeParentForUpdate {
+    $targetPids = @()
+    $parentPid = Get-AskBridgeParentPid
+    if ($parentPid) {
+        $targetPids += [int]$parentPid
+    }
+
+    if ($targetPids.Count -eq 0) {
+        try {
+            $sessionId = $null
+            $self = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue
+            if ($self -and $self.SessionId) {
+                $sessionId = $self.SessionId
+            }
+
+            $allProcesses = Get-CimInstance Win32_Process -Filter "Name='ask.exe' OR Name='ask-bridge.exe'" -ErrorAction SilentlyContinue
+            foreach ($process in $allProcesses) {
+                if ($sessionId -ne $null -and $process.SessionId -ne $sessionId) {
+                    continue
+                }
+                if ($process.ProcessId -ne $PID) {
+                    $targetPids += [int]$process.ProcessId
+                }
+            }
+        } catch {
+            Write-Host "Warning: unable to discover running ask processes by fallback scan ($($_.Exception.Message))." -ForegroundColor Yellow
+        }
+    }
+
+    $targetPids = $targetPids | Sort-Object -Unique
+    if ($targetPids.Count -eq 0) {
+        return
+    }
+
+    foreach ($pid in $targetPids) {
+        $targetProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $pid" -ErrorAction SilentlyContinue
+        if (-not $targetProcess) {
+            continue
+        }
+
+        Write-Host "Stopping running ask-bridge process (PID $pid) to replace binaries safely." -ForegroundColor Cyan
+        try {
+            Stop-Process -Id $pid -Force -ErrorAction Stop
+        } catch {
+            Write-Host "Warning: failed to stop PID $pid automatically ($($_.Exception.Message))." -ForegroundColor Yellow
+        }
+    }
+}
+
+function Copy-ItemWithRetry {
+    param(
+        [Parameter(Mandatory)] [string] $Source,
+        [Parameter(Mandatory)] [string] $Destination
+    )
+
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            Copy-Item -Path $Source -Destination $Destination -Force
+            return
+        } catch {
+            if ($attempt -eq 1) {
+                Stop-AskBridgeParentForUpdate
+            }
+
+            if ($attempt -eq 10) {
+                throw
+            }
+
+            Write-Host "Retrying copy for $Destination in 500ms (attempt $attempt/10)..." -ForegroundColor Yellow
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 # 1. Check Node.js and npx
 $nodeCheck = Get-Command node -ErrorAction SilentlyContinue
 $npxCheck = Get-Command npx -ErrorAction SilentlyContinue
@@ -66,12 +180,53 @@ if (-not $chromeFound) {
 
 # 3. Install from local build (for development)
 if ($Local) {
+    $LocalRoot = if ($MyInvocation.MyCommand.Path) {
+        Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        Get-Location
+    }
+
     if ([string]::IsNullOrWhiteSpace($LocalPath)) {
-        $LocalPath = Join-Path (Get-Location) "target\release\ask-bridge.exe"
+        $LocalPath = Join-Path $LocalRoot "target\release\ask-bridge.exe"
+        $LocalUpdatePath = Join-Path $LocalRoot "target\release\ask-bridge-update.exe"
+    } else {
+        $LocalPath = [System.IO.Path]::GetFullPath($LocalPath)
+        $LocalUpdatePath = Join-Path (Split-Path $LocalPath) "ask-bridge-update.exe"
+    }
+
+    $LocalPathDir = Split-Path $LocalPath
+    if (-not (Test-Path $LocalPathDir)) {
+        try {
+            $null = New-Item -ItemType Directory -Force -Path $LocalPathDir
+        } catch {
+            Write-Error "Failed to prepare local build directory '$LocalPathDir'."
+            exit 1
+        }
+    }
+
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Write-Error "Rust toolchain not found. Please install Rust and retry."
+        exit 1
+    }
+
+    Write-Host "Building ask-bridge in release mode..." -ForegroundColor Cyan
+    try {
+        Push-Location $LocalRoot
+        & cargo build --release
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "cargo build --release failed. Exit code: $LASTEXITCODE"
+            exit 1
+        }
+    } finally {
+        Pop-Location
     }
 
     if (-not (Test-Path $LocalPath)) {
-        Write-Error "Local binary not found at '$LocalPath'. Build it first (cargo build --release) or pass -LocalPath explicitly."
+        Write-Error "Local binary not found at '$LocalPath' even after cargo build. Check repository permissions and build output path."
+        exit 1
+    }
+    if (-not (Test-Path $LocalUpdatePath)) {
+        Write-Error "Local updater binary not found at '$LocalUpdatePath'. Check repository permissions and build output path."
         exit 1
     }
 
@@ -82,9 +237,13 @@ if ($Local) {
 
     $DestPath = Join-Path $InstallDir "ask-bridge.exe"
     $AliasPath = Join-Path $InstallDir "ask.exe"
+    $UpdatePath = Join-Path $InstallDir "ask-bridge-update.exe"
     Write-Host "Installing local ask-bridge.exe to $InstallDir..." -ForegroundColor Cyan
-    Copy-Item -Path (Resolve-Path $LocalPath).Path -Destination $DestPath -Force
-    Copy-Item -Path (Resolve-Path $LocalPath).Path -Destination $AliasPath -Force
+    $ResolvedLocalPath = (Resolve-Path $LocalPath).Path
+    $ResolvedLocalUpdatePath = (Resolve-Path $LocalUpdatePath).Path
+    Copy-ItemWithRetry -Source $ResolvedLocalPath -Destination $DestPath
+    Copy-ItemWithRetry -Source $ResolvedLocalPath -Destination $AliasPath
+    Copy-ItemWithRetry -Source $ResolvedLocalUpdatePath -Destination $UpdatePath
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $CleanPathList = $UserPath -split ';'
@@ -107,7 +266,7 @@ if ($Local) {
 }
 
 # 3. Target configuration
-$Version = "0.2.6"
+$Version = "0.2.7"
 $RepoOwner = "doggy8088"
 $RepoName = "ask-bridge"
 $ArtifactName = "ask-bridge-x86_64-pc-windows-msvc.zip"
@@ -141,13 +300,22 @@ try {
         Write-Error "Could not find ask-bridge.exe in the downloaded archive."
         exit 1
     }
+    $UpdateExePath = Get-ChildItem -Path $TempDir -Recurse -Filter "ask-bridge-update.exe" | Select-Object -First 1
 
     # Copy to destination as ask-bridge.exe and keep ask.exe as an alias.
     $DestPath = Join-Path $InstallDir "ask-bridge.exe"
     $AliasPath = Join-Path $InstallDir "ask.exe"
+    $UpdateDestPath = Join-Path $InstallDir "ask-bridge-update.exe"
     Write-Host "Installing ask-bridge.exe to $InstallDir..." -ForegroundColor Cyan
-    Copy-Item -Path $ExePath.FullName -Destination $DestPath -Force
-    Copy-Item -Path $ExePath.FullName -Destination $AliasPath -Force
+    Copy-ItemWithRetry -Source $ExePath.FullName -Destination $DestPath
+    Copy-ItemWithRetry -Source $ExePath.FullName -Destination $AliasPath
+
+    if ($UpdateExePath) {
+        Write-Host "Installing ask-bridge-update.exe to $InstallDir..." -ForegroundColor Cyan
+        Copy-ItemWithRetry -Source $UpdateExePath.FullName -Destination $UpdateDestPath
+    } else {
+        Write-Host "Warning: ask-bridge-update.exe not found in archive; update helper unavailable." -ForegroundColor Yellow
+    }
 }
 finally {
     # Clean up temp

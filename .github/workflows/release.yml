@@ -38,19 +38,27 @@ jobs:
         shell: pwsh
         run: |
           $binary = "target/${{ matrix.target }}/release/ask-bridge"
+          $updateBinary = "target/${{ matrix.target }}/release/ask-bridge-update"
           if ("${{ runner.os }}" -eq "Windows") {
             $binary = "$binary.exe"
+            $updateBinary = "$updateBinary.exe"
           }
           if (!(Test-Path $binary)) {
             throw "Missing built binary: $binary"
+          }
+          if (!(Test-Path $updateBinary)) {
+            throw "Missing updater binary: $updateBinary"
           }
 
           New-Item -ItemType Directory -Force dist | Out-Null
           $archive = "dist/ask-bridge-${{ matrix.target }}.${{ matrix.ext }}"
           if ("${{ matrix.ext }}" -eq "zip") {
-            Compress-Archive -Path $binary -DestinationPath $archive -Force
+            Compress-Archive -Path $binary, $updateBinary -DestinationPath $archive -Force
           } else {
-            tar -cJf $archive -C (Split-Path $binary) (Split-Path $binary -Leaf)
+            $binaryDir = Split-Path $binary
+            $binaryLeaf = Split-Path $binary -Leaf
+            $updateBinaryLeaf = Split-Path $updateBinary -Leaf
+            tar -cJf $archive -C $binaryDir $binaryLeaf $updateBinaryLeaf
           }
 
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()

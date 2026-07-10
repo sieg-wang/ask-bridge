@@ -425,10 +425,13 @@ fn parse_chatgpt_agent_prompt(prompt: &str) -> Option<ChatGptAgentPrompt<'_>> {
 
 #[derive(Parser)]
 #[command(name = "ask-bridge")]
-#[command(version = "0.2.6")]
+#[command(version = "0.2.7")]
 #[command(disable_version_flag = true)]
 #[command(about = "AI browser CLI - Ask ChatGPT, Gemini or Claude from your Terminal with your subscription", long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// The prompt to send to the selected provider.
     /// If standard input is piped and this value is present, they are combined as:
     /// `prompt + "\\n\\n" + stdin`.
@@ -487,9 +490,6 @@ struct Cli {
     /// Matching is case- and punctuation-insensitive.
     #[arg(long = "model", value_name = "MODEL")]
     model: Option<String>,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -515,6 +515,8 @@ enum Commands {
     Close,
     /// Set or show the global default provider used when --provider is not specified.
     Config,
+    /// Reinstall ask-bridge using the recommended README installation command
+    Update,
     /// Dump the current browser tab HTML for debugging
     #[command(hide = true)]
     Dump,
@@ -657,6 +659,64 @@ fn run_config_command(cli_provider: Option<Provider>) -> Result<(), String> {
             println!("This is a one-time override example: ask-bridge --provider gemini <prompt>");
             Ok(())
         }
+    }
+}
+
+fn run_update_command() -> Result<(), String> {
+    println!("Running ask-bridge update via official installer...");
+    println!("Progress: downloading installer and updating binary.");
+
+    #[cfg(target_os = "windows")]
+    let status = {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to locate current executable path: {}", e))?;
+        let update_exe = current_exe
+            .parent()
+            .ok_or_else(|| "Failed to determine ask-bridge executable directory".to_string())?
+            .join("ask-bridge-update.exe");
+
+        if update_exe.exists() {
+            let child = Command::new(update_exe)
+                .arg(format!("--parent-pid={}", std::process::id()))
+                .arg("--wait-seconds=30")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| format!("Failed to launch ask-bridge-update.exe: {}", e))?;
+            println!("Progress: updater started with PID {}.", child.id());
+            println!("Progress: update command is running in background.");
+            return Ok(());
+        }
+
+        println!("ask-bridge-update.exe not found. Falling back to inline installer.");
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "irm https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.ps1 | iex",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to run Windows update command: {}", e))?
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh | bash",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to run macOS/Linux update command: {}", e))?;
+
+    if status.success() {
+        println!("Progress: update command completed.");
+        Ok(())
+    } else {
+        Err(format!("Update command failed with exit status {}", status))
     }
 }
 
@@ -2033,6 +2093,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_update_command() {
+        let cli = Cli::try_parse_from(["ask-bridge", "update"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Update)));
+    }
+
+    #[test]
     fn leaves_provider_unset_when_cli_argument_is_missing() {
         let cli = Cli::try_parse_from(["ask-bridge", "hello"]).unwrap();
         assert_eq!(cli.provider, None);
@@ -2115,6 +2181,7 @@ mod tests {
         assert!(!help.contains("\n  screenshot"));
         assert!(help.contains("\n  login"));
         assert!(help.contains("\n  close"));
+        assert!(help.contains("\n  update"));
     }
 
     #[test]
@@ -5040,7 +5107,14 @@ fn print_chrome_diagnostics(profile_path: &str) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.command.is_none() {
+        let is_stdin_terminal = io::stdin().is_terminal();
+        if is_stdin_terminal && cli.prompt.as_deref() == Some("update") {
+            cli.command = Some(Commands::Update);
+        }
+    }
+
     let command_verbose = match &cli.command {
         Some(Commands::Get { verbose, .. }) => cli.verbose || *verbose,
         _ => cli.verbose,
@@ -5054,6 +5128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
 
+        return Ok(());
+    }
+    if matches!(cli.command, Some(Commands::Update)) {
+        if let Err(e) = run_update_command() {
+            eprintln!("Update failed: {}", e);
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -5284,6 +5365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Commands::Close => unreachable!("close command is handled before Chrome startup"),
             Commands::Config => unreachable!("config command is handled before Chrome startup"),
+            Commands::Update => unreachable!("update command is handled before Chrome startup"),
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);
