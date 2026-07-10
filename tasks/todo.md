@@ -1,3 +1,58 @@
+# 2026-07-10 修正 Windows ChatGPT 登入延續回歸
+
+## Goal + Acceptance Criteria
+- [x] Windows 上 Chrome launcher PID 與 9223 listener PID 不同時，仍能辨識為 ask-bridge 所啟動的 Chrome。
+- [x] `login` 結束後直接執行 query，不再誤報 `Port 9223 is already used by a non-ask Chrome process`。
+- [x] ChatGPT 頁面登入 UI 尚在 hydration 時，不會因單次暫態訊號立即誤報未登入。
+- [x] 明確位於 auth path 或穩定呈現未登入控制項時，仍安全地阻止 query 並提示登入。
+- [x] `close` 與啟動重用採相同 ownership 規則，且 Windows 優先正常關閉、逾時才強制終止。
+- [x] 回歸測試涵蓋實際 listener PID 記錄、PID fallback、WMIC 空白輸出與登入訊號穩定化。
+- [x] 通過格式、Rust tests/check 與 diff whitespace 驗證（未執行 clippy / npm 測試）。
+
+## Results
+- `src/main.rs`：
+  - 移除已淘汰的 `write_chrome_pid`/舊版 listener 回溯測試。
+  - 重構 `start_chrome_if_needed` 與 `close_ask_chrome_on_debug_port` 以以 `CDP browser_id + debug listener` 為主、且由 parent-chain 尋找 `ask-bridge` 擁有者。
+  - 將啟動與關閉重用判斷的 `Chrome` ownership 與 `build_chrome_process_record` 對齊。
+  - ChatGPT 登入訊號加入 `stable` 欄位與穩定化等待，降低一次性 DOM 暫態誤判。
+- 驗證：
+  - `cargo fmt --all -- --check`
+  - `cargo check`
+  - `cargo test`
+
+## Risk & Rollback
+- Risk level: medium
+- Affected components: Windows Chrome process ownership、9223 listener 重用／關閉、ChatGPT 登入前置判斷。
+- Rollback strategy: revert `src/main.rs` 的 listener PID 與登入穩定化變更；不涉及資料格式或 migration。
+- Rollout plan: 先以純函式測試與本機 Windows listener 驗證，再由受影響使用者重跑 login → query 原始流程。
+- Monitoring signals: verbose diagnostics 中 recorded PID 應等於 listener PID，owner PIDs 不得為空；query 不得再出現 non-ask 或暫態未登入誤判。
+
+## Dependencies & Environment
+- Rust/Cargo、Node.js/npm 與本機 Google Chrome。
+- `chrome-devtools-mcp@latest` 的 `evaluate_script` 支援 async function，可在單一 MCP 呼叫內等待登入 DOM 穩定。
+- 本機 9223 已有既存 ask-bridge Chrome，手動驗證不得破壞其 profile 或登入資料。
+
+## Working Notes
+- 使用者證據：launcher/recorded PID `15864`、listener PID `20728`、owner PIDs `[]`；現有 `chrome.pid` 只記 launcher 且未參與 ownership 判定。
+- `start_chrome_if_needed` 會因 owner 空集合誤判既有 Chrome；`close_ask_chrome_on_debug_port` 又使用另一套更窄的直接 command-line 判斷。
+- Windows WMIC command-line parser 只讀 header 後第一行，遇到空白行便失敗；CIM fallback 也可能受環境限制。
+- v0.2.1 的 ChatGPT ready check 只等 composer；訪客 shell 與登入 hydration 都可能先出現 composer，隨後的單次登入訊號便可能暫態為 LoggedOut。
+- 登入完成當下已得到 Unknown，證明現行 account-menu selector 不是可靠的唯一已登入依據。
+
+## Checklist
+- [x] Review `tasks/lessons.md` if present（檔案不存在）
+- [x] Locate existing implementation / patterns and preserve baseline evidence
+- [x] Design minimal approach + key decisions
+- [x] Implement listener PID ownership fallback and consistent close resolution
+- [x] Make ChatGPT login decision tolerate hydration without masking stable logged-out state
+- [x] Add/adjust regression tests
+- [x] Run targeted and full verification
+- [ ] Review correctness/security/performance of final diff
+- [ ] Summarize changes + verification story
+- [ ] Record lessons if any correction/postmortem occurs
+
+---
+
 # 2026-07-09 修正 WSL Chrome 路徑偵測
 
 ## Goal + Acceptance Criteria

@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use mcp_cli::McpClient;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -29,18 +29,23 @@ struct LoginSignals {
     auth_control: bool,
     auth_path: bool,
     composer: bool,
+    stable: bool,
 }
 
 impl LoginSignals {
-    fn state(self) -> LoginState {
-        match (
-            self.account,
-            self.auth_control || self.auth_path,
-            self.composer,
-        ) {
-            (true, _, _) => LoginState::LoggedIn,
-            (false, true, _) => LoginState::LoggedOut,
-            (false, false, _) => LoginState::Unknown,
+    fn state(self, provider: Provider) -> LoginState {
+        if self.auth_path {
+            LoginState::LoggedOut
+        } else if self.account {
+            LoginState::LoggedIn
+        } else if !self.stable {
+            LoginState::Unknown
+        } else if self.auth_control {
+            LoginState::LoggedOut
+        } else if self.composer && provider == Provider::ChatGpt {
+            LoginState::LoggedIn
+        } else {
+            LoginState::Unknown
         }
     }
 }
@@ -122,7 +127,7 @@ impl Provider {
     fn login_signals_js(self) -> &'static str {
         match self {
             Provider::ChatGpt => {
-                r#"() => {
+                r#"async () => {
                     const isVisible = (el) => {
                         if (!el) return false;
                         const style = window.getComputedStyle(el);
@@ -140,38 +145,63 @@ impl Provider {
                         el.textContent
                     ].filter(Boolean).join(' ').trim();
 
-                    const visibleAuthButton = Array.from(document.querySelectorAll('a, button'))
-                        .some((el) => {
-                            if (!isVisible(el)) return false;
-                            const text = textFor(el);
-                            return /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(text);
-                        });
+                    const readSignals = () => {
+                        const visibleAuthButton = Array.from(document.querySelectorAll('a, button'))
+                            .some((el) => {
+                                if (!isVisible(el)) return false;
+                                const text = textFor(el);
+                                return /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(text);
+                            });
 
-                    const composer = document.querySelector('#prompt-textarea') ||
-                        document.querySelector('[data-testid="composer-text-input"]') ||
-                        document.querySelector('textarea[placeholder*="Message"]') ||
-                        document.querySelector('textarea[placeholder*="訊息"]') ||
-                        document.querySelector('[contenteditable="true"]');
+                        const composer = document.querySelector('#prompt-textarea') ||
+                            document.querySelector('[data-testid="composer-text-input"]') ||
+                            document.querySelector('textarea[placeholder*="Message"]') ||
+                            document.querySelector('textarea[placeholder*="訊息"]') ||
+                            document.querySelector('[contenteditable="true"]');
 
-                    const accountMenu = document.querySelector('[data-testid="profile-button"]') ||
-                        document.querySelector('[data-testid="account-menu-button"]') ||
-                        document.querySelector('[data-testid="user-menu-button"]') ||
-                        document.querySelector('button[aria-label*="Profile"]') ||
-                        document.querySelector('button[aria-label*="profile"]') ||
-                        document.querySelector('button[aria-label*="Account"]') ||
-                        document.querySelector('button[aria-label*="account"]') ||
-                        document.querySelector('button[aria-label*="User"]') ||
-                        document.querySelector('button[aria-label*="user"]') ||
-                        document.querySelector('button[aria-label*="帳戶"]') ||
-                        document.querySelector('button[aria-label*="使用者"]');
+                        const accountMenu = document.querySelector('[data-testid="profile-button"]') ||
+                            document.querySelector('[data-testid="account-menu-button"]') ||
+                            document.querySelector('[data-testid="user-menu-button"]') ||
+                            document.querySelector('button[aria-label*="Profile"]') ||
+                            document.querySelector('button[aria-label*="profile"]') ||
+                            document.querySelector('button[aria-label*="Account"]') ||
+                            document.querySelector('button[aria-label*="account"]') ||
+                            document.querySelector('button[aria-label*="User"]') ||
+                            document.querySelector('button[aria-label*="user"]') ||
+                            document.querySelector('button[aria-label*="帳戶"]') ||
+                            document.querySelector('button[aria-label*="使用者"]');
 
-                    const authPath = /\/(auth|login|signup)(\/|$)/i.test(window.location.pathname);
-                    return {
-                        account: isVisible(accountMenu),
-                        auth_control: Boolean(visibleAuthButton),
-                        auth_path: authPath,
-                        composer: Boolean(composer)
+                        return {
+                            account: isVisible(accountMenu),
+                            auth_control: Boolean(visibleAuthButton),
+                            auth_path: /\/(auth|login|signup)(\/|$)/i.test(window.location.pathname),
+                            composer: isVisible(composer)
+                        };
                     };
+
+                    let signals = readSignals();
+                    let signature = JSON.stringify(signals);
+                    const startedAt = Date.now();
+                    let stableSince = startedAt;
+                    let stable = false;
+                    const earliestDecision = startedAt + 2000;
+                    const deadline = Date.now() + 5000;
+                    while (!signals.account && !signals.auth_path && Date.now() < deadline) {
+                        await new Promise((resolve) => setTimeout(resolve, 250));
+                        const nextSignals = readSignals();
+                        const nextSignature = JSON.stringify(nextSignals);
+                        if (nextSignature !== signature) {
+                            signature = nextSignature;
+                            stableSince = Date.now();
+                        }
+                        signals = nextSignals;
+                        if (Date.now() >= earliestDecision && Date.now() - stableSince >= 750) {
+                            stable = true;
+                            break;
+                        }
+                    }
+
+                    return { ...signals, stable };
                 }"#
             }
             Provider::Gemini => {
@@ -202,7 +232,8 @@ impl Provider {
                         account: isVisible(account),
                         auth_control: Boolean(signIn),
                         auth_path: authPath,
-                        composer: Boolean(composer)
+                        composer: Boolean(composer),
+                        stable: true
                     };
                 }"#
             }
@@ -736,21 +767,41 @@ fn chrome_pid_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn write_chrome_pid(pid: u32) -> Result<(), String> {
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ChromeProcessRecord {
+    pid: u32,
+    #[serde(default)]
+    browser_id: Option<String>,
+}
+
+fn parse_chrome_process_record(content: &str) -> Option<ChromeProcessRecord> {
+    serde_json::from_str(content).ok().or_else(|| {
+        content
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(|pid| ChromeProcessRecord {
+                pid,
+                browser_id: None,
+            })
+    })
+}
+
+fn write_chrome_process_record(record: &ChromeProcessRecord) -> Result<(), String> {
     let path = chrome_pid_path()?;
-    std::fs::write(&path, pid.to_string())
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    let content = serde_json::to_string(record)
+        .map_err(|e| format!("Failed to serialize Chrome process record: {}", e))?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+fn read_chrome_process_record() -> Option<ChromeProcessRecord> {
+    let path = chrome_pid_path().ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_chrome_process_record(&content)
 }
 
 fn read_chrome_pid() -> Option<String> {
-    let path = chrome_pid_path().ok()?;
-    let pid = std::fs::read_to_string(path).ok()?;
-    let pid = pid.trim();
-    if pid.is_empty() {
-        None
-    } else {
-        Some(pid.to_string())
-    }
+    read_chrome_process_record().map(|record| record.pid.to_string())
 }
 
 fn remove_chrome_pid_file() -> Result<(), String> {
@@ -760,6 +811,119 @@ fn remove_chrome_pid_file() -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Failed to remove {}: {}", path.display(), e)),
     }
+}
+
+fn browser_id_from_websocket_url(url: &str) -> Option<String> {
+    const LOOPBACK_PREFIXES: &[&str] = &[
+        "ws://127.0.0.1:9223/devtools/browser/",
+        "ws://localhost:9223/devtools/browser/",
+        "ws://[::1]:9223/devtools/browser/",
+    ];
+    let id = LOOPBACK_PREFIXES
+        .iter()
+        .find_map(|prefix| url.strip_prefix(prefix))?
+        .trim();
+    (!id.is_empty() && !id.contains(['/', '?', '#'])).then(|| id.to_string())
+}
+
+fn browser_id_from_version_response(response: &str) -> Option<String> {
+    if !http_response_is_complete(response.as_bytes()) {
+        return None;
+    }
+    let (headers, body) = response.split_once("\r\n\r\n")?;
+    let status = headers.lines().next()?;
+    let mut status_parts = status.split_whitespace();
+    if !status_parts.next()?.starts_with("HTTP/") || status_parts.next()? != "200" {
+        return None;
+    }
+    let body = body.trim();
+    let version: Value = serde_json::from_str(body).ok()?;
+    let websocket_url = version.get("webSocketDebuggerUrl")?.as_str()?;
+    browser_id_from_websocket_url(websocket_url)
+}
+
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body_start = header_end + 4;
+    let Ok(headers) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+
+    content_length
+        .and_then(|content_length| body_start.checked_add(content_length))
+        .map(|response_length| response.len() >= response_length)
+        .unwrap_or(false)
+}
+
+fn debug_browser_id() -> Option<String> {
+    const MAX_RESPONSE_SIZE: usize = 64 * 1024;
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut stream = TcpStream::connect("127.0.0.1:9223").ok()?;
+    let timeout = Some(Duration::from_millis(500));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+    stream
+        .write_all(
+            b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:9223\r\nConnection: close\r\n\r\n",
+        )
+        .ok()?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let deadline = Instant::now() + TOTAL_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                response
+                    .len()
+                    .checked_add(bytes_read)
+                    .filter(|length| *length <= MAX_RESPONSE_SIZE)
+                    .map(|_| ())?;
+                response.extend_from_slice(&buffer[..bytes_read]);
+                if http_response_is_complete(&response) {
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+
+    if !http_response_is_complete(&response) {
+        return None;
+    }
+    let response = String::from_utf8(response).ok()?;
+    browser_id_from_version_response(&response)
+}
+
+fn build_chrome_process_record(
+    listener_pids: &[String],
+    browser_id: Option<&str>,
+) -> Option<ChromeProcessRecord> {
+    if listener_pids.len() != 1 {
+        return None;
+    }
+    Some(ChromeProcessRecord {
+        pid: listener_pids.first()?.parse::<u32>().ok()?,
+        browser_id: Some(browser_id?.to_string()),
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -874,16 +1038,19 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
     if TcpStream::connect("127.0.0.1:9223").is_ok() {
-        let ask_pids = ask_chrome_pids_on_debug_port(&profile_path);
-        if !ask_pids.is_empty() {
-            if let Some(pid) = ask_pids.first().and_then(|pid| pid.parse::<u32>().ok()) {
-                let _ = write_chrome_pid(pid);
-            }
+        let snapshot = inspect_chrome_debug_port(&profile_path);
+        if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
+            && chrome_record_matches_current(
+                snapshot.record.as_ref(),
+                snapshot.browser_id.as_deref(),
+                &snapshot.listener_pids,
+            )
+        {
             if headless {
                 // Force hide any existing background Chrome PIDs asynchronously just in case they are currently visible
                 #[cfg(target_os = "macos")]
                 {
-                    let pids = ask_pids.clone();
+                    let pids = snapshot.ask_pids.clone();
                     thread::spawn(move || {
                         for pid_str in pids {
                             if let Ok(pid) = pid_str.parse::<u32>() {
@@ -905,11 +1072,20 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
             return Ok(());
         }
 
-        if debug_port_listener_pids().is_empty() {
+        if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
+            && !snapshot.ask_pids.is_empty()
+            && build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
+                .is_some()
+        {
+            if let Some(record) =
+                build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
+            {
+                write_chrome_process_record(&record).map_err(|error| {
+                    format!("Failed to update Chrome process record: {}", error)
+                })?;
+            }
             if verbose {
-                println!(
-                    "Port 9223 is listening, but ask-bridge could not identify the listener process. Reusing it."
-                );
+                println!("Reusing the existing ask-bridge Chrome on port 9223.");
             }
             return Ok(());
         }
@@ -928,6 +1104,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     }
 
     let chrome_path = find_chrome_path()?;
+    let _ = remove_chrome_pid_file();
 
     let mut cmd = Command::new(&chrome_path);
     cmd.arg("--remote-debugging-port=9223")
@@ -957,11 +1134,6 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to start Google Chrome: {}", e))?;
 
     let child_pid = child.id();
-    if let Err(e) = write_chrome_pid(child_pid)
-        && verbose
-    {
-        eprintln!("Warning: Failed to record Chrome PID: {}", e);
-    }
 
     if verbose {
         println!(
@@ -990,19 +1162,47 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
 
     let _ = child; // Avoid unused variable warning on non-macOS platforms
 
-    // Wait for Chrome to listen on port 9223
-    for _ in 0..50 {
+    // Wait for Chrome to listen and prove that the listener belongs to this launch.
+    let startup_deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_identity_error = None;
+    while Instant::now() < startup_deadline {
         if TcpStream::connect("127.0.0.1:9223").is_ok() {
-            if verbose {
-                println!("Chrome started and listening on port 9223.");
+            let snapshot = inspect_chrome_debug_port(&profile_path);
+            if let Some(record) =
+                build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
+            {
+                if let Err(error) = write_chrome_process_record(&record) {
+                    return Err(format!(
+                        "Failed to record Chrome process identity: {}",
+                        error
+                    ));
+                }
+                if verbose && record.pid != child_pid {
+                    println!(
+                        "Recorded actual Chrome listener PID {} (launcher PID {}).",
+                        record.pid, child_pid
+                    );
+                }
+                if verbose {
+                    println!("Chrome started and listening on port 9223.");
+                }
+                return Ok(());
             }
-            return Ok(());
+            last_identity_error = Some(
+                "Chrome did not expose a valid CDP browser identity on port 9223.".to_string(),
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
 
     let _ = remove_chrome_pid_file();
-    Err("Timed out waiting for Chrome to start on port 9223".to_string())
+    match last_identity_error {
+        Some(error) => Err(format!(
+            "Failed to identify active Chrome listener: {}",
+            error
+        )),
+        None => Err("Timed out waiting for Chrome to start on port 9223".to_string()),
+    }
 }
 
 fn normalize_profile_match_text(value: &str) -> String {
@@ -1019,16 +1219,36 @@ fn normalize_profile_match_text(value: &str) -> String {
     }
 }
 
+fn command_has_argument(command: &str, argument: &str) -> bool {
+    command.match_indices(argument).any(|(start, matched)| {
+        let before_is_boundary = start == 0
+            || command[..start]
+                .chars()
+                .next_back()
+                .map(char::is_whitespace)
+                .unwrap_or(false);
+        let end = start + matched.len();
+        let after_is_boundary = end == command.len()
+            || command[end..]
+                .chars()
+                .next()
+                .map(char::is_whitespace)
+                .unwrap_or(false);
+        before_is_boundary && after_is_boundary
+    })
+}
+
 fn command_uses_profile(command: &str, profile_path: &str) -> bool {
     let command = normalize_profile_match_text(command);
     let profile_path = normalize_profile_match_text(profile_path);
 
-    command.contains(&format!("--user-data-dir={}", profile_path))
-        || command.contains(&format!("--user-data-dir {}", profile_path))
+    command_has_argument(&command, &format!("--user-data-dir={}", profile_path))
+        || command_has_argument(&command, &format!("--user-data-dir {}", profile_path))
 }
 
 fn command_identifies_ask_chrome(command: &str, profile_path: &str) -> bool {
-    command_uses_profile(command, profile_path) || command.contains(ASK_BRIDGE_CHROME_MARKER)
+    command_uses_profile(command, profile_path)
+        || command_has_argument(command, ASK_BRIDGE_CHROME_MARKER)
 }
 
 fn find_ask_chrome_owner_pid_with<C, P>(
@@ -1061,25 +1281,106 @@ where
     None
 }
 
-fn find_ask_chrome_owner_pid(listener_pid: &str, profile_path: &str) -> Option<String> {
-    find_ask_chrome_owner_pid_with(
-        listener_pid,
-        profile_path,
-        process_command,
-        process_parent_pid,
+fn chrome_record_matches_browser(record: &ChromeProcessRecord, browser_id: Option<&str>) -> bool {
+    matches!(
+        (record.browser_id.as_deref(), browser_id),
+        (Some(recorded_id), Some(current_id)) if recorded_id == current_id
     )
 }
 
-fn ask_chrome_pids_on_debug_port(profile_path: &str) -> Vec<String> {
-    let mut owner_pids = Vec::new();
-    for listener_pid in debug_port_listener_pids() {
-        if let Some(owner_pid) = find_ask_chrome_owner_pid(&listener_pid, profile_path)
-            && !owner_pids.contains(&owner_pid)
+fn chrome_record_matches_current(
+    record: Option<&ChromeProcessRecord>,
+    browser_id: Option<&str>,
+    listener_pids: &[String],
+) -> bool {
+    record.is_some_and(|record| chrome_record_matches_browser(record, browser_id))
+        && listener_pids.len() == 1
+}
+
+fn find_ask_chrome_owner_pids_with<C, P>(
+    listener_pids: &[String],
+    profile_path: &str,
+    mut command_for: C,
+    mut parent_for: P,
+) -> Vec<String>
+where
+    C: FnMut(&str) -> Option<String>,
+    P: FnMut(&str) -> Option<String>,
+{
+    let mut ask_pids = Vec::new();
+    for listener_pid in listener_pids {
+        let ask_pid = find_ask_chrome_owner_pid_with(
+            listener_pid,
+            profile_path,
+            &mut command_for,
+            &mut parent_for,
+        );
+
+        if let Some(ask_pid) = ask_pid
+            && !ask_pids.contains(&ask_pid)
         {
-            owner_pids.push(owner_pid);
+            ask_pids.push(ask_pid);
         }
     }
-    owner_pids
+    ask_pids
+}
+
+struct ChromeDebugSnapshot {
+    listener_pids: Vec<String>,
+    record: Option<ChromeProcessRecord>,
+    browser_id: Option<String>,
+    ask_pids: Vec<String>,
+}
+
+fn debug_listener_scope_is_unambiguous(listener_pids: &[String]) -> bool {
+    listener_pids.len() <= 1
+}
+
+fn inspect_chrome_debug_port(profile_path: &str) -> ChromeDebugSnapshot {
+    let listener_pids = debug_port_listener_pids();
+    let record = read_chrome_process_record();
+    let browser_id = debug_browser_id();
+    let ask_pids = find_ask_chrome_owner_pids_with(
+        &listener_pids,
+        profile_path,
+        process_command,
+        process_parent_pid,
+    );
+    ChromeDebugSnapshot {
+        listener_pids,
+        record,
+        browser_id,
+        ask_pids,
+    }
+}
+
+fn ask_chrome_pids_on_debug_port(profile_path: &str) -> Vec<String> {
+    inspect_chrome_debug_port(profile_path).ask_pids
+}
+
+fn parse_windows_netstat_listener_pids(output: &str, port: u16) -> Vec<String> {
+    let mut pids = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5
+            || !fields[0].eq_ignore_ascii_case("TCP")
+            || !fields[3].eq_ignore_ascii_case("LISTENING")
+            || fields[1]
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                != Some(port)
+        {
+            continue;
+        }
+
+        let pid = fields[4];
+        if pid.chars().all(|character| character.is_ascii_digit())
+            && !pids.iter().any(|existing| existing == pid)
+        {
+            pids.push(pid.to_string());
+        }
+    }
+    pids
 }
 
 fn debug_port_listener_pids() -> Vec<String> {
@@ -1090,18 +1391,7 @@ fn debug_port_listener_pids() -> Vec<String> {
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut pids = Vec::new();
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.contains(":9223") && line.contains("LISTENING") {
-                        if let Some(pid) = line.split_whitespace().last() {
-                            if !pids.contains(&pid.to_string()) {
-                                pids.push(pid.to_string());
-                            }
-                        }
-                    }
-                }
-                pids
+                parse_windows_netstat_listener_pids(&stdout, 9223)
             }
             _ => Vec::new(),
         }
@@ -1125,6 +1415,15 @@ fn debug_port_listener_pids() -> Vec<String> {
     }
 }
 
+fn parse_wmic_column_value(output: &str) -> Option<String> {
+    let mut non_empty_lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    non_empty_lines.next()?;
+    non_empty_lines.next().map(str::to_string)
+}
+
 fn process_command(pid: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -1138,16 +1437,12 @@ fn process_command(pid: &str) -> Option<String> {
             ])
             .output();
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut cmd_lines = stdout.lines().skip(1);
-                if let Some(cmd) = cmd_lines.next() {
-                    let cmd = cmd.trim();
-                    if !cmd.is_empty() {
-                        return Some(cmd.to_string());
-                    }
-                }
+        if let Ok(out) = output
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(command) = parse_wmic_column_value(&stdout) {
+                return Some(command);
             }
         }
 
@@ -1162,12 +1457,12 @@ fn process_command(pid: &str) -> Option<String> {
             ])
             .output();
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !stdout.is_empty() {
-                    return Some(stdout);
-                }
+        if let Ok(out) = output
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                return Some(stdout);
             }
         }
 
@@ -1204,13 +1499,9 @@ fn process_parent_pid(pid: &str) -> Option<String> {
 
         if let Ok(out) = output
             && out.status.success()
-            && let Some(parent_pid) = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .skip(1)
-                .map(str::trim)
-                .find(|line| !line.is_empty())
+            && let Some(parent_pid) = parse_wmic_column_value(&String::from_utf8_lossy(&out.stdout))
         {
-            return Some(parent_pid.to_string());
+            return Some(parent_pid);
         }
 
         let output = Command::new("powershell")
@@ -1267,36 +1558,37 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
 }
 
 fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
-    let listener_pids = debug_port_listener_pids();
-    if listener_pids.is_empty() {
-        let _ = remove_chrome_pid_file();
+    let snapshot = inspect_chrome_debug_port(profile_path);
+    if snapshot.listener_pids.is_empty() {
+        if TcpStream::connect("127.0.0.1:9223").is_ok() {
+            return Err(
+                "Port 9223 is active, but ask-bridge could not identify its listener process. No process was closed."
+                    .to_string(),
+            );
+        }
+        if let Err(_error) = remove_chrome_pid_file() {
+            // ignore cleanup failure when port is already closed
+        }
         return Ok(false);
     }
+    if !debug_listener_scope_is_unambiguous(&snapshot.listener_pids) {
+        return Err(
+            "Multiple processes are listening on port 9223, so ask-bridge cannot safely determine which process to close. No process was closed."
+                .to_string(),
+        );
+    }
 
-    let ask_pids: Vec<String> = listener_pids
-        .into_iter()
-        .filter(|pid| {
-            process_command(pid)
-                .map(|cmd| command_uses_profile(&cmd, profile_path))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if ask_pids.is_empty() {
+    if snapshot.ask_pids.is_empty() {
         return Err(
             "Port 9223 is already used by a non-ask Chrome process. Stop it or use a different debugging port."
                 .to_string(),
         );
     }
 
-    for pid in &ask_pids {
+    for pid in &snapshot.ask_pids {
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("taskkill")
-                .arg("/F")
-                .arg("/PID")
-                .arg(pid)
-                .status();
+            let _ = Command::new("taskkill").args(["/PID", pid, "/T"]).status();
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -1494,6 +1786,7 @@ fn validate_provider_feature_support(provider: Provider, cli: &Cli) -> Result<()
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1845,15 +2138,41 @@ mod tests {
     }
 
     #[test]
-    fn composer_without_account_or_auth_controls_has_unknown_login_state() {
+    fn rejects_profile_and_marker_prefixes_with_extra_suffixes() {
+        let profile_path = r"C:\Users\Will\.config\ask-bridge\chrome-profile";
+        let profile_copy =
+            r#"chrome.exe --user-data-dir=C:\Users\Will\.config\ask-bridge\chrome-profile-copy"#;
+        let marker_copy = "chrome.exe --ask-bridge-instance-copy";
+
+        assert!(!command_uses_profile(profile_copy, profile_path));
+        assert!(!command_identifies_ask_chrome(marker_copy, profile_path));
+    }
+
+    #[test]
+    fn composer_without_account_or_auth_controls_has_logged_in_state() {
         let signals = LoginSignals {
             account: false,
             auth_control: false,
             auth_path: false,
             composer: true,
+            stable: true,
         };
 
-        assert_eq!(signals.state(), LoginState::Unknown);
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::LoggedIn);
+    }
+
+    #[test]
+    fn chatgpt_login_signals_wait_for_ambiguous_auth_shell() {
+        let script = Provider::ChatGpt.login_signals_js();
+
+        assert!(script.starts_with("async () =>"));
+        assert!(script.contains("earliestDecision"));
+        assert!(script.contains("stableSince"));
+        assert!(script.contains("let stable = false"));
+        assert!(script.contains("JSON.stringify(nextSignals)"));
+        assert!(script.contains("await new Promise"));
+        assert!(script.contains("Date.now() + 5000"));
+        assert!(script.contains("return { ...signals, stable }"));
     }
 
     #[test]
@@ -1863,9 +2182,10 @@ mod tests {
             auth_control: false,
             auth_path: false,
             composer: true,
+            stable: true,
         };
 
-        assert_eq!(signals.state(), LoginState::LoggedIn);
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::LoggedIn);
     }
 
     #[test]
@@ -1875,16 +2195,21 @@ mod tests {
             auth_control: true,
             auth_path: false,
             composer: true,
+            stable: true,
         };
         let auth_path = LoginSignals {
             account: false,
             auth_control: false,
             auth_path: true,
             composer: false,
+            stable: false,
         };
 
-        assert_eq!(visible_auth_control.state(), LoginState::LoggedOut);
-        assert_eq!(auth_path.state(), LoginState::LoggedOut);
+        assert_eq!(
+            visible_auth_control.state(Provider::ChatGpt),
+            LoginState::LoggedOut
+        );
+        assert_eq!(auth_path.state(Provider::ChatGpt), LoginState::LoggedOut);
     }
 
     #[test]
@@ -1894,9 +2219,58 @@ mod tests {
             auth_control: false,
             auth_path: false,
             composer: false,
+            stable: true,
         };
 
-        assert_eq!(signals.state(), LoginState::Unknown);
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::Unknown);
+    }
+
+    #[test]
+    fn unstable_chatgpt_signals_never_block_or_confirm_login() {
+        for signals in [
+            LoginSignals {
+                account: false,
+                auth_control: true,
+                auth_path: false,
+                composer: true,
+                stable: false,
+            },
+            LoginSignals {
+                account: false,
+                auth_control: false,
+                auth_path: false,
+                composer: true,
+                stable: false,
+            },
+        ] {
+            assert_eq!(signals.state(Provider::ChatGpt), LoginState::Unknown);
+        }
+    }
+
+    #[test]
+    fn auth_path_overrides_stale_account_control() {
+        let signals = LoginSignals {
+            account: true,
+            auth_control: false,
+            auth_path: true,
+            composer: true,
+            stable: false,
+        };
+
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::LoggedOut);
+    }
+
+    #[test]
+    fn gemini_composer_without_account_remains_unknown() {
+        let signals = LoginSignals {
+            account: false,
+            auth_control: false,
+            auth_path: false,
+            composer: true,
+            stable: true,
+        };
+
+        assert_eq!(signals.state(Provider::Gemini), LoginState::Unknown);
     }
 
     #[test]
@@ -1943,6 +2317,176 @@ mod tests {
             command,
             r"C:\Users\Will\.config\ask-bridge\chrome-profile"
         ));
+    }
+
+    #[test]
+    fn parses_legacy_and_json_chrome_process_records() {
+        assert_eq!(
+            parse_chrome_process_record("15864\r\n"),
+            Some(ChromeProcessRecord {
+                pid: 15864,
+                browser_id: None,
+            })
+        );
+        assert_eq!(
+            parse_chrome_process_record(r#"{"pid":20728,"browser_id":"browser-123"}"#),
+            Some(ChromeProcessRecord {
+                pid: 20728,
+                browser_id: Some("browser-123".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn extracts_browser_id_from_cdp_version_response() {
+        let body = r#"{"Browser":"Chrome/149","webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/browser/browser-123"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length:{}\r\nContent-Type:application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        assert_eq!(
+            browser_id_from_version_response(&response),
+            Some("browser-123".to_string())
+        );
+        assert!(http_response_is_complete(response.as_bytes()));
+        assert!(!http_response_is_complete(
+            &response.as_bytes()[..response.len() - 1]
+        ));
+
+        let non_success = response.replacen("200 OK", "404 Not Found", 1);
+        assert_eq!(browser_id_from_version_response(&non_success), None);
+        assert_eq!(browser_id_from_version_response(body), None);
+
+        let foreign_body = body.replace("127.0.0.1:9223", "example.com:9223");
+        let foreign_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length:{}\r\n\r\n{}",
+            foreign_body.len(),
+            foreign_body
+        );
+        assert_eq!(browser_id_from_version_response(&foreign_response), None);
+
+        let overflowing_length = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length:{}\r\n\r\n{{}}",
+            usize::MAX
+        );
+        assert!(!http_response_is_complete(overflowing_length.as_bytes()));
+    }
+
+    #[test]
+    fn build_chrome_process_record_prefers_unique_listener_pid() {
+        let listeners = vec!["20728".to_string()];
+        assert_eq!(
+            build_chrome_process_record(&listeners, Some("browser-123")),
+            Some(ChromeProcessRecord {
+                pid: 20728,
+                browser_id: Some("browser-123".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn build_chrome_process_record_requires_unambiguous_identity() {
+        assert_eq!(
+            build_chrome_process_record(
+                &["20728".to_string(), "30000".to_string()],
+                Some("browser-123")
+            ),
+            None
+        );
+        assert_eq!(
+            build_chrome_process_record(&["20728".to_string()], None),
+            None
+        );
+    }
+
+    #[test]
+    fn chrome_record_matches_current_checks_browser_identity_and_scope() {
+        let record = ChromeProcessRecord {
+            pid: 20728,
+            browser_id: Some("browser-123".to_string()),
+        };
+        let single = vec!["20728".to_string()];
+        let multiple = vec!["20728".to_string(), "30000".to_string()];
+
+        assert!(chrome_record_matches_current(
+            Some(&record),
+            Some("browser-123"),
+            &single
+        ));
+        assert!(!chrome_record_matches_current(
+            Some(&record),
+            Some("browser-456"),
+            &single
+        ));
+        assert!(!chrome_record_matches_current(
+            Some(&record),
+            Some("browser-123"),
+            &multiple
+        ));
+    }
+
+    #[test]
+    fn windows_netstat_parser_matches_exact_listening_port() {
+        let output = concat!(
+            "  TCP    127.0.0.1:9223    0.0.0.0:0    LISTENING    20728\r\n",
+            "  TCP    127.0.0.1:92230   0.0.0.0:0    LISTENING    30000\r\n",
+            "  TCP    [::1]:9223        [::]:0       LISTENING    20728\r\n",
+            "  TCP    127.0.0.1:9223    127.0.0.1:50000 ESTABLISHED 40000\r\n",
+            "  UDP    127.0.0.1:9223    *:*                       50000\r\n"
+        );
+
+        assert_eq!(
+            parse_windows_netstat_listener_pids(output, 9223),
+            vec!["20728".to_string()]
+        );
+    }
+
+    #[test]
+    fn finds_ask_owner_pids_and_deduplicates_results() {
+        let listeners = vec![
+            "30000".to_string(),
+            "20728".to_string(),
+            "20728".to_string(),
+        ];
+        let commands = std::collections::HashMap::from([
+            ("20728", "chrome.exe --type=utility"),
+            ("30000", "chrome.exe --type=gpu-process"),
+            (
+                "18000",
+                "chrome.exe --remote-debugging-port=9223 --ask-bridge-instance",
+            ),
+            (
+                "15000",
+                "chrome.exe --user-data-dir=C:\\Users\\Chris\\.config\\ask-bridge\\chrome-profile",
+            ),
+        ]);
+        let parents = std::collections::HashMap::from([
+            ("20728", "18000"),
+            ("30000", "18000"),
+            ("18000", "1"),
+            ("15000", "1"),
+        ]);
+
+        let ask_pids = find_ask_chrome_owner_pids_with(
+            &listeners,
+            r"C:\Users\Chris\.config\ask-bridge\chrome-profile",
+            |pid| commands.get(pid).map(|command| (*command).to_string()),
+            |pid| parents.get(pid).map(|parent| (*parent).to_string()),
+        );
+
+        assert_eq!(ask_pids, vec!["18000".to_string()]);
+    }
+
+    #[test]
+    fn parses_wmic_value_after_blank_lines() {
+        let output = "CommandLine\r\n\r\n  chrome.exe --remote-debugging-port=9223  \r\n\r\n";
+
+        assert_eq!(
+            parse_wmic_column_value(output),
+            Some("chrome.exe --remote-debugging-port=9223".to_string())
+        );
     }
 
     #[test]
@@ -4037,8 +4581,8 @@ fn ensure_provider_tab(
                         "bringToFront": false
                     }),
                 )?;
-                let login_state =
-                    check_login_status(config_path, provider).unwrap_or(LoginState::Unknown);
+                let login_state = check_login_status(config_path, provider, verbose)
+                    .unwrap_or(LoginState::Unknown);
                 page_states.push(PageLoginState {
                     id: page.id,
                     selected: page.selected,
@@ -4178,7 +4722,11 @@ fn ensure_provider_tab(
     ))
 }
 
-fn check_login_status(config_path: &str, provider: Provider) -> Result<LoginState, String> {
+fn check_login_status(
+    config_path: &str,
+    provider: Provider,
+    verbose: bool,
+) -> Result<LoginState, String> {
     let res = call_mcp_tool(
         config_path,
         "evaluate_script",
@@ -4190,19 +4738,36 @@ fn check_login_status(config_path: &str, provider: Provider) -> Result<LoginStat
     let parsed = parse_script_result(&res)?;
     let signals: LoginSignals = serde_json::from_value(parsed)
         .map_err(|e| format!("Failed to parse login signals: {}", e))?;
-    Ok(signals.state())
+    if verbose {
+        println!(
+            "{} login signals: account={}, auth_control={}, auth_path={}, composer={}, stable={}",
+            provider.display_name(),
+            signals.account,
+            signals.auth_control,
+            signals.auth_path,
+            signals.composer,
+            signals.stable
+        );
+    }
+    Ok(signals.state(provider))
 }
 
 fn print_chrome_diagnostics(profile_path: &str) {
-    let listener_pids = debug_port_listener_pids();
-    let owner_pids = ask_chrome_pids_on_debug_port(profile_path);
+    let snapshot = inspect_chrome_debug_port(profile_path);
     let recorded_pid = read_chrome_pid().unwrap_or_else(|| "unknown".to_string());
 
     println!("Chrome diagnostics:");
     println!("  profile: {}", profile_path);
     println!("  recorded PID: {}", recorded_pid);
-    println!("  listener PIDs: {:?}", listener_pids);
-    println!("  ask-bridge owner PIDs: {:?}", owner_pids);
+    println!("  listener PIDs: {:?}", snapshot.listener_pids);
+    println!("  ask-bridge owner PIDs: {:?}", snapshot.ask_pids);
+    println!(
+        "  CDP browser identity recorded: {}",
+        snapshot
+            .record
+            .and_then(|record| record.browser_id)
+            .is_some()
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -4396,7 +4961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut buffer = String::new();
                 io::stdin().read_line(&mut buffer)?;
 
-                match check_login_status(&config_path, provider) {
+                match check_login_status(&config_path, provider, cli.verbose) {
                     Ok(LoginState::LoggedIn) => println!(
                         "Success: Logged in successfully! You can now use the `ask-bridge` command."
                     ),
@@ -4537,7 +5102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verify login
-    match check_login_status(&config_path, provider) {
+    match check_login_status(&config_path, provider, cli.verbose) {
         Ok(LoginState::LoggedOut) => {
             eprintln!(
                 "\nError: You are not logged in to {}.",
