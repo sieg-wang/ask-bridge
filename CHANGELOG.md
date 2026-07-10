@@ -6,6 +6,20 @@
 
 ---
 
+## [0.2.5] - 2026-07-10
+
+### 🚀 新增 (Added)
+- 新增 `ask-bridge` 問答命令的等待逾時參數（`--timeout`），可自訂回應等待秒數。
+- `ask-bridge login` 新增登入頁面背景輪詢完成檢測，減少手動切換視窗等待時間。
+- Windows 安裝腳本新增本地建構安裝模式（`install.ps1 -Local`），可直接安裝 `target\\release\\ask-bridge.exe`，並保留 `ask.exe` alias 安裝。
+
+### 🔧 修復 (Fixed)
+- 修正 npm publish 版本對齊流程，避免在重複發佈時版本比對失敗。
+- 修正 CI 平台條件，避免在 Windows 專用 parser 測試執行於非 Windows 平台。
+- 修正 `bump-and-release` 首版 SOP 與版本搜尋流程，提升版本升級一致性。
+
+---
+
 ## [0.2.3] - 2026-07-10
 
 ### 🔧 修復 (Fixed)

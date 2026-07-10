@@ -267,3 +267,24 @@
   - `cargo test`（54 passed）
   - `npm test`（4 passed）
 - 已完成：`chore(release): bump version to 0.2.3` commit、`v0.2.3` tag 推送；CI `Release` workflow 已完成並發佈成功，並補上繁中 release note。
+
+# 2026-07-10 bump-and-release 0.2.5
+
+## Goal + Acceptance Criteria
+- [ ] 將版本提升為  .2.5，並同步更新 6 個版本錨點（Cargo.toml, package.json, src/main.rs, install.ps1, install.sh, scripts/ask.sh）。
+- [ ] 通過格式、建置、測試：cargo fmt --all -- --check、cargo check、cargo test、
+pm test。
+- [ ] 通過 cargo check 同步 Cargo.lock，並補齊 CHANGELOG.md 的  .2.5 條目。
+- [ ] 產生 chore(release) 提交並建立 0.2.5 tag。
+
+## Risk & Rollback
+- Risk level: low
+- Affected components: 版本號一致性、安裝腳本下載來源、CLI 版本輸出、文件版本紀錄。
+- Rollback strategy: revert release commit、刪除 0.2.5 tag，必要時重建 release commit。
+
+## Checklist
+- [ ] Update all required version anchors
+- [ ] Add changelog entry
+- [ ] Run fmt/check/tests
+- [ ] Commit release bump
+- [ ] Create annotated tag (本地)
