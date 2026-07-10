@@ -208,11 +208,34 @@ impl Provider {
             }
             Provider::Claude => {
                 r#"() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.opacity !== '0' &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                    };
                     const composer = document.querySelector('div[contenteditable="true"][data-testid="chat-input"]') ||
                         document.querySelector('div[contenteditable="true"].ProseMirror');
-                    const loginIndicator = document.querySelector('[data-testid="login-with-google"]') !== null ||
-                        window.location.pathname.startsWith('/login');
-                    return Boolean(composer) && !loginIndicator;
+                    const account = document.querySelector('[data-testid="user-menu-button"]') ||
+                        document.querySelector('button[aria-label*="User menu"]') ||
+                        document.querySelector('button[aria-label*="Account"]');
+                    const signIn = document.querySelector('[data-testid="login-with-google"]') ||
+                        Array.from(document.querySelectorAll('a, button'))
+                            .find((el) => isVisible(el) && /^(log in|login|sign in|sign up|登入|註冊)$/i.test([
+                                    el.getAttribute('aria-label'),
+                                    el.textContent
+                                ].filter(Boolean).join(' ').trim()));
+                    const authPath = /^\/(login|signup|magic-link)(\/|$)/i.test(window.location.pathname);
+                    return {
+                        account: isVisible(account),
+                        auth_control: Boolean(signIn),
+                        auth_path: authPath,
+                        composer: Boolean(composer)
+                    };
                 }"#
             }
         }
