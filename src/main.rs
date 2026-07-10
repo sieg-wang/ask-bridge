@@ -5002,8 +5002,7 @@ fn wait_for_login_completion(
                 if verbose {
                     println!(
                         "Warning: Failed to check {} login status: {}",
-                        display_name,
-                        e
+                        display_name, e
                     );
                 }
                 LoginState::Unknown
@@ -5386,6 +5385,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if prompt.is_empty() {
         // No prompt and no command, print help
         let mut cmd = Cli::command();
+        if let Some(version) = cmd.get_version() {
+            println!("ask-bridge {}", version);
+        } else {
+            println!("ask-bridge {}", env!("CARGO_PKG_VERSION"));
+        }
         cmd.print_help()?;
         println!();
         std::process::exit(0);

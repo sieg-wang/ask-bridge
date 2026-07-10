@@ -1,4 +1,8 @@
 # install.ps1 for Windows PowerShell
+param(
+    [switch]$Local,
+    [string]$LocalPath = ""
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -58,6 +62,48 @@ foreach ($path in $chromePaths) {
 if (-not $chromeFound) {
     Write-Host "Warning: Google Chrome was not found in default installation paths." -ForegroundColor Yellow
     Write-Host "Please ensure Google Chrome is installed, as it is required by Chrome DevTools MCP." -ForegroundColor Yellow
+}
+
+# 3. Install from local build (for development)
+if ($Local) {
+    if ([string]::IsNullOrWhiteSpace($LocalPath)) {
+        $LocalPath = Join-Path (Get-Location) "target\release\ask-bridge.exe"
+    }
+
+    if (-not (Test-Path $LocalPath)) {
+        Write-Error "Local binary not found at '$LocalPath'. Build it first (cargo build --release) or pass -LocalPath explicitly."
+        exit 1
+    }
+
+    $InstallDir = Join-Path $HOME ".local\bin"
+    if (-not (Test-Path $InstallDir)) {
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    }
+
+    $DestPath = Join-Path $InstallDir "ask-bridge.exe"
+    $AliasPath = Join-Path $InstallDir "ask.exe"
+    Write-Host "Installing local ask-bridge.exe to $InstallDir..." -ForegroundColor Cyan
+    Copy-Item -Path (Resolve-Path $LocalPath).Path -Destination $DestPath -Force
+    Copy-Item -Path (Resolve-Path $LocalPath).Path -Destination $AliasPath -Force
+
+    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $CleanPathList = $UserPath -split ';'
+
+    if ($CleanPathList -notcontains $InstallDir) {
+        Write-Host "Adding $InstallDir to User PATH..." -ForegroundColor Cyan
+        $NewPath = $UserPath
+        if ($NewPath -and -not $NewPath.EndsWith(';')) {
+            $NewPath += ";"
+        }
+        $NewPath += $InstallDir
+        [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+        
+        $env:Path = $env:Path + ";" + $InstallDir
+        Write-Host "Successfully added to PATH. You may need to restart your terminal to apply." -ForegroundColor Green
+    }
+
+    Write-Host "Successfully installed! You can now use the 'ask-bridge' command. The 'ask' alias is also available." -ForegroundColor Green
+    exit 0
 }
 
 # 3. Target configuration
