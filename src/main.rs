@@ -1396,28 +1396,91 @@ fn find_chrome_path() -> Result<String, String> {
     }
 }
 
-/// If `binary` is the executable inside a macOS `.app` bundle
-/// (…/Foo.app/Contents/MacOS/<exe>), return the `.app` bundle path. Used to launch
-/// the browser via `open -g` (background, no focus steal) instead of exec'ing the
-/// binary directly, which macOS foregrounds/activates on launch.
+/// Lexical part of [`app_bundle_from_binary`]. Components are matched
+/// case-insensitively to stay consistent with `resolve_browser_binary` (the
+/// default macOS volume is case-insensitive, so "Foo.APP/contents/macos" names
+/// the same bundle).
 #[cfg(any(target_os = "macos", test))]
-fn app_bundle_from_binary(binary: &str) -> Option<String> {
+fn app_bundle_from_binary_lexical(binary: &str) -> Option<String> {
     let macos_dir = Path::new(binary).parent()?;
-    if macos_dir.file_name()?.to_str()? != "MacOS" {
+    if !macos_dir
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("MacOS")
+    {
         return None;
     }
     let contents = macos_dir.parent()?;
-    if contents.file_name()?.to_str()? != "Contents" {
+    if !contents
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("Contents")
+    {
         return None;
     }
     let app = contents.parent()?;
-    let app_str = app.to_str()?;
-    if app_str.ends_with(".app") {
-        Some(app_str.to_string())
+    let is_app = app
+        .extension()
+        .map(|ext| ext.eq_ignore_ascii_case("app"))
+        .unwrap_or(false);
+    if is_app {
+        Some(app.to_str()?.to_string())
     } else {
         None
     }
 }
+
+/// If `binary` is the executable inside a macOS `.app` bundle
+/// (…/Foo.app/Contents/MacOS/<exe>), return the `.app` bundle path. Used to launch
+/// the browser via `open -g` (background, no focus steal) instead of exec'ing the
+/// binary directly, which macOS foregrounds/activates on launch. Falls back to the
+/// canonicalized path so a symlink to a bundle binary is still recognized.
+#[cfg(any(target_os = "macos", test))]
+fn app_bundle_from_binary(binary: &str) -> Option<String> {
+    app_bundle_from_binary_lexical(binary).or_else(|| {
+        let real = std::fs::canonicalize(binary).ok()?;
+        app_bundle_from_binary_lexical(real.to_str()?)
+    })
+}
+
+/// Arguments for `open` to launch a browser bundle. `-g` (do not bring to
+/// foreground) is applied only in headless mode: the login flow needs a window
+/// the user can actually see and focus.
+#[cfg(any(target_os = "macos", test))]
+fn open_launch_args(app: &str, headless: bool, browser_args: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if headless {
+        v.push("-g".to_string());
+    }
+    v.push("-n".to_string());
+    v.push("-a".to_string());
+    v.push(app.to_string());
+    v.push("--args".to_string());
+    v.extend(browser_args.iter().cloned());
+    v
+}
+
+/// Run a launcher (normally `open`) and report whether it succeeded.
+/// Ok(true) = launched; Ok(false) = launcher exited non-zero (caller should fall
+/// back to a direct spawn); Err = the launcher itself could not be executed.
+fn run_launcher(launcher: &str, args: &[String]) -> Result<bool, String> {
+    let status = Command::new(launcher)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run launcher '{}': {}", launcher, e))?;
+    Ok(status.success())
+}
+
+/// Iterations (x100ms) to wait for the browser to bind the debug port. Generous:
+/// `open` + LaunchServices + a post-auto-update Gatekeeper scan can take well
+/// over 5s on a cold start.
+const PORT_WAIT_ITERS: u32 = 200; // 20s
+/// Iterations (x100ms) the hide thread waits for the debug-port PID before
+/// giving up. Must be >= PORT_WAIT_ITERS so a slow-but-successful launch is
+/// still hidden.
+const HIDE_PID_WAIT_ITERS: u32 = 220; // 22s
 
 /// Rewrite a Chromium `Default/Preferences` JSON body so the next launch does not
 /// show the "didn't shut down correctly / restore pages?" bubble: force
@@ -1448,7 +1511,13 @@ fn mark_profile_exited_cleanly(profile_path: &str) {
         return;
     };
     if let Some(patched) = preferences_marked_clean(&content) {
-        let _ = std::fs::write(&prefs, patched);
+        // Atomic replace (tmp + rename) so a crash mid-write can never leave a
+        // truncated Preferences behind. Errors stay ignored: this patch is a
+        // cosmetic nicety, and --hide-crash-restore-bubble backs it up anyway.
+        let tmp = prefs.with_extension("askbridge.tmp");
+        if std::fs::write(&tmp, patched).is_ok() {
+            let _ = std::fs::rename(&tmp, &prefs);
+        }
     }
 }
 
@@ -1551,8 +1620,10 @@ fn start_chrome_if_needed(
 
     // (B) Suppress the "didn't shut down correctly / restore?" bubble by forcing a
     // clean exit_type in the profile before launch — deterministic regardless of
-    // how the previous instance died. Safe here: port 9223 is confirmed closed, so
-    // no ask-bridge browser is holding this profile.
+    // how the previous instance died. Port 9223 is closed here, so normally no
+    // browser holds this profile; a just-killed instance could still be flushing
+    // its final write (accepted race: worst case the bubble is suppressed by the
+    // --hide-crash-restore-bubble flag instead, and the write itself is atomic).
     mark_profile_exited_cleanly(&profile_path);
 
     let mut args: Vec<String> = vec![
@@ -1572,23 +1643,28 @@ fn start_chrome_if_needed(
     }
 
     // (A) On macOS, launch a `.app` bundle in the BACKGROUND via `open -g` so it
-    // never activates/steals foreground; `-n` forces a new instance on our
-    // dedicated profile even if the same browser is the user's daily driver.
-    // Exec'ing the binary directly (the fallback below) makes macOS foreground it.
+    // never activates/steals foreground (headless only — login needs a visible,
+    // focusable window); `-n` forces a new instance on our dedicated profile even
+    // if the same browser is the user's daily driver. Exec'ing the binary directly
+    // (the fallback below) makes macOS foreground it.
     #[cfg(target_os = "macos")]
     let launched_via_open = match app_bundle_from_binary(&chrome_path) {
         Some(app) => {
-            let mut open_cmd = Command::new("open");
-            open_cmd.arg("-g").arg("-n").arg("-a").arg(&app).arg("--args");
-            for a in &args {
-                open_cmd.arg(a);
+            let open_args = open_launch_args(&app, headless, &args);
+            match run_launcher("open", &open_args)? {
+                true => true,
+                false => {
+                    // `open` ran but refused the launch (Gatekeeper, damaged or
+                    // deleted bundle, LaunchServices error). Fall back to the
+                    // direct spawn — a focus-stealing launch beats no launch —
+                    // and say why instead of failing later with a port timeout.
+                    eprintln!(
+                        "Warning: `open` failed to launch '{}'; falling back to spawning the binary directly (window may steal focus). Run `open -n -a '{}'` manually to see why.",
+                        app, app
+                    );
+                    false
+                }
             }
-            open_cmd
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|e| format!("Failed to launch browser via `open` ('{}'): {}", app, e))?;
-            true
         }
         None => false,
     };
@@ -1641,7 +1717,7 @@ fn start_chrome_if_needed(
         if headless {
             let profile = profile_path.clone();
             thread::spawn(move || {
-                for _ in 0..60 {
+                for _ in 0..HIDE_PID_WAIT_ITERS {
                     let pids = ask_chrome_pids_on_debug_port(&profile);
                     if !pids.is_empty() {
                         for _ in 0..40 {
@@ -1665,10 +1741,11 @@ fn start_chrome_if_needed(
         }
     }
 
-    // Wait for Chrome to listen and prove that the listener belongs to this launch.
-    let startup_deadline = Instant::now() + Duration::from_secs(15);
+    // Wait for the browser to listen on port 9223 and prove that the listener
+    // belongs to this launch. Generous budget: see PORT_WAIT_ITERS
+    // (open/LaunchServices + post-update Gatekeeper scans).
     let mut last_identity_error = None;
-    while Instant::now() < startup_deadline {
+    for _ in 0..PORT_WAIT_ITERS {
         if TcpStream::connect("127.0.0.1:9223").is_ok() {
             let snapshot = inspect_chrome_debug_port(&profile_path);
             if let Some(record) =
@@ -2093,6 +2170,21 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
         })
 }
 
+/// Wait (bounded, iters x 100ms) until none of `pids` is alive. Returns true if
+/// they all exited. Needed because a Chromium browser closes its debug port
+/// BEFORE it finishes dying: if a relaunch races the dying process, the new
+/// instance sees the old SingletonLock, forwards to it (activating its window —
+/// a focus steal), exits, and nothing ever binds the port again.
+fn wait_for_pids_to_exit(pids: &[String], iters: u32) -> bool {
+    for _ in 0..iters {
+        if pids.iter().all(|pid| process_command(pid).is_none()) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     let snapshot = inspect_chrome_debug_port(profile_path);
     if snapshot.listener_pids.is_empty() {
@@ -2134,10 +2226,33 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
 
     for _ in 0..50 {
         if TcpStream::connect("127.0.0.1:9223").is_err() {
+            // Port closed is NOT process gone: wait for the PIDs to actually
+            // exit so an immediate relaunch can't hit the old SingletonLock.
+            wait_for_pids_to_exit(&snapshot.ask_pids, 100);
             let _ = remove_chrome_pid_file();
             return Ok(true);
         }
         thread::sleep(Duration::from_millis(100));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for pid in &snapshot.ask_pids {
+            let _ = Command::new("taskkill")
+                .arg("/F")
+                .arg("/PID")
+                .arg(pid)
+                .status();
+        }
+
+        for _ in 0..50 {
+            if TcpStream::connect("127.0.0.1:9223").is_err() {
+                wait_for_pids_to_exit(&snapshot.ask_pids, 100);
+                let _ = remove_chrome_pid_file();
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     Err("Timed out waiting for existing ask-bridge Chrome to stop".to_string())
@@ -3083,6 +3198,136 @@ mod tests {
         assert!(preferences_marked_clean("[]").is_none());
         assert!(preferences_marked_clean("\"hi\"").is_none());
         assert!(preferences_marked_clean("not json").is_none());
+    }
+
+    #[test]
+    fn preferences_marked_clean_rejects_non_object_profile_value() {
+        // "profile" present but not an object: leave the file untouched rather
+        // than clobbering an unexpected structure.
+        assert!(preferences_marked_clean(r#"{"profile": 5}"#).is_none());
+        assert!(preferences_marked_clean(r#"{"profile": "x"}"#).is_none());
+    }
+
+    #[test]
+    fn app_bundle_from_binary_is_case_insensitive() {
+        // Consistent with resolve_browser_binary: the default macOS volume is
+        // case-insensitive, so these all name a real bundle layout.
+        assert_eq!(
+            app_bundle_from_binary_lexical("/Applications/Foo.APP/Contents/MacOS/Foo"),
+            Some("/Applications/Foo.APP".to_string())
+        );
+        assert_eq!(
+            app_bundle_from_binary_lexical("/Applications/foo.app/contents/macos/foo"),
+            Some("/Applications/foo.app".to_string())
+        );
+        // Still rejects non-bundle layouts.
+        assert_eq!(app_bundle_from_binary_lexical("/usr/bin/chromium"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_bundle_from_binary_resolves_symlinked_binary() {
+        let dir = make_test_dir("bundle_symlink");
+        let macos = dir.join("Linked.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let real_bin = macos.join("Linked");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let link = dir.join("linked-alias");
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        // The symlink path is not lexically inside the bundle...
+        assert_eq!(app_bundle_from_binary_lexical(link.to_str().unwrap()), None);
+        // ...but canonicalization recovers the bundle.
+        let resolved = app_bundle_from_binary(link.to_str().unwrap()).unwrap();
+        assert!(
+            resolved.ends_with("Linked.app"),
+            "expected a Linked.app bundle path, got: {}",
+            resolved
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_launch_args_gates_foreground_on_headless() {
+        let browser_args = vec!["--flag-a".to_string(), "--flag-b".to_string()];
+        // Headless: background launch, -g present and first.
+        let bg = open_launch_args("/Applications/X.app", true, &browser_args);
+        assert_eq!(
+            bg,
+            vec!["-g", "-n", "-a", "/Applications/X.app", "--args", "--flag-a", "--flag-b"]
+        );
+        // Headful (login): NO -g — the user must be able to see/focus the window.
+        let fg = open_launch_args("/Applications/X.app", false, &browser_args);
+        assert_eq!(
+            fg,
+            vec!["-n", "-a", "/Applications/X.app", "--args", "--flag-a", "--flag-b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_launcher_reports_success_failure_and_spawn_error() {
+        assert_eq!(
+            run_launcher("sh", &["-c".to_string(), "exit 0".to_string()]).unwrap(),
+            true
+        );
+        assert_eq!(
+            run_launcher("sh", &["-c".to_string(), "exit 1".to_string()]).unwrap(),
+            false
+        );
+        assert!(run_launcher("/no/such/launcher-xyz", &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_pids_to_exit_detects_death_and_survival() {
+        // A killed child is detected as exited.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        child.kill().unwrap();
+        child.wait().unwrap(); // reap so the PID actually disappears
+        assert!(wait_for_pids_to_exit(&[pid], 20));
+
+        // Our own (very alive) process is not: bounded wait returns false.
+        let me = std::process::id().to_string();
+        assert!(!wait_for_pids_to_exit(&[me], 2));
+    }
+
+    #[test]
+    fn hide_budget_covers_port_wait() {
+        // A slow-but-successful launch must still get hidden: the hide thread's
+        // PID wait must outlast the main port wait.
+        assert!(HIDE_PID_WAIT_ITERS >= PORT_WAIT_ITERS);
+    }
+
+    #[test]
+    fn mark_profile_exited_cleanly_filesystem_behavior() {
+        let dir = make_test_dir("profile_prefs");
+        let default_dir = dir.join("Default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let prefs = default_dir.join("Preferences");
+
+        // Real file: patched in place, other keys preserved, no tmp left behind.
+        std::fs::write(&prefs, r#"{"profile":{"exit_type":"Crashed"},"keep":42}"#).unwrap();
+        mark_profile_exited_cleanly(dir.to_str().unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(v["profile"]["exit_type"], "Normal");
+        assert_eq!(v["profile"]["exited_cleanly"], true);
+        assert_eq!(v["keep"], 42);
+        assert!(!default_dir.join("Preferences.askbridge.tmp").exists());
+
+        // Non-object body: left byte-for-byte untouched.
+        std::fs::write(&prefs, "[]").unwrap();
+        mark_profile_exited_cleanly(dir.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&prefs).unwrap(), "[]");
+
+        // Missing file: no-op, nothing created.
+        std::fs::remove_file(&prefs).unwrap();
+        mark_profile_exited_cleanly(dir.to_str().unwrap());
+        assert!(!prefs.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
