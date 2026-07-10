@@ -690,6 +690,7 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
     let config_path = config_dir.to_string_lossy().to_string();
 
     let mut chrome_devtools_server = if quiet_mcp && !cfg!(target_os = "windows") {
+        // Unix: wrap with sh so we can redirect stderr to /dev/null
         let mut sh_cmd = format!(
             "exec npx -y chrome-devtools-mcp@latest --browser-url=http://127.0.0.1:9223 --no-usage-statistics --no-performance-crux --logFile \"{}\"",
             log_path
@@ -704,6 +705,29 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
             "args": [
                 "-c",
                 sh_cmd
+            ]
+        })
+    } else if quiet_mcp && cfg!(target_os = "windows") {
+        // Windows: wrap with cmd.exe so we can redirect stderr to nul
+        let mut cmd_args = vec![
+            "-y".to_string(),
+            "chrome-devtools-mcp@latest".to_string(),
+            "--browser-url=http://127.0.0.1:9223".to_string(),
+            "--no-usage-statistics".to_string(),
+            "--no-performance-crux".to_string(),
+            "--logFile".to_string(),
+            format!("\"{}\"", log_path),
+        ];
+        if headless {
+            cmd_args.push("--headless".to_string());
+        }
+        let cmd_str = format!("npx {} 2>nul", cmd_args.join(" "));
+
+        serde_json::json!({
+            "command": "cmd.exe",
+            "args": [
+                "/c",
+                cmd_str
             ]
         })
     } else {
