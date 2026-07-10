@@ -94,8 +94,10 @@ GitHub Release 建立完成後，必須立即補上繁體中文（zh-tw）發行
 
 #### 資料蒐集
 1. 使用 `gh release view vX.Y.Z --repo doggy8088/ask-bridge --json tagName,body,url,publishedAt` 確認 release 已建立。
-2. 使用 `git log --reverse --pretty=format:'%h%x09%ad%x09%s' --date=short <previous-tag>..vX.Y.Z` 查看此版本 commit。若是首版 release，範圍改用 `vX.Y.Z`。
-3. 使用 `git diff --stat <previous-tag>..vX.Y.Z` 與必要的 `git diff <previous-tag>..vX.Y.Z -- <path>` 確認實際影響範圍。
+2. 使用 `git log --reverse --pretty=format:'%h%x09%ad%x09%s' --date=short <previous-tag>..vX.Y.Z` 查看此版本 commit。若是首版 release，前一個 tag 不存在，改用 `git log --reverse --pretty=format:'%h%x09%ad%x09%s' --date=short vX.Y.Z`。
+3. 使用 `git diff --stat <previous-tag>..vX.Y.Z` 與必要的 `git diff <previous-tag>..vX.Y.Z -- <path>` 確認實際影響範圍。若是首版 release，改用：
+   - `git diff --stat --root vX.Y.Z`
+   - `git diff --root vX.Y.Z -- <path>`
 4. 若 `CHANGELOG.md` 已有該版本內容，使用 `git show vX.Y.Z:CHANGELOG.md` 交叉比對，但仍需以 commit 與 diff 驗證，不可只改寫 changelog。
 
 #### 發行說明格式
@@ -164,7 +166,13 @@ gh release view vX.Y.Z --repo doggy8088/ask-bridge --json tagName,body,url
 ## 💡 提示與訣竅
 
 > [!TIP]
-> 變更版本號前，建議使用 `grep_search` 搜尋當前的舊版本號（例如 `0.1.2`），以確認是否有其他遺漏未提及的檔案需要同步更新。
+> 變更版本號前，建議先檢查舊版本號（例如 `0.1.2`）是否在其他檔案中出現：
+> - macOS / Linux：
+>   - `rg -n "0\.1\.2" .`
+>   - 若無 `rg`，改用：`grep -RIn "0.1.2" .`
+> - Windows PowerShell：
+>   - `rg -n "0\.1\.2" .`
+>   - 若無 `rg`，改用：`Get-ChildItem -Recurse -File | Select-String -Pattern "0.1.2" -SimpleMatch`
 
 > [!CAUTION]
 > 絕對不要只修改 `Cargo.toml` 而忽略了安裝腳本中的 `$Version`，這會導致使用者透過 `curl` 或 `iwr` 下載安裝時抓取到錯誤的版本。
