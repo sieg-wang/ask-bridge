@@ -1757,13 +1757,14 @@ fn start_chrome_if_needed(
                         error
                     ));
                 }
-                if let Some(launcher_pid) = child_pid {
-                    if verbose && record.pid != launcher_pid {
-                        println!(
-                            "Recorded actual Chrome listener PID {} (launcher PID {}).",
-                            record.pid, launcher_pid
-                        );
-                    }
+                if let Some(launcher_pid) = child_pid
+                    && verbose
+                    && record.pid != launcher_pid
+                {
+                    println!(
+                        "Recorded actual Chrome listener PID {} (launcher PID {}).",
+                        record.pid, launcher_pid
+                    );
                 }
                 if verbose {
                     println!("Chrome started and listening on port 9223.");
@@ -1969,7 +1970,8 @@ fn ask_chrome_pids_on_debug_port(profile_path: &str) -> Vec<String> {
     inspect_chrome_debug_port(profile_path).ask_pids
 }
 
-#[cfg(target_os = "windows")]
+// `test` included so the platform-independent parser tests compile on non-Windows.
+#[cfg(any(target_os = "windows", test))]
 fn parse_windows_netstat_listener_pids(output: &str, port: u16) -> Vec<String> {
     let mut pids = Vec::new();
     for line in output.lines() {
@@ -2027,7 +2029,8 @@ fn debug_port_listener_pids() -> Vec<String> {
     }
 }
 
-#[cfg(target_os = "windows")]
+// `test` included so the platform-independent parser tests compile on non-Windows.
+#[cfg(any(target_os = "windows", test))]
 fn parse_wmic_column_value(output: &str) -> Option<String> {
     let mut non_empty_lines = output
         .lines()
