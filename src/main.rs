@@ -2624,6 +2624,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_netstat_parser_matches_exact_listening_port() {
         let output = concat!(
@@ -2676,6 +2677,7 @@ mod tests {
         assert_eq!(ask_pids, vec!["18000".to_string()]);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn parses_wmic_value_after_blank_lines() {
         let output = "CommandLine\r\n\r\n  chrome.exe --remote-debugging-port=9223  \r\n\r\n";
