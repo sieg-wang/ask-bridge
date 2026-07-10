@@ -1,3 +1,38 @@
+# 2026-07-10 bump-and-release 0.2.6
+
+## Goal + Acceptance Criteria
+- [ ] 將版本從 `0.2.5` 升級至 `0.2.6`（patch）。
+- [ ] 同步更新 6 個版本來源：`Cargo.toml`、`package.json`、`src/main.rs`、`install.ps1`、`install.sh`、`scripts/ask.sh`。
+- [ ] 透過 `cargo check` 更新 `Cargo.lock` 並確認通過。
+- [ ] 完成 git 提交（單一 commit）並推送 `main`。
+- [ ] CI 在該 commit 上以 `ci.yml` + `push` 成功。
+- [ ] 建立 `v0.2.6` tag 並推送，接著補齊 GitHub Release 繁中發行說明。
+
+## Risk & Rollback
+- Risk level: low
+- 影響範圍: 專案版本宣告、安裝腳本下載版本、CLI 版本輸出。
+- Rollback strategy: 只要 revert 版本 bump commit 並刪除 `v0.2.6` tag 即可回滾版本宣告。
+
+## Dependencies & Environment
+- Rust/Cargo（`cargo check`）
+- Git 與 GitHub CLI（提交、CI 監控、tag 與 release）
+- 當前分支需位於 `main`
+
+## Checklist
+- [ ] 檢查現況版本與變更範圍
+- [ ] 修改 6 個版本檔
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo check`
+- [ ] 建立提交並記錄 release commit
+- [ ] 等待 `.github/workflows/ci.yml` 對該 commit 驗證成功
+- [ ] 建立並推送 `v0.2.6` tag
+- [ ] 更新 GitHub Release 繁體中文發行說明
+
+## Working Notes
+- 已將目標版本定為 `0.2.6`（從 `0.2.5` patch 升級）。
+
+---
+
 # 2026-07-10 修正 Windows quiet MCP 與程式碼區塊回覆解析
 
 ## Goal + Acceptance Criteria
