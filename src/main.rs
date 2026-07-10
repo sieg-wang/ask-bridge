@@ -633,7 +633,7 @@ fn load_configured_browser() -> Result<Option<String>, String> {
 }
 
 /// Resolve a browser value (an executable path or a macOS `.app` bundle) into a
-/// concrete executable path. Errors if it cannot be resolved to an existing file
+/// concrete executable path. Errors if it cannot be resolved to an executable file
 /// so a misconfigured browser fails loudly instead of silently using Chrome.
 /// True if `path` is a regular file with an executable bit set. On non-unix the
 /// executable bit is unavailable, so it degrades to "is a regular file".
@@ -703,7 +703,7 @@ fn resolve_browser_binary(value: &str) -> Result<String, String> {
         // executable inside Contents/MacOS if that convention does not hold.
         if let Some(stem) = app_dir.file_stem().and_then(|s| s.to_str()) {
             let candidate = macos_dir.join(stem);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Ok(candidate.to_string_lossy().to_string());
             }
         }
@@ -719,7 +719,13 @@ fn resolve_browser_binary(value: &str) -> Result<String, String> {
 
     let path = Path::new(trimmed);
     if path.is_file() {
-        return Ok(trimmed.to_string());
+        if is_executable_file(path) {
+            return Ok(trimmed.to_string());
+        }
+        return Err(format!(
+            "Configured browser file at '{}' is not executable.",
+            trimmed
+        ));
     }
     if path.is_dir() {
         return Err(format!(
@@ -822,7 +828,7 @@ fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Res
                 "Failed to read existing config file {}: {}",
                 config_path.to_string_lossy(),
                 e
-            ))
+            ));
         }
     };
     let provider_str = provider.map(|p| p.to_string());
@@ -1295,7 +1301,7 @@ const LINUX_CHROME_COMMANDS: &[&str] = &["google-chrome", "google-chrome-stable"
 fn first_existing_path(paths: &[&str]) -> Option<String> {
     paths
         .iter()
-        .find(|path| Path::new(path).exists())
+        .find(|path| is_executable_file(Path::new(path)))
         .map(|path| (*path).to_string())
 }
 
@@ -1305,7 +1311,7 @@ fn find_command_in_path(command: &str, path_env: Option<&std::ffi::OsStr>) -> Op
 
     std::env::split_paths(path_env)
         .map(|dir| dir.join(command))
-        .find(|path| path.exists())
+        .find(|path| is_executable_file(path))
         .map(|path| path.to_string_lossy().to_string())
 }
 
@@ -2188,6 +2194,17 @@ fn wait_for_pids_to_exit(pids: &[String], iters: u32) -> bool {
     false
 }
 
+fn require_pids_to_exit(pids: &[String], iters: u32) -> Result<(), String> {
+    if wait_for_pids_to_exit(pids, iters) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Debug port closed, but browser process(es) {} are still running",
+            pids.join(", ")
+        ))
+    }
+}
+
 fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     let snapshot = inspect_chrome_debug_port(profile_path);
     if snapshot.listener_pids.is_empty() {
@@ -2231,7 +2248,7 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         if TcpStream::connect("127.0.0.1:9223").is_err() {
             // Port closed is NOT process gone: wait for the PIDs to actually
             // exit so an immediate relaunch can't hit the old SingletonLock.
-            wait_for_pids_to_exit(&snapshot.ask_pids, 100);
+            require_pids_to_exit(&snapshot.ask_pids, 100)?;
             let _ = remove_chrome_pid_file();
             return Ok(true);
         }
@@ -2250,7 +2267,7 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
 
         for _ in 0..50 {
             if TcpStream::connect("127.0.0.1:9223").is_err() {
-                wait_for_pids_to_exit(&snapshot.ask_pids, 100);
+                require_pids_to_exit(&snapshot.ask_pids, 100)?;
                 let _ = remove_chrome_pid_file();
                 return Ok(true);
             }
@@ -2824,6 +2841,16 @@ mod tests {
         ))
     }
 
+    fn mark_test_file_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
     #[test]
     fn parses_provider_as_global_argument() {
         let cli = Cli::try_parse_from(["ask-bridge", "--provider", "gemini", "login"]).unwrap();
@@ -2949,7 +2976,10 @@ mod tests {
             Some("/x".to_string())
         );
         assert_eq!(parse_configured_browser(r#"{}"#).unwrap(), None);
-        assert_eq!(parse_configured_browser(r#"{"browser":"  "}"#).unwrap(), None);
+        assert_eq!(
+            parse_configured_browser(r#"{"browser":"  "}"#).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2978,6 +3008,7 @@ mod tests {
         std::fs::create_dir_all(&macos).unwrap();
         let exec = macos.join("Brave Test");
         std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        mark_test_file_executable(&exec);
 
         let app_path = dir.join("Brave Test.app");
         let resolved = resolve_browser_binary(app_path.to_str().unwrap()).unwrap();
@@ -2992,9 +3023,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let exec = dir.join("chromium");
         std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        mark_test_file_executable(&exec);
 
         let resolved = resolve_browser_binary(exec.to_str().unwrap()).unwrap();
         assert_eq!(resolved, exec.to_string_lossy().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_browser_binary_rejects_non_executable_file() {
+        let dir = make_test_dir("browser_nonexec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("chromium");
+        std::fs::write(&file, b"not executable\n").unwrap();
+
+        let err = resolve_browser_binary(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not executable"), "got: {}", err);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3059,6 +3105,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_browser_binary_rejects_non_executable_bundle_binary() {
+        let dir = make_test_dir("browser_nonexec_app");
+        let macos = dir.join("Blocked.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("Blocked"), b"not executable\n").unwrap();
+
+        let err = resolve_browser_binary(dir.join("Blocked.app").to_str().unwrap()).unwrap_err();
+        assert!(err.contains("No executable found"), "got: {}", err);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn resolve_browser_binary_handles_uppercase_app_extension() {
         let dir = make_test_dir("browser_upper_app");
@@ -3066,6 +3126,7 @@ mod tests {
         std::fs::create_dir_all(&macos).unwrap();
         let exec = macos.join("Foo");
         std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        mark_test_file_executable(&exec);
         let app = dir.join("Foo.APP");
         let resolved = resolve_browser_binary(app.to_str().unwrap()).unwrap();
         assert_eq!(resolved, exec.to_string_lossy().to_string());
@@ -3079,6 +3140,7 @@ mod tests {
         std::fs::create_dir_all(&macos).unwrap();
         let exec = macos.join("Brave Test");
         std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        mark_test_file_executable(&exec);
         let app_with_slash = format!("{}/", dir.join("Brave Test.app").to_str().unwrap());
         let resolved = resolve_browser_binary(&app_with_slash).unwrap();
         assert_eq!(resolved, exec.to_string_lossy().to_string());
@@ -3099,8 +3161,7 @@ mod tests {
         let bin = macos.join("ActualBinary");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let resolved =
-            resolve_browser_binary(dir.join("Renamed.app").to_str().unwrap()).unwrap();
+        let resolved = resolve_browser_binary(dir.join("Renamed.app").to_str().unwrap()).unwrap();
         assert_eq!(resolved, bin.to_string_lossy().to_string());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3140,7 +3201,10 @@ mod tests {
     fn rejects_non_string_browser_in_config_json() {
         let err = parse_configured_browser(r#"{"browser": 42}"#).unwrap_err();
         assert!(err.contains("Failed to parse config.json"), "got: {}", err);
-        assert_eq!(parse_configured_browser(r#"{"browser": null}"#).unwrap(), None);
+        assert_eq!(
+            parse_configured_browser(r#"{"browser": null}"#).unwrap(),
+            None
+        );
         // A wrong-typed browser value also breaks provider loading (same struct).
         assert!(parse_configured_provider(r#"{"provider":"gemini","browser":42}"#).is_err());
     }
@@ -3257,27 +3321,36 @@ mod tests {
         let bg = open_launch_args("/Applications/X.app", true, &browser_args);
         assert_eq!(
             bg,
-            vec!["-g", "-n", "-a", "/Applications/X.app", "--args", "--flag-a", "--flag-b"]
+            vec![
+                "-g",
+                "-n",
+                "-a",
+                "/Applications/X.app",
+                "--args",
+                "--flag-a",
+                "--flag-b"
+            ]
         );
         // Headful (login): NO -g — the user must be able to see/focus the window.
         let fg = open_launch_args("/Applications/X.app", false, &browser_args);
         assert_eq!(
             fg,
-            vec!["-n", "-a", "/Applications/X.app", "--args", "--flag-a", "--flag-b"]
+            vec![
+                "-n",
+                "-a",
+                "/Applications/X.app",
+                "--args",
+                "--flag-a",
+                "--flag-b"
+            ]
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn run_launcher_reports_success_failure_and_spawn_error() {
-        assert_eq!(
-            run_launcher("sh", &["-c".to_string(), "exit 0".to_string()]).unwrap(),
-            true
-        );
-        assert_eq!(
-            run_launcher("sh", &["-c".to_string(), "exit 1".to_string()]).unwrap(),
-            false
-        );
+        assert!(run_launcher("sh", &["-c".to_string(), "exit 0".to_string()]).unwrap());
+        assert!(!run_launcher("sh", &["-c".to_string(), "exit 1".to_string()]).unwrap());
         assert!(run_launcher("/no/such/launcher-xyz", &[]).is_err());
     }
 
@@ -3285,7 +3358,10 @@ mod tests {
     #[test]
     fn wait_for_pids_to_exit_detects_death_and_survival() {
         // A killed child is detected as exited.
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = child.id().to_string();
         child.kill().unwrap();
         child.wait().unwrap(); // reap so the PID actually disappears
@@ -3297,10 +3373,18 @@ mod tests {
     }
 
     #[test]
+    fn require_pids_to_exit_reports_a_bounded_wait_timeout() {
+        let me = std::process::id().to_string();
+        let err = require_pids_to_exit(std::slice::from_ref(&me), 0).unwrap_err();
+        assert!(err.contains(&me), "got: {}", err);
+        assert!(err.contains("still running"), "got: {}", err);
+    }
+
+    #[test]
     fn hide_budget_covers_port_wait() {
         // A slow-but-successful launch must still get hidden: the hide thread's
         // PID wait must outlast the main port wait.
-        assert!(HIDE_PID_WAIT_ITERS >= PORT_WAIT_ITERS);
+        const { assert!(HIDE_PID_WAIT_ITERS >= PORT_WAIT_ITERS) };
     }
 
     #[test]
@@ -3537,6 +3621,8 @@ mod tests {
         let chrome_path = second_dir.join("google-chrome");
         std::fs::write(&stable_path, "").unwrap();
         std::fs::write(&chrome_path, "").unwrap();
+        mark_test_file_executable(&stable_path);
+        mark_test_file_executable(&chrome_path);
 
         let path_env = std::env::join_paths([first_dir.as_os_str(), second_dir.as_os_str()])
             .expect("test PATH should be joinable");
@@ -3554,6 +3640,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let chrome_path = root.join("google-chrome");
         std::fs::write(&chrome_path, "").unwrap();
+        mark_test_file_executable(&chrome_path);
 
         let chrome_path_str = chrome_path.to_string_lossy().to_string();
         let candidates = [chrome_path_str.as_str()];
@@ -3561,6 +3648,29 @@ mod tests {
         let found = find_linux_chrome_path(None, &candidates);
 
         assert_eq!(found, Some(chrome_path_str));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_chrome_discovery_skips_non_executable_files() {
+        let root = make_test_dir("chrome_nonexec_discovery");
+        let path_dir = root.join("path");
+        let candidate_dir = root.join("candidate");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        std::fs::create_dir_all(&candidate_dir).unwrap();
+        let path_file = path_dir.join("google-chrome");
+        let candidate_file = candidate_dir.join("google-chrome");
+        std::fs::write(&path_file, "").unwrap();
+        std::fs::write(&candidate_file, "").unwrap();
+        let path_env = std::env::join_paths([path_dir.as_os_str()]).unwrap();
+        let candidate = candidate_file.to_string_lossy().to_string();
+
+        assert_eq!(
+            find_linux_chrome_path(Some(path_env.as_os_str()), &[candidate.as_str()]),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5629,10 +5739,10 @@ fn submit_regular_prompt(
                         return;
                     }
                     el.focus();
-                    
+
                     const value = __PROMPT__;
                     el.focus();
-                    
+
                     try {
                         const range = document.createRange();
                         range.selectNodeContents(el);
@@ -5640,7 +5750,7 @@ fn submit_regular_prompt(
                         sel.removeAllRanges();
                         sel.addRange(range);
                     } catch (e) {}
-                    
+
                     let pasted = false;
                     try {
                         const dataTransfer = new DataTransfer();
@@ -5655,13 +5765,13 @@ fn submit_regular_prompt(
                             configurable: true
                         });
                         el.dispatchEvent(event);
-                        
+
                         const currentText = typeof el.value !== 'undefined' ? el.value : el.textContent;
                         if (currentText && currentText.trim().length > 0) {
                             pasted = true;
                         }
                     } catch (e) {}
-                    
+
                     if (!pasted) {
                         const success = document.execCommand('insertText', false, value);
                         if (!success) {
@@ -5677,7 +5787,7 @@ fn submit_regular_prompt(
                             el.dispatchEvent(new Event('change', { bubbles: true }));
                         }
                     }
-                    
+
                     const isVisible = (el) => {
                         if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                         const style = window.getComputedStyle(el);
@@ -5691,14 +5801,14 @@ fn submit_regular_prompt(
                             btn = document.querySelector(s);
                             if (isVisible(btn)) break;
                         }
-                        
+
                         if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
                             btn.click();
                             return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
                         }
                         return null;
                     };
-                    
+
                     let result = findAndClickSendButton();
                     if (result) {
                         window.__submit_status = 'success:' + JSON.stringify(result);
@@ -5713,7 +5823,7 @@ fn submit_regular_prompt(
                             return;
                         }
                     }
-                    
+
                     window.__submit_status = 'error: Send button did not become active/enabled';
                 } catch (e) {
                     window.__submit_status = 'error: ' + e.message;
