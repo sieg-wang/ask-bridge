@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
-use mcp_cli::McpClient;
+use mcp_cli::{McpClient, McpConnection, ServerConfig, StdioClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -774,7 +774,7 @@ fn validate_node_version_output(output: &str) -> Result<(), String> {
     }
 
     Err(format!(
-        "Node.js v{major}.{minor}.{patch} is not supported by chrome-devtools-mcp@latest. Supported versions are ^20.19.0, ^22.12.0, or >=23.0.0. Install a current Node.js LTS release, reopen the terminal, and retry."
+        "Node.js v{major}.{minor}.{patch} is not supported by {MCP_PACKAGE_SPEC}. Supported versions are ^20.19.0, ^22.12.0, or >=23.0.0. Install a current Node.js LTS release, reopen the terminal, and retry."
     ))
 }
 
@@ -798,6 +798,12 @@ fn check_node_runtime() -> Result<(), String> {
     validate_node_version_output(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Pinned chrome-devtools-mcp package spec. `@latest` would make every npx
+/// spawn re-resolve the dist-tag against the npm registry, which was observed
+/// stalling; with mcp-cli's timeout-less request wait that hung whole runs
+/// (2026-07-11). Bump this version deliberately and re-run the e2e check.
+const MCP_PACKAGE_SPEC: &str = "chrome-devtools-mcp@1.5.0";
+
 fn build_chrome_devtools_server_config(
     quiet_mcp: bool,
     headless: bool,
@@ -806,7 +812,7 @@ fn build_chrome_devtools_server_config(
 ) -> Value {
     let mut mcp_args = vec![
         "-y".to_string(),
-        "chrome-devtools-mcp@latest".to_string(),
+        MCP_PACKAGE_SPEC.to_string(),
         "--browser-url=http://127.0.0.1:9223".to_string(),
     ];
     if quiet_mcp {
@@ -1735,13 +1741,135 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
 
 static FORWARD_MCP_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+/// One MCP session per run: a single long-lived chrome-devtools-mcp child plus
+/// the tokio runtime that drives its background reader tasks.
+///
+/// Upstream called `McpClient::call_tool` per browser action, which spawns a
+/// fresh `npx chrome-devtools-mcp` child for every single action (~50 per
+/// query) and waits on its response without any timeout — one stalled npx
+/// spawn hung the whole run forever (2026-07-11). Reusing one connection
+/// removes the re-spawn churn; `MCP_CALL_TIMEOUT` turns any remaining stall
+/// into a loud, bounded error (see `mcp_error_is_transport` for why the failed
+/// call is not replayed).
+struct McpSession {
+    connection: McpConnection,
+    runtime: tokio::runtime::Runtime,
+    config_path: String,
+}
+
+static MCP_SESSION: std::sync::Mutex<Option<McpSession>> = std::sync::Mutex::new(None);
+
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(90);
+const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
     let client = McpClient::load(Some(config_path))
         .map_err(|e| format!("Failed to load MCP config: {}", e))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let server_config = client
+        .server_config("chrome-devtools")
+        .map_err(|e| format!("Missing chrome-devtools MCP server config: {}", e))?;
+    // A multi-thread runtime with one worker keeps the connection's background
+    // stdout/stderr reader tasks running between calls (a current-thread
+    // runtime only makes progress inside block_on).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
-        .map_err(|e| format!("Failed to create async runtime for MCP call: {}", e))?;
+        .map_err(|e| format!("Failed to create async runtime for MCP session: {}", e))?;
+    let connection = runtime.block_on(async {
+        // Connect the stdio transport directly: mcp-cli's default path first
+        // tries its persistent daemon, which re-execs this binary with
+        // `--daemon` — an entrypoint ask-bridge does not implement — so that
+        // path can only ever fail and fall back.
+        let connect_future = async {
+            match &server_config {
+                ServerConfig::Stdio(stdio_config) => {
+                    StdioClient::connect("chrome-devtools", stdio_config)
+                        .await
+                        .map(McpConnection::Stdio)
+                }
+                _ => client.connect("chrome-devtools").await,
+            }
+        };
+        match tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect_future).await {
+            Err(_) => Err(format!(
+                "Failed to start chrome-devtools MCP server: timed out after {}s",
+                MCP_CONNECT_TIMEOUT.as_secs()
+            )),
+            Ok(result) => {
+                result.map_err(|e| format!("Failed to start chrome-devtools MCP server: {}", e))
+            }
+        }
+    })?;
+    Ok(McpSession {
+        connection,
+        runtime,
+        config_path: config_path.to_string(),
+    })
+}
+
+fn mcp_session_reset(slot: &mut Option<McpSession>) {
+    if let Some(session) = slot.take() {
+        let McpSession {
+            connection,
+            runtime,
+            ..
+        } = session;
+        // Best-effort close (kills the child); if even that stalls, dropping
+        // the runtime stops the background tasks and the orphaned child exits
+        // on stdin EOF.
+        let _ = runtime
+            .block_on(async { tokio::time::timeout(MCP_CLOSE_TIMEOUT, connection.close()).await });
+    }
+}
+
+fn mcp_session_call(
+    slot: &mut Option<McpSession>,
+    config_path: &str,
+    tool: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let needs_connect = slot
+        .as_ref()
+        .map(|session| session.config_path != config_path)
+        .unwrap_or(true);
+    if needs_connect {
+        mcp_session_reset(slot);
+        *slot = Some(mcp_session_connect(config_path)?);
+    }
+    let session = slot.as_ref().expect("session connected above");
+    session.runtime.block_on(async {
+        match tokio::time::timeout(MCP_CALL_TIMEOUT, session.connection.call_tool(tool, args)).await
+        {
+            Err(_) => Err(format!(
+                "MCP tool '{}' timed out after {}s",
+                tool,
+                MCP_CALL_TIMEOUT.as_secs()
+            )),
+            Ok(result) => result.map_err(|e| format!("mcp-cli library call failed: {}", e)),
+        }
+    })
+}
+
+/// Errors that mean the MCP transport itself is dead or wedged: our own
+/// timeouts, or transport-level failures (dead child / closed pipes — exact
+/// phrases from mcp-cli's StdioClient). These earn a session reset so the next
+/// command starts clean. The failed call is deliberately NOT replayed: a
+/// timed-out request may already have executed in the browser (replaying a
+/// submit would double-post), and a fresh chrome-devtools-mcp child forgets
+/// the selected page (a replay could act on the wrong tab). Application-level
+/// tool errors (e.g. a JS exception from evaluate_script) propagate unchanged.
+fn mcp_error_is_transport(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("timed out")
+        || lower.contains("failed to send request to process stdin")
+        || lower.contains("server process exited unexpectedly")
+        || lower.contains("stdio response receiver canceled")
+        || lower.contains("failed to start chrome-devtools mcp server")
+}
+
+fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
     let _stderr_guard = if FORWARD_MCP_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
@@ -1751,9 +1879,22 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
         )
     };
 
-    runtime
-        .block_on(async { client.call_tool("chrome-devtools", tool, args).await })
-        .map_err(|e| format!("mcp-cli library call failed: {}", e))
+    let mut slot = MCP_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match mcp_session_call(&mut slot, config_path, tool, args) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if mcp_error_is_transport(&error) {
+                mcp_session_reset(&mut slot);
+                return Err(format!(
+                    "{} (MCP session was reset; re-run the command)",
+                    error
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn parse_pages(text: &str) -> Vec<Page> {
@@ -1965,6 +2106,100 @@ mod tests {
     }
 
     #[test]
+    fn pins_chrome_devtools_mcp_version() {
+        // `@latest` makes every npx spawn re-resolve the dist-tag against the
+        // npm registry; combined with mcp-cli's timeout-less request wait this
+        // hung whole runs (2026-07-11). The package spec must pin a version.
+        let config = build_chrome_devtools_server_config(true, true, "/tmp/mcp.log", false);
+        let args = config["args"].as_array().expect("args array");
+        let pkg = args
+            .iter()
+            .filter_map(|a| a.as_str())
+            .find(|a| a.starts_with("chrome-devtools-mcp"))
+            .expect("chrome-devtools-mcp package argument");
+        assert!(
+            !pkg.ends_with("@latest"),
+            "chrome-devtools-mcp must be version-pinned, got {pkg}"
+        );
+        let version = pkg.rsplit('@').next().unwrap_or_default();
+        assert!(
+            version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "expected an explicit pinned version, got {pkg}"
+        );
+    }
+
+    #[test]
+    fn classifies_transport_errors_for_reconnect() {
+        // Transport failures earn a session reset + loud error (exact phrases
+        // from mcp-cli's StdioClient surface inside CliError's `Details:`
+        // line); the call is never replayed — see mcp_error_is_transport...
+        for transport in [
+            "MCP tool 'click' timed out after 90s",
+            "Error [SERVER_CONNECTION_FAILED]: x\n  Details: Failed to send request to process stdin",
+            "Error [TOOL_EXECUTION_FAILED]: x\n  Details: Server process exited unexpectedly. Last stderr:\nnpm error",
+            "Error [SERVER_CONNECTION_FAILED]: x\n  Details: Stdio response receiver canceled",
+            "Failed to start chrome-devtools MCP server: timed out after 120s",
+        ] {
+            assert!(
+                mcp_error_is_transport(transport),
+                "expected transport-class error: {transport}"
+            );
+        }
+        // ...application-level tool errors must NOT reset the session — the
+        // transport is fine and the caller needs the original error.
+        for app_level in [
+            "mcp-cli library call failed: Error [TOOL_EXECUTION_FAILED]: Tool \"click\" execution failed\n  Details: element not found",
+            "mcp-cli library call failed: Error [TOOL_EXECUTION_FAILED]: Tool \"evaluate_script\" execution failed\n  Details: TypeError: x is undefined",
+        ] {
+            assert!(
+                !mcp_error_is_transport(app_level),
+                "expected app-level error to pass through: {app_level}"
+            );
+        }
+    }
+
+    #[test]
+    fn piped_stdin_grace_skips_silent_pipe_when_prompt_argument_present() {
+        // Agent harnesses (Claude Code / Codex) run commands with a non-tty
+        // stdin they may never close; blocking on EOF hung whole runs
+        // (2026-07-11). With a prompt argument in hand, a silent pipe must be
+        // treated as "no piped input" after the grace period.
+        let (_probe_tx, probe_rx) = std::sync::mpsc::channel::<StdinProbe>();
+        let (_data_tx, data_rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let out = recv_piped_stdin(&probe_rx, &data_rx, Duration::from_millis(50), true)
+            .expect("silent pipe should yield empty stdin, not an error");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn piped_stdin_reads_live_pipe_to_eof_when_prompt_argument_present() {
+        // A pipe that delivers data keeps the documented combine behavior:
+        // `cat notes.md | ask-bridge '摘要'` must still append stdin.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
+        probe_tx.send(StdinProbe::Data).unwrap();
+        data_tx.send(Ok("piped context".to_string())).unwrap();
+        let out = recv_piped_stdin(&probe_rx, &data_rx, Duration::from_millis(50), true)
+            .expect("live pipe should be read");
+        assert_eq!(out, "piped context");
+    }
+
+    #[test]
+    fn piped_stdin_waits_unbounded_when_no_prompt_argument() {
+        // Without a prompt argument stdin IS the prompt: keep upstream's
+        // unbounded wait even when data arrives long after any grace window.
+        let (_probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            let _ = data_tx.send(Ok("stdin is the prompt".to_string()));
+        });
+        let out = recv_piped_stdin(&probe_rx, &data_rx, Duration::from_millis(10), false)
+            .expect("unbounded wait should return the piped prompt");
+        assert_eq!(out, "stdin is the prompt");
+    }
+
+    #[test]
     fn builds_direct_quiet_mcp_configs() {
         fn config_args(config: &serde_json::Value) -> Vec<&str> {
             config["args"]
@@ -1986,7 +2221,7 @@ mod tests {
         assert_eq!(verbose_windows["command"].as_str(), Some("npx.cmd"));
         assert_eq!(quiet_unix["command"].as_str(), Some("npx"));
         for required in [
-            "chrome-devtools-mcp@latest",
+            MCP_PACKAGE_SPEC,
             "--browser-url=http://127.0.0.1:9223",
             "--headless",
             "--logFile",
@@ -5106,6 +5341,89 @@ fn print_chrome_diagnostics(profile_path: &str) {
     );
 }
 
+/// How long to wait for a non-tty stdin to produce its first byte (or EOF)
+/// when a prompt argument was already provided. Agent harnesses (Claude Code,
+/// Codex) run commands with a pipe they may never close; blocking on EOF hung
+/// whole runs (2026-07-11).
+const STDIN_PIPE_GRACE: Duration = Duration::from_secs(2);
+
+enum StdinProbe {
+    Data,
+    Eof,
+}
+
+/// Read stdin on a helper thread, signalling the first byte (or EOF) on one
+/// channel and the full content on another, so the caller can bound how long
+/// it waits for a pipe that might never deliver anything.
+fn spawn_stdin_reader() -> (
+    std::sync::mpsc::Receiver<StdinProbe>,
+    std::sync::mpsc::Receiver<std::io::Result<String>>,
+) {
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let (data_tx, data_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut first = [0u8; 1];
+        match stdin.read(&mut first) {
+            Ok(0) => {
+                let _ = probe_tx.send(StdinProbe::Eof);
+                let _ = data_tx.send(Ok(String::new()));
+            }
+            Ok(_) => {
+                let _ = probe_tx.send(StdinProbe::Data);
+                let mut bytes = vec![first[0]];
+                let result = stdin.read_to_end(&mut bytes).and_then(|_| {
+                    String::from_utf8(bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                });
+                let _ = data_tx.send(result);
+            }
+            Err(e) => {
+                let _ = probe_tx.send(StdinProbe::Eof);
+                let _ = data_tx.send(Err(e));
+            }
+        }
+    });
+    (probe_rx, data_rx)
+}
+
+/// With a prompt argument in hand piped stdin is an optional supplement: wait
+/// up to `grace` for the pipe's first byte, then read a live pipe to EOF as
+/// before; a silent pipe (agent harness holding it open) is treated as "no
+/// piped input". Without a prompt argument stdin IS the prompt, so wait
+/// unbounded exactly like upstream.
+fn recv_piped_stdin(
+    probe_rx: &std::sync::mpsc::Receiver<StdinProbe>,
+    data_rx: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    grace: Duration,
+    has_prompt_argument: bool,
+) -> std::io::Result<String> {
+    if !has_prompt_argument {
+        // stdin IS the prompt: wait unbounded like upstream, but after the
+        // grace window tell the user what we are blocked on (an agent harness
+        // holding the pipe open would otherwise hang here with no diagnostic).
+        return match data_rx.recv_timeout(grace) {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "Waiting for a prompt on stdin (pipe is open; close it or pass a prompt argument)..."
+                );
+                data_rx.recv().unwrap_or(Ok(String::new()))
+            }
+        };
+    }
+    match probe_rx.recv_timeout(grace) {
+        Ok(_) => data_rx.recv().unwrap_or(Ok(String::new())),
+        Err(_) => {
+            eprintln!(
+                "No piped stdin data within {}s; continuing with the prompt argument only.",
+                grace.as_secs()
+            );
+            Ok(String::new())
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
     if cli.command.is_none() {
@@ -5449,7 +5767,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if stdin is a pipe (not a tty)
     if !std::io::stdin().is_terminal() {
-        io::stdin().read_to_string(&mut stdin_prompt)?;
+        let (probe_rx, data_rx) = spawn_stdin_reader();
+        stdin_prompt =
+            recv_piped_stdin(&probe_rx, &data_rx, STDIN_PIPE_GRACE, cli.prompt.is_some())?;
     }
 
     let prompt = match cli.prompt {
