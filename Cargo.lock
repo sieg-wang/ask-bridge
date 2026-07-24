@@ -81,6 +81,7 @@ dependencies = [
  "mcp-cli",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -806,6 +806,14 @@ fn merged_config_json(
 
 fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Result<(), String> {
     let config_path = config_file_path()?;
+    write_global_config_at(&config_path, provider, browser)
+}
+
+fn write_global_config_at(
+    config_path: &Path,
+    provider: Option<Provider>,
+    browser: Option<&str>,
+) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -816,11 +824,29 @@ fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Res
         })?;
     }
 
+    match std::fs::symlink_metadata(config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Refusing to write config file through a symbolic link: {}",
+                config_path.to_string_lossy()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect existing config file {}: {}",
+                config_path.to_string_lossy(),
+                error
+            ));
+        }
+    }
+
     // Only a missing file means "start fresh". Any other read error (permission
     // bits, transient I/O on a cloud-backed home dir, invalid UTF-8) must fail
     // loud — treating it as empty would rewrite the file and drop the other
     // field, defeating the merge-preserving guarantee.
-    let existing = match std::fs::read_to_string(&config_path) {
+    let existing = match std::fs::read_to_string(config_path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -833,11 +859,38 @@ fn write_global_config(provider: Option<Provider>, browser: Option<&str>) -> Res
     };
     let provider_str = provider.map(|p| p.to_string());
     let content = merged_config_json(&existing, provider_str.as_deref(), browser)?;
-    std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
+    let parent = config_path.parent().ok_or_else(|| {
         format!(
-            "Failed to write config file {}: {}",
+            "Config path has no parent: {}",
+            config_path.to_string_lossy()
+        )
+    })?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".config.json.tmp.")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "Failed to create staging file for {}: {}",
+                config_path.to_string_lossy(),
+                error
+            )
+        })?;
+    staged
+        .write_all(format!("{}\n", content).as_bytes())
+        .and_then(|()| staged.flush())
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|error| {
+            format!(
+                "Failed to stage config file {}: {}",
+                config_path.to_string_lossy(),
+                error
+            )
+        })?;
+    staged.persist(config_path).map_err(|error| {
+        format!(
+            "Failed to atomically replace config file {}: {}",
             config_path.to_string_lossy(),
-            e
+            error.error
         )
     })?;
 
@@ -1924,6 +1977,31 @@ struct ChromeDebugSnapshot {
     ask_pids: Vec<String>,
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn same_pid_set(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && left.iter().all(|pid| right.contains(pid))
+}
+
+/// Return force-kill targets only when a fresh inspection proves that the CDP
+/// browser, listener, and ask-bridge owner identities are unchanged from the
+/// pre-TERM snapshot. Numeric PIDs alone are not identities and may be reused.
+#[cfg(any(target_os = "windows", test))]
+fn validated_force_kill_pids(
+    initial: &ChromeDebugSnapshot,
+    current: &ChromeDebugSnapshot,
+) -> Option<Vec<String>> {
+    let initial_browser_id = initial.browser_id.as_deref()?;
+    if current.browser_id.as_deref() != Some(initial_browser_id)
+        || !debug_listener_scope_is_unambiguous(&current.listener_pids)
+        || current.ask_pids.is_empty()
+        || !same_pid_set(&initial.listener_pids, &current.listener_pids)
+        || !same_pid_set(&initial.ask_pids, &current.ask_pids)
+    {
+        return None;
+    }
+    Some(current.ask_pids.clone())
+}
+
 fn debug_listener_scope_is_unambiguous(listener_pids: &[String]) -> bool {
     listener_pids.len() <= 1
 }
@@ -2106,6 +2184,50 @@ fn process_command(pid: &str) -> Option<String> {
     }
 }
 
+fn process_is_alive(pid: &str) -> Option<bool> {
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "$p = Get-Process -Id {} -ErrorAction SilentlyContinue; \
+                     if ($null -eq $p) {{ [Console]::Write('missing') }} \
+                     else {{ [Console]::Write('alive') }}",
+                    pid
+                ),
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "alive" => Some(true),
+            "missing" => Some(false),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", pid, "-o", "pid="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return Some(false);
+        }
+        Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+}
+
 fn process_parent_pid(pid: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -2184,6 +2306,7 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
 /// BEFORE it finishes dying: if a relaunch races the dying process, the new
 /// instance sees the old SingletonLock, forwards to it (activating its window —
 /// a focus steal), exits, and nothing ever binds the port again.
+#[cfg(test)]
 fn wait_for_pids_to_exit(pids: &[String], iters: u32) -> bool {
     for _ in 0..iters {
         if pids.iter().all(|pid| process_command(pid).is_none()) {
@@ -2194,6 +2317,54 @@ fn wait_for_pids_to_exit(pids: &[String], iters: u32) -> bool {
     false
 }
 
+fn ask_chrome_pids_are_gone_with<C, L>(
+    pids: &[String],
+    profile_path: &str,
+    mut command_for: C,
+    mut is_alive: L,
+) -> bool
+where
+    C: FnMut(&str) -> Option<String>,
+    L: FnMut(&str) -> Option<bool>,
+{
+    pids.iter().all(|pid| match command_for(pid) {
+        Some(command) if !command.trim().is_empty() => {
+            !command_identifies_ask_chrome(&command, profile_path)
+        }
+        // A command-line probe can fail or succeed without returning a usable
+        // command because WMIC/PowerShell/ps is unavailable, denied, or
+        // redacted. Treat the PID as gone only when a separate liveness probe
+        // proves absence.
+        Some(_) | None => matches!(is_alive(pid), Some(false)),
+    })
+}
+
+fn wait_for_ask_chrome_pids_to_exit(pids: &[String], profile_path: &str, iters: u32) -> bool {
+    for _ in 0..iters {
+        if ask_chrome_pids_are_gone_with(pids, profile_path, process_command, process_is_alive) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn require_ask_chrome_pids_to_exit(
+    pids: &[String],
+    profile_path: &str,
+    iters: u32,
+) -> Result<(), String> {
+    if wait_for_ask_chrome_pids_to_exit(pids, profile_path, iters) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Debug port closed, but browser process(es) {} are still running",
+            pids.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
 fn require_pids_to_exit(pids: &[String], iters: u32) -> Result<(), String> {
     if wait_for_pids_to_exit(pids, iters) {
         Ok(())
@@ -2248,7 +2419,7 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         if TcpStream::connect("127.0.0.1:9223").is_err() {
             // Port closed is NOT process gone: wait for the PIDs to actually
             // exit so an immediate relaunch can't hit the old SingletonLock.
-            require_pids_to_exit(&snapshot.ask_pids, 100)?;
+            require_ask_chrome_pids_to_exit(&snapshot.ask_pids, profile_path, 100)?;
             let _ = remove_chrome_pid_file();
             return Ok(true);
         }
@@ -2257,7 +2428,12 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
 
     #[cfg(target_os = "windows")]
     {
-        for pid in &snapshot.ask_pids {
+        let current = inspect_chrome_debug_port(profile_path);
+        let force_kill_pids = validated_force_kill_pids(&snapshot, &current).ok_or_else(|| {
+            "Browser identity changed while waiting for graceful shutdown; refusing to force-kill any PID."
+                .to_string()
+        })?;
+        for pid in &force_kill_pids {
             let _ = Command::new("taskkill")
                 .arg("/F")
                 .arg("/PID")
@@ -2267,7 +2443,7 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
 
         for _ in 0..50 {
             if TcpStream::connect("127.0.0.1:9223").is_err() {
-                require_pids_to_exit(&snapshot.ask_pids, 100)?;
+                require_ask_chrome_pids_to_exit(&force_kill_pids, profile_path, 100)?;
                 let _ = remove_chrome_pid_file();
                 return Ok(true);
             }
@@ -3078,6 +3254,33 @@ mod tests {
         assert!(err.contains("not a JSON object"), "got: {}", err);
         let err2 = merged_config_json("\"hello\"", None, Some("/b")).unwrap_err();
         assert!(err2.contains("not a JSON object"), "got: {}", err2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_writer_rejects_symlink_without_touching_its_target() {
+        let dir = make_test_dir("config_symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("sentinel.json");
+        let config = dir.join("config.json");
+        std::fs::write(&sentinel, b"{\"keep\":\"PRECIOUS\"}\n").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &config).unwrap();
+
+        let err = write_global_config_at(&config, Some(Provider::Gemini), None).unwrap_err();
+
+        assert!(err.contains("symbolic link"), "got: {}", err);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "{\"keep\":\"PRECIOUS\"}\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rejected destination symlink must remain untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3994,7 +4197,105 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "windows")]
+    #[test]
+    fn force_close_targets_require_the_same_browser_and_owner_identity() {
+        let initial = ChromeDebugSnapshot {
+            listener_pids: vec!["20728".to_string()],
+            record: None,
+            browser_id: Some("browser-original".to_string()),
+            ask_pids: vec!["18000".to_string()],
+        };
+        let same = ChromeDebugSnapshot {
+            listener_pids: vec!["20728".to_string()],
+            record: None,
+            browser_id: Some("browser-original".to_string()),
+            ask_pids: vec!["18000".to_string()],
+        };
+        assert_eq!(
+            validated_force_kill_pids(&initial, &same),
+            Some(vec!["18000".to_string()])
+        );
+
+        // The original numeric PID was reused by an unrelated process after
+        // graceful close. Re-inspection can no longer prove it as the owner,
+        // so no force-kill target may be returned.
+        let reused = ChromeDebugSnapshot {
+            listener_pids: vec!["20728".to_string()],
+            record: None,
+            browser_id: Some("browser-original".to_string()),
+            ask_pids: Vec::new(),
+        };
+        assert_eq!(validated_force_kill_pids(&initial, &reused), None);
+
+        // A new browser instance on the same port is also not the one whose
+        // graceful shutdown we initiated.
+        let replacement_browser = ChromeDebugSnapshot {
+            listener_pids: vec!["20728".to_string()],
+            record: None,
+            browser_id: Some("browser-replacement".to_string()),
+            ask_pids: vec!["18000".to_string()],
+        };
+        assert_eq!(
+            validated_force_kill_pids(&initial, &replacement_browser),
+            None
+        );
+
+        assert!(ask_chrome_pids_are_gone_with(
+            &initial.ask_pids,
+            "/tmp/profile",
+            |_| Some("unrelated --process".to_string()),
+            |_| Some(true),
+        ));
+        assert!(!ask_chrome_pids_are_gone_with(
+            &initial.ask_pids,
+            "/tmp/profile",
+            |_| Some("chrome --remote-debugging-port=9223 --ask-bridge-instance".to_string()),
+            |_| Some(true),
+        ));
+        assert!(!ask_chrome_pids_are_gone_with(
+            &initial.ask_pids,
+            "/tmp/profile",
+            |_| None,
+            |_| Some(true),
+        ));
+        assert!(!ask_chrome_pids_are_gone_with(
+            &initial.ask_pids,
+            "/tmp/profile",
+            |_| None,
+            |_| None,
+        ));
+        assert!(ask_chrome_pids_are_gone_with(
+            &initial.ask_pids,
+            "/tmp/profile",
+            |_| None,
+            |_| Some(false),
+        ));
+    }
+
+    #[test]
+    fn empty_process_command_requires_proven_process_exit() {
+        let pids = vec!["18000".to_string()];
+
+        assert!(!ask_chrome_pids_are_gone_with(
+            &pids,
+            "/tmp/profile",
+            |_| Some(String::new()),
+            |_| Some(true),
+        ));
+        assert!(!ask_chrome_pids_are_gone_with(
+            &pids,
+            "/tmp/profile",
+            |_| Some(String::new()),
+            |_| None,
+        ));
+        assert!(ask_chrome_pids_are_gone_with(
+            &pids,
+            "/tmp/profile",
+            |_| Some(String::new()),
+            |_| Some(false),
+        ));
+    }
+
     #[test]
     fn windows_netstat_parser_matches_exact_listening_port() {
         let output = concat!(
@@ -4047,7 +4348,6 @@ mod tests {
         assert_eq!(ask_pids, vec!["18000".to_string()]);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn parses_wmic_value_after_blank_lines() {
         let output = "CommandLine\r\n\r\n  chrome.exe --remote-debugging-port=9223  \r\n\r\n";
@@ -6569,7 +6869,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Err(e) = start_chrome_if_needed(is_headless, command_verbose, browser_override.as_deref()) {
+    if let Err(e) =
+        start_chrome_if_needed(is_headless, command_verbose, browser_override.as_deref())
+    {
         eprintln!("Error starting browser: {}", e);
         std::process::exit(1);
     }
