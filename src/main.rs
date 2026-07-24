@@ -3356,7 +3356,11 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "config.json")
             .collect();
-        assert!(residue.is_empty(), "staging residue left behind: {:?}", residue);
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {:?}",
+            residue
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4394,14 +4398,15 @@ mod tests {
 
     #[test]
     fn force_kill_validation_handles_a_hung_browser_without_cdp_identity() {
-        let snapshot_with = |browser_id: Option<&str>, ask_pids: Vec<&str>, listeners: Vec<&str>| {
-            ChromeDebugSnapshot {
-                listener_pids: listeners.into_iter().map(str::to_string).collect(),
-                record: None,
-                browser_id: browser_id.map(str::to_string),
-                ask_pids: ask_pids.into_iter().map(str::to_string).collect(),
-            }
-        };
+        let snapshot_with =
+            |browser_id: Option<&str>, ask_pids: Vec<&str>, listeners: Vec<&str>| {
+                ChromeDebugSnapshot {
+                    listener_pids: listeners.into_iter().map(str::to_string).collect(),
+                    record: None,
+                    browser_id: browser_id.map(str::to_string),
+                    ask_pids: ask_pids.into_iter().map(str::to_string).collect(),
+                }
+            };
 
         // A hung browser never answered CDP: no UUID in the pre-TERM snapshot.
         // The ask/listener pid sets were proven via profile/marker command
