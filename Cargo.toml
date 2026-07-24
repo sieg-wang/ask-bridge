@@ -21,3 +21,4 @@ mcp-cli = { git = "https://github.com/doggy8088/mcp-cli" }
 gag = "1.0"
 base64 = "0.21"
 url = "2"
+tempfile = "3"
