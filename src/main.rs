@@ -886,6 +886,34 @@ fn write_global_config_at(
                 error
             )
         })?;
+    // The staging file is created 0600; carry the existing config's mode over
+    // so the atomic replace does not silently lock out group/other readers
+    // that could read the file before. A missing file keeps the staging
+    // default. (Symlinks were already rejected above, so this reads the
+    // regular file itself.)
+    #[cfg(unix)]
+    match std::fs::metadata(config_path) {
+        Ok(metadata) => {
+            staged
+                .as_file()
+                .set_permissions(metadata.permissions())
+                .map_err(|error| {
+                    format!(
+                        "Failed to preserve permissions of config file {}: {}",
+                        config_path.to_string_lossy(),
+                        error
+                    )
+                })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to read permissions of config file {}: {}",
+                config_path.to_string_lossy(),
+                error
+            ));
+        }
+    }
     staged.persist(config_path).map_err(|error| {
         format!(
             "Failed to atomically replace config file {}: {}",
@@ -1982,17 +2010,26 @@ fn same_pid_set(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && left.iter().all(|pid| right.contains(pid))
 }
 
-/// Return force-kill targets only when a fresh inspection proves that the CDP
-/// browser, listener, and ask-bridge owner identities are unchanged from the
-/// pre-TERM snapshot. Numeric PIDs alone are not identities and may be reused.
+/// Return force-kill targets only when a fresh inspection proves that the
+/// listener and ask-bridge owner identities are unchanged from the pre-TERM
+/// snapshot. The pid sets were themselves proven by walking parents until the
+/// command line carried the dedicated profile or the ask-bridge marker — that
+/// identity needs no CDP. The CDP browser UUID is corroborating evidence only
+/// when BOTH snapshots have one; a hung browser (CDP dead → `browser_id:
+/// None`) is the very case the force branch exists for and must not be
+/// blocked on it.
 #[cfg(any(target_os = "windows", test))]
 fn validated_force_kill_pids(
     initial: &ChromeDebugSnapshot,
     current: &ChromeDebugSnapshot,
 ) -> Option<Vec<String>> {
-    let initial_browser_id = initial.browser_id.as_deref()?;
-    if current.browser_id.as_deref() != Some(initial_browser_id)
-        || !debug_listener_scope_is_unambiguous(&current.listener_pids)
+    if let (Some(initial_id), Some(current_id)) =
+        (initial.browser_id.as_deref(), current.browser_id.as_deref())
+        && initial_id != current_id
+    {
+        return None;
+    }
+    if !debug_listener_scope_is_unambiguous(&current.listener_pids)
         || current.ask_pids.is_empty()
         || !same_pid_set(&initial.listener_pids, &current.listener_pids)
         || !same_pid_set(&initial.ask_pids, &current.ask_pids)
@@ -2004,6 +2041,16 @@ fn validated_force_kill_pids(
 
 fn debug_listener_scope_is_unambiguous(listener_pids: &[String]) -> bool {
     listener_pids.len() <= 1
+}
+
+/// A fresh inspection that finds neither a port-9223 listener nor an
+/// ask-bridge owner means the browser finished dying (e.g. just after the
+/// last graceful-shutdown port poll): that is a SUCCESSFUL close, not an
+/// identity failure. Callers must still confirm the probe itself ran (the
+/// port really stopped accepting connections) before trusting this.
+#[cfg(any(target_os = "windows", test))]
+fn snapshot_shows_browser_gone(current: &ChromeDebugSnapshot) -> bool {
+    current.listener_pids.is_empty() && current.ask_pids.is_empty()
 }
 
 fn inspect_chrome_debug_port(profile_path: &str) -> ChromeDebugSnapshot {
@@ -2301,22 +2348,6 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
         })
 }
 
-/// Wait (bounded, iters x 100ms) until none of `pids` is alive. Returns true if
-/// they all exited. Needed because a Chromium browser closes its debug port
-/// BEFORE it finishes dying: if a relaunch races the dying process, the new
-/// instance sees the old SingletonLock, forwards to it (activating its window —
-/// a focus steal), exits, and nothing ever binds the port again.
-#[cfg(test)]
-fn wait_for_pids_to_exit(pids: &[String], iters: u32) -> bool {
-    for _ in 0..iters {
-        if pids.iter().all(|pid| process_command(pid).is_none()) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
 fn ask_chrome_pids_are_gone_with<C, L>(
     pids: &[String],
     profile_path: &str,
@@ -2339,6 +2370,12 @@ where
     })
 }
 
+/// Wait (bounded, iters x 100ms) until none of `pids` is running as ask
+/// chrome. Returns true if they all exited (or were reused by unrelated
+/// processes). Needed because a Chromium browser closes its debug port BEFORE
+/// it finishes dying: if a relaunch races the dying process, the new instance
+/// sees the old SingletonLock, forwards to it (activating its window — a
+/// focus steal), exits, and nothing ever binds the port again.
 fn wait_for_ask_chrome_pids_to_exit(pids: &[String], profile_path: &str, iters: u32) -> bool {
     for _ in 0..iters {
         if ask_chrome_pids_are_gone_with(pids, profile_path, process_command, process_is_alive) {
@@ -2355,18 +2392,6 @@ fn require_ask_chrome_pids_to_exit(
     iters: u32,
 ) -> Result<(), String> {
     if wait_for_ask_chrome_pids_to_exit(pids, profile_path, iters) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Debug port closed, but browser process(es) {} are still running",
-            pids.join(", ")
-        ))
-    }
-}
-
-#[cfg(test)]
-fn require_pids_to_exit(pids: &[String], iters: u32) -> Result<(), String> {
-    if wait_for_pids_to_exit(pids, iters) {
         Ok(())
     } else {
         Err(format!(
@@ -2429,6 +2454,21 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         let current = inspect_chrome_debug_port(profile_path);
+        if snapshot_shows_browser_gone(&current) {
+            // Distinguish "probe ran, found nothing" (graceful exit finished
+            // right after the last port poll — success) from "probe failed to
+            // execute" (netstat/wmic unavailable while the port is still
+            // wedged — error).
+            if TcpStream::connect("127.0.0.1:9223").is_ok() {
+                return Err(
+                    "Port 9223 is still open, but its owner could not be re-identified; refusing to force-kill any PID."
+                        .to_string(),
+                );
+            }
+            require_ask_chrome_pids_to_exit(&snapshot.ask_pids, profile_path, 100)?;
+            let _ = remove_chrome_pid_file();
+            return Ok(true);
+        }
         let force_kill_pids = validated_force_kill_pids(&snapshot, &current).ok_or_else(|| {
             "Browser identity changed while waiting for graceful shutdown; refusing to force-kill any PID."
                 .to_string()
@@ -3283,6 +3323,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn config_write_replaces_existing_file_atomically_preserving_extras_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = make_test_dir("config_atomic_happy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, "{\"keep\":\"extra\"}\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_global_config_at(&config, Some(Provider::Gemini), Some("/b")).unwrap();
+
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.ends_with('\n'), "got: {:?}", content);
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["provider"], "gemini");
+        assert_eq!(value["browser"], "/b");
+        assert_eq!(value["keep"], "extra");
+
+        let metadata = std::fs::symlink_metadata(&config).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(
+            metadata.permissions().mode() & 0o7777,
+            0o644,
+            "the atomic replace must preserve the existing file's mode"
+        );
+
+        let residue: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json")
+            .collect();
+        assert!(residue.is_empty(), "staging residue left behind: {:?}", residue);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn resolve_browser_binary_rejects_directory() {
         let dir = make_test_dir("browser_plain_dir");
@@ -3559,8 +3637,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn wait_for_pids_to_exit_detects_death_and_survival() {
-        // A killed child is detected as exited.
+    fn process_is_alive_probes_real_processes() {
+        // Our own (very alive) process.
+        let me = std::process::id().to_string();
+        assert_eq!(process_is_alive(&me), Some(true));
+
+        // A killed AND reaped child no longer exists for `ps`.
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -3568,17 +3650,55 @@ mod tests {
         let pid = child.id().to_string();
         child.kill().unwrap();
         child.wait().unwrap(); // reap so the PID actually disappears
-        assert!(wait_for_pids_to_exit(&[pid], 20));
+        assert_eq!(process_is_alive(&pid), Some(false));
 
-        // Our own (very alive) process is not: bounded wait returns false.
-        let me = std::process::id().to_string();
-        assert!(!wait_for_pids_to_exit(&[me], 2));
+        // Non-PID inputs must be indeterminate, never "dead".
+        assert_eq!(process_is_alive(""), None);
+        assert_eq!(process_is_alive("12x"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_ask_chrome_pids_to_exit_detects_death_and_survival() {
+        // A killed, reaped child is detected as exited by the real
+        // process_command/process_is_alive probes.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+        child.kill().unwrap();
+        child.wait().unwrap(); // reap so the PID actually disappears
+        assert!(wait_for_ask_chrome_pids_to_exit(
+            &[pid],
+            "/tmp/ask-bridge-test-profile",
+            20
+        ));
+
+        // A live process whose command line carries the ask-bridge marker is
+        // still running as ask chrome: the bounded wait returns false.
+        let mut marked = std::process::Command::new("sh")
+            // Compound command: stops sh from exec-replacing itself with
+            // `sleep`, which would drop the marker from its argv.
+            .args(["-c", "sleep 30; :", "sh", "--ask-bridge-instance"])
+            .spawn()
+            .unwrap();
+        let marked_pid = marked.id().to_string();
+        let still_running = !wait_for_ask_chrome_pids_to_exit(
+            std::slice::from_ref(&marked_pid),
+            "/tmp/ask-bridge-test-profile",
+            2,
+        );
+        marked.kill().ok();
+        marked.wait().ok();
+        assert!(still_running);
     }
 
     #[test]
-    fn require_pids_to_exit_reports_a_bounded_wait_timeout() {
+    fn require_ask_chrome_pids_to_exit_reports_a_bounded_wait_timeout() {
         let me = std::process::id().to_string();
-        let err = require_pids_to_exit(std::slice::from_ref(&me), 0).unwrap_err();
+        let err = require_ask_chrome_pids_to_exit(std::slice::from_ref(&me), "/tmp/profile", 0)
+            .unwrap_err();
         assert!(err.contains(&me), "got: {}", err);
         assert!(err.contains("still running"), "got: {}", err);
     }
@@ -4270,6 +4390,101 @@ mod tests {
             |_| None,
             |_| Some(false),
         ));
+    }
+
+    #[test]
+    fn force_kill_validation_handles_a_hung_browser_without_cdp_identity() {
+        let snapshot_with = |browser_id: Option<&str>, ask_pids: Vec<&str>, listeners: Vec<&str>| {
+            ChromeDebugSnapshot {
+                listener_pids: listeners.into_iter().map(str::to_string).collect(),
+                record: None,
+                browser_id: browser_id.map(str::to_string),
+                ask_pids: ask_pids.into_iter().map(str::to_string).collect(),
+            }
+        };
+
+        // A hung browser never answered CDP: no UUID in the pre-TERM snapshot.
+        // The ask/listener pid sets were proven via profile/marker command
+        // lines, so force-kill must still proceed on unchanged sets.
+        let initial_no_id = snapshot_with(None, vec!["18000"], vec!["20728"]);
+        let current_no_id = snapshot_with(None, vec!["18000"], vec!["20728"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_no_id, &current_no_id),
+            Some(vec!["18000".to_string()])
+        );
+
+        // CDP died between the snapshot and re-inspection (browser dying/hung):
+        // a missing current UUID must not block the kill either.
+        let initial_with_id = snapshot_with(Some("browser-original"), vec!["18000"], vec!["20728"]);
+        let current_lost_id = snapshot_with(None, vec!["18000"], vec!["20728"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_with_id, &current_lost_id),
+            Some(vec!["18000".to_string()])
+        );
+
+        // When BOTH snapshots carry a UUID, a mismatch still refuses.
+        let current_other_id =
+            snapshot_with(Some("browser-replacement"), vec!["18000"], vec!["20728"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_with_id, &current_other_id),
+            None
+        );
+
+        // A different NON-EMPTY ask set is not the owner we TERMed (only the
+        // ask-set comparison trips here: listeners unchanged, scope single).
+        let current_other_ask = snapshot_with(None, vec!["19999"], vec!["20728"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_no_id, &current_other_ask),
+            None
+        );
+
+        // A different single listener is not the one we snapshotted (only the
+        // listener-set comparison trips: scope single, ask set unchanged).
+        let current_other_listener = snapshot_with(None, vec!["18000"], vec!["30000"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_no_id, &current_other_listener),
+            None
+        );
+
+        // Two listeners make the kill scope ambiguous even when the sets are
+        // UNCHANGED (only the ambiguity check trips).
+        let initial_two_listeners = snapshot_with(None, vec!["18000"], vec!["20728", "30000"]);
+        let current_two_listeners = snapshot_with(None, vec!["18000"], vec!["20728", "30000"]);
+        assert_eq!(
+            validated_force_kill_pids(&initial_two_listeners, &current_two_listeners),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_revalidation_snapshot_means_browser_gone_not_identity_failure() {
+        let gone = ChromeDebugSnapshot {
+            listener_pids: Vec::new(),
+            record: None,
+            browser_id: None,
+            ask_pids: Vec::new(),
+        };
+        // The browser finished dying just after the last port poll: close
+        // succeeded and must not be reported as an identity failure.
+        assert!(snapshot_shows_browser_gone(&gone));
+
+        // Any surviving listener or ask owner is NOT "gone" — those still go
+        // through identity validation.
+        let listener_left = ChromeDebugSnapshot {
+            listener_pids: vec!["20728".to_string()],
+            record: None,
+            browser_id: None,
+            ask_pids: Vec::new(),
+        };
+        assert!(!snapshot_shows_browser_gone(&listener_left));
+
+        let ask_left = ChromeDebugSnapshot {
+            listener_pids: Vec::new(),
+            record: None,
+            browser_id: None,
+            ask_pids: vec!["18000".to_string()],
+        };
+        assert!(!snapshot_shows_browser_gone(&ask_left));
     }
 
     #[test]
