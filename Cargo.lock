@@ -78,6 +78,7 @@ dependencies = [
  "clap",
  "gag",
  "home",
+ "libc",
  "mcp-cli",
  "serde",
  "serde_json",

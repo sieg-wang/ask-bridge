@@ -1018,6 +1018,76 @@ fn write_global_config_at(
         })?;
     }
 
+    let config_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "Config path has no valid file name: {}",
+                config_path.to_string_lossy()
+            )
+        })?;
+    let lock_path = config_path.with_file_name(format!(".{config_name}.lock"));
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Refusing to use config lock through a symbolic link: {}",
+                lock_path.to_string_lossy()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect config lock {}: {}",
+                lock_path.to_string_lossy(),
+                error
+            ));
+        }
+    }
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let config_lock = lock_options.open(&lock_path).map_err(|error| {
+        format!(
+            "Failed to open config lock {}: {}",
+            lock_path.to_string_lossy(),
+            error
+        )
+    })?;
+    if !config_lock
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "Failed to inspect opened config lock {}: {}",
+                lock_path.to_string_lossy(),
+                error
+            )
+        })?
+        .file_type()
+        .is_file()
+    {
+        return Err(format!(
+            "Config lock is not a regular file: {}",
+            lock_path.to_string_lossy()
+        ));
+    }
+    config_lock.lock().map_err(|error| {
+        format!(
+            "Failed to lock config file {}: {}",
+            config_path.to_string_lossy(),
+            error
+        )
+    })?;
+
     match std::fs::symlink_metadata(config_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(format!(
@@ -1860,12 +1930,31 @@ fn mark_profile_exited_cleanly(profile_path: &str) {
         return;
     };
     if let Some(patched) = preferences_marked_clean(&content) {
-        // Atomic replace (tmp + rename) so a crash mid-write can never leave a
-        // truncated Preferences behind. Errors stay ignored: this patch is a
-        // cosmetic nicety, and --hide-crash-restore-bubble backs it up anyway.
-        let tmp = prefs.with_extension("askbridge.tmp");
-        if std::fs::write(&tmp, patched).is_ok() {
-            let _ = std::fs::rename(&tmp, &prefs);
+        // Stage with an unpredictable, exclusively-created name in the same
+        // directory. A fixed name lets another local process preplant a
+        // symlink and redirect this cosmetic write to an unrelated file.
+        let Some(parent) = prefs.parent() else {
+            return;
+        };
+        if let Ok(mut staged) = tempfile::Builder::new()
+            .prefix(".Preferences.askbridge.tmp.")
+            .tempfile_in(parent)
+        {
+            let staged_ok = staged
+                .write_all(patched.as_bytes())
+                .and_then(|()| staged.flush())
+                .and_then(|()| staged.as_file().sync_all())
+                .is_ok();
+            if staged_ok {
+                #[cfg(unix)]
+                if let Ok(metadata) = std::fs::metadata(&prefs) {
+                    let _ = staged.as_file().set_permissions(metadata.permissions());
+                }
+                // Same-directory persist is atomic. Errors stay ignored: this
+                // patch is cosmetic, and --hide-crash-restore-bubble is the
+                // primary launch-time mitigation.
+                let _ = staged.persist(&prefs);
+            }
         }
     }
 }
@@ -3594,6 +3683,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn config_writer_rejects_symlink_lock_without_touching_its_target() {
+        let dir = make_test_dir("config_lock_symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        let lock = dir.join(".config.json.lock");
+        let sentinel = dir.join("sentinel");
+        std::fs::write(&sentinel, "DO NOT MODIFY").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &lock).unwrap();
+
+        let err = write_global_config_at(&config, Some(Provider::Gemini), None).unwrap_err();
+
+        assert!(err.contains("symbolic link"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "DO NOT MODIFY");
+        assert!(
+            std::fs::symlink_metadata(&lock)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn config_write_replaces_existing_file_atomically_preserving_extras_and_mode() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3623,12 +3736,19 @@ mod tests {
         let residue: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "config.json")
+            .filter(|name| name != "config.json" && name != ".config.json.lock")
             .collect();
         assert!(
             residue.is_empty(),
             "staging residue left behind: {:?}",
             residue
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join(".config.json.lock"))
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the persistent cross-process lock must be a regular file"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4101,6 +4221,37 @@ mod tests {
         std::fs::remove_file(&prefs).unwrap();
         mark_profile_exited_cleanly(dir.to_str().unwrap());
         assert!(!prefs.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_profile_exited_cleanly_does_not_follow_preplanted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_test_dir("profile_prefs_staging_symlink");
+        let default_dir = dir.join("Default");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let prefs = default_dir.join("Preferences");
+        let victim = dir.join("victim");
+        let staging = default_dir.join("Preferences.askbridge.tmp");
+
+        std::fs::write(&prefs, r#"{"profile":{"exit_type":"Crashed"},"keep":42}"#).unwrap();
+        std::fs::write(&victim, "DO NOT MODIFY").unwrap();
+        symlink(&victim, &staging).unwrap();
+
+        mark_profile_exited_cleanly(dir.to_str().unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "DO NOT MODIFY",
+            "the Preferences patch must not write through a preplanted staging symlink"
+        );
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(patched["profile"]["exit_type"], "Normal");
+        assert_eq!(patched["profile"]["exited_cleanly"], true);
 
         std::fs::remove_dir_all(&dir).ok();
     }
