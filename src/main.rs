@@ -1901,64 +1901,6 @@ const PORT_WAIT_ITERS: u32 = 200; // 20s
 /// still hidden.
 const HIDE_PID_WAIT_ITERS: u32 = 220; // 22s
 
-/// Rewrite a Chromium `Default/Preferences` JSON body so the next launch does not
-/// show the "didn't shut down correctly / restore pages?" bubble: force
-/// `profile.exit_type = "Normal"` and `profile.exited_cleanly = true`, preserving
-/// all other keys. Returns the serialized JSON, or `None` if `content` is not a
-/// JSON object (caller then leaves the file untouched).
-fn preferences_marked_clean(content: &str) -> Option<String> {
-    let mut root: serde_json::Value = serde_json::from_str(content).ok()?;
-    let obj = root.as_object_mut()?;
-    let profile = obj
-        .entry("profile")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let pobj = profile.as_object_mut()?;
-    pobj.insert(
-        "exit_type".to_string(),
-        serde_json::Value::String("Normal".to_string()),
-    );
-    pobj.insert("exited_cleanly".to_string(), serde_json::Value::Bool(true));
-    serde_json::to_string(&root).ok()
-}
-
-/// Patch `<profile>/Default/Preferences` in place so the crash-restore bubble is
-/// suppressed on the next launch. No-op if the file is missing (fresh profile) or
-/// not a JSON object. Only call when the ask-bridge browser is not running.
-fn mark_profile_exited_cleanly(profile_path: &str) {
-    let prefs = Path::new(profile_path).join("Default").join("Preferences");
-    let Ok(content) = std::fs::read_to_string(&prefs) else {
-        return;
-    };
-    if let Some(patched) = preferences_marked_clean(&content) {
-        // Stage with an unpredictable, exclusively-created name in the same
-        // directory. A fixed name lets another local process preplant a
-        // symlink and redirect this cosmetic write to an unrelated file.
-        let Some(parent) = prefs.parent() else {
-            return;
-        };
-        if let Ok(mut staged) = tempfile::Builder::new()
-            .prefix(".Preferences.askbridge.tmp.")
-            .tempfile_in(parent)
-        {
-            let staged_ok = staged
-                .write_all(patched.as_bytes())
-                .and_then(|()| staged.flush())
-                .and_then(|()| staged.as_file().sync_all())
-                .is_ok();
-            if staged_ok {
-                #[cfg(unix)]
-                if let Ok(metadata) = std::fs::metadata(&prefs) {
-                    let _ = staged.as_file().set_permissions(metadata.permissions());
-                }
-                // Same-directory persist is atomic. Errors stay ignored: this
-                // patch is cosmetic, and --hide-crash-restore-bubble is the
-                // primary launch-time mitigation.
-                let _ = staged.persist(&prefs);
-            }
-        }
-    }
-}
-
 fn start_chrome_if_needed(
     headless: bool,
     verbose: bool,
@@ -2056,13 +1998,10 @@ fn start_chrome_if_needed(
     };
     let _ = remove_chrome_pid_file();
 
-    // (B) Suppress the "didn't shut down correctly / restore?" bubble by forcing a
-    // clean exit_type in the profile before launch — deterministic regardless of
-    // how the previous instance died. Port 9223 is closed here, so normally no
-    // browser holds this profile; a just-killed instance could still be flushing
-    // its final write (accepted race: worst case the bubble is suppressed by the
-    // --hide-crash-restore-bubble flag instead, and the write itself is atomic).
-    mark_profile_exited_cleanly(&profile_path);
+    // Suppress the "didn't shut down correctly / restore?" bubble with the
+    // launch flag below. Do not rewrite Preferences here: a just-killed browser
+    // may still publish a newer file after port 9223 closes, and replacing that
+    // successor would lose unrelated settings.
 
     let mut args: Vec<String> = vec![
         "--remote-debugging-port=9223".to_string(),
@@ -2070,7 +2009,7 @@ fn start_chrome_if_needed(
         ASK_BRIDGE_CHROME_MARKER.to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
-        // (B) belt-and-suspenders alongside the Preferences patch.
+        // Suppress the crash-restore prompt without mutating Preferences.
         "--hide-crash-restore-bubble".to_string(),
     ];
     if headless {
@@ -3916,40 +3855,6 @@ mod tests {
     }
 
     #[test]
-    fn preferences_marked_clean_forces_normal_and_preserves_keys() {
-        let out = preferences_marked_clean(
-            r#"{"profile":{"exit_type":"Crashed","name":"Person 1"},"other":1}"#,
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["profile"]["exit_type"], "Normal");
-        assert_eq!(v["profile"]["exited_cleanly"], true);
-        assert_eq!(v["profile"]["name"], "Person 1"); // untouched key preserved
-        assert_eq!(v["other"], 1); // top-level key preserved
-    }
-
-    #[test]
-    fn preferences_marked_clean_creates_profile_and_rejects_non_object() {
-        let out = preferences_marked_clean("{}").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["profile"]["exit_type"], "Normal");
-        assert_eq!(v["profile"]["exited_cleanly"], true);
-
-        // Non-object (or invalid) bodies are left untouched (None).
-        assert!(preferences_marked_clean("[]").is_none());
-        assert!(preferences_marked_clean("\"hi\"").is_none());
-        assert!(preferences_marked_clean("not json").is_none());
-    }
-
-    #[test]
-    fn preferences_marked_clean_rejects_non_object_profile_value() {
-        // "profile" present but not an object: leave the file untouched rather
-        // than clobbering an unexpected structure.
-        assert!(preferences_marked_clean(r#"{"profile": 5}"#).is_none());
-        assert!(preferences_marked_clean(r#"{"profile": "x"}"#).is_none());
-    }
-
-    #[test]
     fn app_bundle_from_binary_is_case_insensitive() {
         // Consistent with resolve_browser_binary: the default macOS volume is
         // case-insensitive, so these all name a real bundle layout.
@@ -4193,67 +4098,6 @@ mod tests {
         // A slow-but-successful launch must still get hidden: the hide thread's
         // PID wait must outlast the main port wait.
         const { assert!(HIDE_PID_WAIT_ITERS >= PORT_WAIT_ITERS) };
-    }
-
-    #[test]
-    fn mark_profile_exited_cleanly_filesystem_behavior() {
-        let dir = make_test_dir("profile_prefs");
-        let default_dir = dir.join("Default");
-        std::fs::create_dir_all(&default_dir).unwrap();
-        let prefs = default_dir.join("Preferences");
-
-        // Real file: patched in place, other keys preserved, no tmp left behind.
-        std::fs::write(&prefs, r#"{"profile":{"exit_type":"Crashed"},"keep":42}"#).unwrap();
-        mark_profile_exited_cleanly(dir.to_str().unwrap());
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
-        assert_eq!(v["profile"]["exit_type"], "Normal");
-        assert_eq!(v["profile"]["exited_cleanly"], true);
-        assert_eq!(v["keep"], 42);
-        assert!(!default_dir.join("Preferences.askbridge.tmp").exists());
-
-        // Non-object body: left byte-for-byte untouched.
-        std::fs::write(&prefs, "[]").unwrap();
-        mark_profile_exited_cleanly(dir.to_str().unwrap());
-        assert_eq!(std::fs::read_to_string(&prefs).unwrap(), "[]");
-
-        // Missing file: no-op, nothing created.
-        std::fs::remove_file(&prefs).unwrap();
-        mark_profile_exited_cleanly(dir.to_str().unwrap());
-        assert!(!prefs.exists());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mark_profile_exited_cleanly_does_not_follow_preplanted_staging_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let dir = make_test_dir("profile_prefs_staging_symlink");
-        let default_dir = dir.join("Default");
-        std::fs::create_dir_all(&default_dir).unwrap();
-        let prefs = default_dir.join("Preferences");
-        let victim = dir.join("victim");
-        let staging = default_dir.join("Preferences.askbridge.tmp");
-
-        std::fs::write(&prefs, r#"{"profile":{"exit_type":"Crashed"},"keep":42}"#).unwrap();
-        std::fs::write(&victim, "DO NOT MODIFY").unwrap();
-        symlink(&victim, &staging).unwrap();
-
-        mark_profile_exited_cleanly(dir.to_str().unwrap());
-
-        assert_eq!(
-            std::fs::read_to_string(&victim).unwrap(),
-            "DO NOT MODIFY",
-            "the Preferences patch must not write through a preplanted staging symlink"
-        );
-        let patched: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
-        assert_eq!(patched["profile"]["exit_type"], "Normal");
-        assert_eq!(patched["profile"]["exited_cleanly"], true);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
