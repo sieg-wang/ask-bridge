@@ -3950,21 +3950,113 @@ mod tests {
 
         // A live process whose command line carries the ask-bridge marker is
         // still running as ask chrome: the bounded wait returns false.
-        let mut marked = std::process::Command::new("sh")
-            // Compound command: stops sh from exec-replacing itself with
-            // `sleep`, which would drop the marker from its argv.
-            .args(["-c", "sleep 30; :", "sh", "--ask-bridge-instance"])
-            .spawn()
-            .unwrap();
+        let mut marked = spawn_marked_ask_chrome_stub();
         let marked_pid = marked.id().to_string();
         let still_running = !wait_for_ask_chrome_pids_to_exit(
             std::slice::from_ref(&marked_pid),
             "/tmp/ask-bridge-test-profile",
             2,
         );
-        marked.kill().ok();
-        marked.wait().ok();
+        terminate_marked_ask_chrome_stub(&mut marked);
         assert!(still_running);
+    }
+
+    /// Spawns a stub process whose argv carries the ask-bridge marker, so the
+    /// real process probes classify it as a live ask chrome.
+    #[cfg(unix)]
+    fn spawn_marked_ask_chrome_stub() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        std::process::Command::new("sh")
+            // Compound command: stops sh from exec-replacing itself with
+            // `sleep`, which would drop the marker from its argv.
+            .args(["-c", "sleep 30; :", "sh", "--ask-bridge-instance"])
+            // Give the stub its own process group (pgid == its own pid) so
+            // teardown can signal the whole subtree without ever reaching a
+            // process this test did not spawn.
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Tears the stub down. `sh` forks `sleep`, so the whole subtree must die.
+    #[cfg(unix)]
+    fn terminate_marked_ask_chrome_stub(child: &mut std::process::Child) {
+        let pgid = child.id();
+        // `process_group(0)` above makes the stub its own group leader, so the
+        // group id equals its pid: signalling `-pgid` can only hit the stub and
+        // its descendants.
+        assert!(pgid > 1, "refusing to signal process group {pgid}");
+        std::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .status()
+            .ok();
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[cfg(unix)]
+    fn child_pids_of(parent: u32) -> Vec<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-eo", "pid=,ppid="])
+            .output()
+            .unwrap();
+        let parent = parent.to_string();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?;
+                let ppid = fields.next()?;
+                (ppid == parent).then(|| pid.to_string())
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marked_ask_chrome_stub_teardown_leaves_no_orphaned_descendants() {
+        // Regression: the stub's teardown used to signal only the direct `sh`
+        // child, orphaning the `sleep` it forked. Every `cargo test` run then
+        // leaked a live process onto the developer's (or CI's) machine.
+        let mut marked = spawn_marked_ask_chrome_stub();
+        let marked_pid = marked.id();
+
+        // Wait for `sh` to fork `sleep` so the subtree is fully formed.
+        let mut subtree = Vec::new();
+        for _ in 0..100 {
+            subtree = child_pids_of(marked_pid);
+            if !subtree.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !subtree.is_empty(),
+            "stub never forked a child, so this test cannot observe orphaning"
+        );
+
+        terminate_marked_ask_chrome_stub(&mut marked);
+
+        for pid in &subtree {
+            let mut gone = false;
+            for _ in 0..100 {
+                if process_is_alive(pid) == Some(false) {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                gone,
+                "teardown orphaned descendant pid {pid} of stub {marked_pid}"
+            );
+        }
+        assert_eq!(
+            process_is_alive(&marked_pid.to_string()),
+            Some(false),
+            "stub {marked_pid} itself survived teardown"
+        );
     }
 
     #[test]
