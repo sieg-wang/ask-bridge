@@ -1,5 +1,8 @@
+mod markdown_output;
+
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use markdown_output::MarkdownOutput;
 use mcp_cli::{McpClient, McpConnection, ServerConfig, StdioClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -660,8 +663,13 @@ struct Cli {
     verbose: bool,
 
     /// Write the final response in Markdown format to the specified file.
+    // Not a doc comment on purpose: clap prints those in `--help`, and this is
+    // a note to maintainers, not to users. Deliberately not an Option<String> —
+    // MarkdownOutput keeps the path private to `markdown_output`, so this field
+    // cannot be handed to a file-writing call anywhere in main.rs. See that
+    // module's header for what that does and does not guarantee.
     #[arg(long, short, value_name = "FILE")]
-    output: Option<String>,
+    output: Option<MarkdownOutput>,
 
     /// Write the downloaded images to the specified folder or file path.
     #[arg(long, short = 'i', value_name = "IMAGE_PATH")]
@@ -3118,6 +3126,13 @@ fn validate_provider_feature_support(provider: Provider, cli: &Cli) -> Result<()
 mod tests {
     use super::*;
 
+    /// Build the `--output` value a test wants to aim at. Goes through the same
+    /// `FromStr` clap uses, so tests exercise the real construction path and
+    /// still cannot read the path back out — the point of the type.
+    fn markdown_output_at(path: &std::path::Path) -> MarkdownOutput {
+        path.to_str().unwrap().parse().unwrap()
+    }
+
     #[test]
     fn validates_chrome_devtools_mcp_node_versions() {
         for version in [
@@ -5374,7 +5389,7 @@ mod tests {
 
         let code = finish_prompt_artifacts(
             "the assistant answer",
-            output.to_str(),
+            Some(&markdown_output_at(&output)),
             Some(1), // --image-output failed and the run must die
             false,
         );
@@ -5392,7 +5407,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("answer.md");
 
-        let code = finish_prompt_artifacts("the assistant answer", output.to_str(), None, false);
+        let code = finish_prompt_artifacts(
+            "the assistant answer",
+            Some(&markdown_output_at(&output)),
+            None,
+            false,
+        );
 
         assert_eq!(code, None);
         assert_eq!(
@@ -5415,7 +5435,12 @@ mod tests {
         std::fs::create_dir(&blocked).unwrap();
 
         // No image failure at all — the --output failure alone must kill the run.
-        let code = finish_prompt_artifacts("the assistant answer", blocked.to_str(), None, false);
+        let code = finish_prompt_artifacts(
+            "the assistant answer",
+            Some(&markdown_output_at(&blocked)),
+            None,
+            false,
+        );
 
         assert_eq!(
             code,
@@ -5437,29 +5462,118 @@ mod tests {
     }
 
     #[test]
-    fn every_output_file_write_goes_through_the_exit_code_wrapper() {
-        // Tripwire for a rebase, mirroring the --image-output one below. The
-        // --output contract lives in the same three command paths, and the bug
-        // this replaces was exactly one of them writing the file by hand and
-        // swallowing the error while the other two exited 1. Split literals
-        // keep this test from matching its own source text.
-        let source = include_str!("main.rs");
-        let raw = concat!("std::fs::write(", "output_path");
-        let wrapped = concat!("write_markdown_", "output(");
-        let call_sites = |needle: &str| {
-            source.matches(needle).count() - source.matches(&format!("fn {needle}")).count()
+    fn the_output_flag_still_parses_into_a_usable_destination() {
+        // The type clap parses --output into changed from String to
+        // MarkdownOutput to make the path unreachable outside its module. That
+        // is only worth anything if the flag still works, so: both spellings
+        // parse, and the parsed value still lands the file where the caller
+        // pointed. The path cannot be read back out for comparison — that is
+        // the whole design — so the file appearing is the assertion.
+        let dir = tempfile::tempdir().unwrap();
+        for flag in ["--output", "-o"] {
+            let requested = dir.path().join(format!("{}.md", flag.trim_matches('-')));
+            let cli =
+                Cli::try_parse_from(["ask-bridge", flag, requested.to_str().unwrap(), "a prompt"])
+                    .unwrap();
+
+            assert_eq!(
+                finish_prompt_artifacts("the assistant answer", cli.output.as_ref(), None, false),
+                None,
+                "{flag} must parse into a writable destination"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&requested).unwrap(),
+                "the assistant answer",
+                "{flag} must write the file the caller named"
+            );
+        }
+    }
+
+    #[test]
+    fn the_output_path_stays_private_to_its_module() {
+        // Scope of this test, stated so it is not mistaken for the guarantee:
+        //
+        // The guarantee that no code in main.rs can hand-write the --output
+        // destination is the compiler's. `MarkdownOutput` keeps the path
+        // private to `markdown_output`, so `std::fs::write(<the --output path>,
+        // ..)` in these 8000-odd lines does not compile whatever the author
+        // calls the variable. The round-1 version of this test grepped for
+        // `std::fs::write(output_path` and was evaded by renaming the variable;
+        // string matching cannot cover a bug class whose shape is the author's
+        // choice of identifier and file API.
+        //
+        // What is left for a test is the trusted region itself — the one file
+        // that is *allowed* to touch the path — plus the API it exposes, since
+        // adding a `Display`/`as_str`/`path()` there would silently hand the
+        // path back to main.rs and reopen everything. That check is lexical and
+        // that is the honest ceiling for a region defined by being permitted.
+        // Split literals keep the test from matching its own source text.
+        let trusted = include_str!("markdown_output.rs");
+        let write_call = concat!("std::fs::", "write(");
+
+        assert_eq!(
+            trusted.matches(write_call).count(),
+            1,
+            "markdown_output.rs is the whole trusted region; it may contain \
+             exactly one write of the --output file"
+        );
+        // A whitelist, not a blacklist: banning `as_str`, `Display` and friends
+        // by name is the same mistake as grepping for `output_path`, because the
+        // evasion is just a different name. Instead the module's *entire* public
+        // surface and trait-impl set is pinned, so anything new — an accessor
+        // called `destination`, a `Deref`, a `#[derive(Debug)]` — fails here and
+        // has to be argued for rather than slipped in.
+        let names = |lines: &str, prefix: &'static str| -> Vec<String> {
+            lines
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(prefix))
+                .map(|line| line.trim_end_matches(" {").to_string())
+                .collect()
         };
 
         assert_eq!(
-            source.matches(raw).count(),
-            1,
-            "--output may only be written inside {wrapped} — a hand-rolled write \
-             is how one path silently kept exiting 0 on a write failure"
+            names(trusted, "pub "),
+            [
+                "pub struct MarkdownOutput",
+                "pub fn write_if_requested(",
+                // Widening this list hands the path back to main.rs and voids
+                // the compiler-enforced guarantee; that is the decision being
+                // pinned, not the spelling.
+            ],
+            "unexpected public item in the trusted region"
         );
+        assert_eq!(
+            names(trusted, "impl "),
+            ["impl FromStr for MarkdownOutput"],
+            "a trait impl can leak the path as effectively as an accessor \
+             (Display, Deref, AsRef<Path>, Into<String>)"
+        );
+        assert_eq!(
+            names(trusted, "#[derive"),
+            ["#[derive(Clone)]"],
+            "Debug would print the path straight back out"
+        );
+    }
+
+    #[test]
+    fn every_command_path_still_writes_the_requested_output_file() {
+        // Complementary to the privacy guarantee, which only stops a path from
+        // writing --output *badly*. A rebase that drops the call from `get`
+        // altogether would make `--output` silently do nothing there, and the
+        // compiler is perfectly happy with that. Counting the call sites is the
+        // available guard: it is lexical, it only defends the three paths that
+        // exist today, and it cannot tell a real path from a decoy — but a
+        // dropped call is exactly the failure mode this fork's rebases produce.
+        // Split literals keep the test from matching its own source text.
+        let source = include_str!("main.rs");
+        let entry = concat!("markdown_output::", "write_if_requested(");
+        let call_sites = source.matches(entry).count();
+
         assert!(
-            call_sites(wrapped) >= 3,
-            "open <url>, get and the default prompt run each need the wrapper; found {}",
-            call_sites(wrapped)
+            call_sites >= 3,
+            "open <url>, get and the default prompt run must each still write \
+             --output; found {call_sites} call site(s)"
         );
     }
 
@@ -6303,42 +6417,6 @@ fn download_images_and_exit_code(
     }
 }
 
-/// Write the `--output` file, report a failure, and return the exit code the
-/// command must terminate with (`None` = carry on, including when no
-/// `--output` was asked for).
-///
-/// `--output` names a path the caller intends to read back, so a failed write
-/// leaves automation consuming a missing or stale file while the exit status
-/// says the answer is there — the same contract `--image-output` enforces for
-/// images.
-///
-/// The only supported way to write that file: the contract has to hold on all
-/// three command paths (`open <url>`, `get`, and the default prompt run), and
-/// this fork is rebased onto upstream repeatedly. One wrapper means a rebase
-/// cannot leave the check on two paths and drop it from the third — the
-/// structural test in this module enforces that. A hand-rolled write on the
-/// prompt path is exactly how that path kept exiting 0 on a write failure while
-/// the other two exited 1.
-///
-/// The exit code is returned rather than taken here so callers can finish
-/// writing the artifacts they already promised before dying.
-fn write_markdown_output(output_path: Option<&str>, markdown: &str, verbose: bool) -> Option<i32> {
-    let output_path = output_path?;
-    match std::fs::write(output_path, markdown) {
-        Ok(()) => {
-            if verbose {
-                println!("Successfully wrote Markdown response to {}", output_path);
-            }
-            None
-        }
-        Err(e) => {
-            eprintln!("Error writing output file: {}", e);
-            // 1 is the code every other fatal path in this CLI uses.
-            Some(1)
-        }
-    }
-}
-
 /// Write the Markdown artifacts a prompt run promised, then hand back whichever
 /// failure must end the run.
 ///
@@ -6348,11 +6426,11 @@ fn write_markdown_output(output_path: Option<&str>, markdown: &str, verbose: boo
 /// before touching images; this keeps the default prompt path in line.
 fn finish_prompt_artifacts(
     markdown: &str,
-    output_path: Option<&str>,
+    output: Option<&MarkdownOutput>,
     image_exit_code: Option<i32>,
     verbose: bool,
 ) -> Option<i32> {
-    write_markdown_output(output_path, markdown, verbose).or(image_exit_code)
+    markdown_output::write_if_requested(output, markdown, verbose).or(image_exit_code)
 }
 
 /// Decode the scanned images and write them out, honouring an explicit
@@ -8278,8 +8356,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match copy_latest_markdown(&config_path, page_provider) {
                         Ok(markdown) => {
-                            if let Some(code) = write_markdown_output(
-                                cli.output.as_deref(),
+                            if let Some(code) = markdown_output::write_if_requested(
+                                cli.output.as_ref(),
                                 &markdown,
                                 command_verbose,
                             ) {
@@ -8347,9 +8425,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match copy_latest_markdown(&config_path, page_provider) {
                     Ok(markdown) => {
-                        if let Some(code) =
-                            write_markdown_output(cli.output.as_deref(), &markdown, command_verbose)
-                        {
+                        if let Some(code) = markdown_output::write_if_requested(
+                            cli.output.as_ref(),
+                            &markdown,
+                            command_verbose,
+                        ) {
                             std::process::exit(code);
                         }
                         if let Err(e) = render_markdown(&markdown, use_glow) {
@@ -8810,7 +8890,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(code) = finish_prompt_artifacts(
         &last_markdown,
-        cli.output.as_deref(),
+        cli.output.as_ref(),
         image_exit_code,
         command_verbose,
     ) {
