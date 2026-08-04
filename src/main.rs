@@ -5280,6 +5280,87 @@ mod tests {
 
         assert_eq!(owner, None);
     }
+
+    /// Smallest valid PNG, standing in for an image the page generated.
+    const STUB_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn stub_generated_images(count: usize) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "src": format!("https://example.invalid/generated-{}.png", index),
+                    "alt": "",
+                    "dataUrl": STUB_PNG_DATA_URL,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn explicit_image_output_that_cannot_be_written_produces_no_artifact() {
+        // A caller that passed --image-output is going to read that path next.
+        // Prove the save really fails and really leaves nothing behind, so the
+        // exit-code contract below is guarding a genuinely missing file rather
+        // than a cosmetic error message.
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where a parent directory would have to be: no user,
+        // root included, can create a directory underneath it.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"regular file").unwrap();
+        let requested = blocker.join("shot.png");
+
+        let error = save_generated_images(&stub_generated_images(1), requested.to_str())
+            .expect_err("an unwritable --image-output destination must not report success");
+
+        assert!(
+            error.contains("not-a-directory"),
+            "error should name the destination that failed: {error}"
+        );
+        assert!(
+            !requested.exists(),
+            "no artifact should exist at the requested path"
+        );
+    }
+
+    #[test]
+    fn image_download_failure_is_fatal_only_when_the_caller_named_the_path() {
+        // --image-output is a promise of a file at a caller-chosen path.
+        // Reporting success while that file is missing makes automation read a
+        // stale or absent artifact as the answer, so the failure must be fatal.
+        assert_eq!(
+            image_download_failure_exit_code(Some("/tmp/ask-bridge-test/shot.png")),
+            Some(1)
+        );
+        assert_eq!(image_download_failure_exit_code(Some("out/")), Some(1));
+        // 1 is the code every other fatal path in this CLI uses. Anything in
+        // the 124..=125 range would collide with `timeout(1)`'s convention,
+        // which callers legitimately retry as a flake.
+        assert_eq!(image_download_failure_exit_code(Some("x.png")), Some(1));
+
+        // Without the flag the download is a best-effort extra into target/;
+        // the answer itself already printed, so the run is still a success.
+        // This is upstream behaviour — do not "fix" it into a hard failure.
+        assert_eq!(image_download_failure_exit_code(None), None);
+    }
+
+    #[test]
+    fn writable_explicit_image_output_still_saves_every_image() {
+        // Positive control: the fatal path above must not be reachable when the
+        // destination works, otherwise the fix would break normal image runs.
+        let dir = tempfile::tempdir().unwrap();
+        let requested = dir.path().join("nested").join("shot.png");
+
+        save_generated_images(&stub_generated_images(2), requested.to_str())
+            .expect("a writable destination should save every image");
+
+        let saved: Vec<_> = std::fs::read_dir(dir.path().join("nested"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(saved.contains(&"shot_1.png".to_string()), "{saved:?}");
+        assert!(saved.contains(&"shot_2.png".to_string()), "{saved:?}");
+    }
 }
 
 fn read_clipboard() -> Result<String, String> {
@@ -5914,6 +5995,27 @@ fn download_images_from_latest_message(
         return Ok(());
     }
 
+    save_generated_images(images, image_output)
+}
+
+/// Exit code a command must terminate with after an image download failed, or
+/// `None` to carry on.
+///
+/// `--image-output` names a path the caller intends to read back, so a failed
+/// download leaves automation consuming a missing or stale file while the exit
+/// status says the artifact is there — the same contract `--output` already
+/// enforces for the Markdown file. Without the flag the download is a
+/// best-effort extra into `target/`; the answer itself has already been
+/// printed, so the run still succeeded and stays exit 0 (upstream behaviour).
+fn image_download_failure_exit_code(image_output: Option<&str>) -> Option<i32> {
+    image_output.map(|_| 1)
+}
+
+/// Decode the scanned images and write them out, honouring an explicit
+/// `--image-output` destination. Split out of the browser-driven scan above so
+/// the destination handling — the part a caller's automation depends on — is
+/// reachable without a browser.
+fn save_generated_images(images: &[Value], image_output: Option<&str>) -> Result<(), String> {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -7849,6 +7951,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 command_verbose,
                             ) {
                                 eprintln!("Error downloading images: {}", e);
+                                if let Some(code) =
+                                    image_download_failure_exit_code(cli.image_output.as_deref())
+                                {
+                                    std::process::exit(code);
+                                }
                             }
                         }
                         Err(e) => {
@@ -7917,6 +8024,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             command_verbose,
                         ) {
                             eprintln!("Error downloading images: {}", e);
+                            if let Some(code) =
+                                image_download_failure_exit_code(cli.image_output.as_deref())
+                            {
+                                std::process::exit(code);
+                            }
                         }
                     }
                     Err(e) => {
@@ -8330,16 +8442,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error rendering Markdown: {}", e);
     }
 
-    if finished {
-        let _ = download_images_from_latest_message(
+    if finished
+        && let Err(e) = download_images_from_latest_message(
             &config_path,
             provider,
             cli.image_output.as_deref(),
             command_verbose,
         )
-        .map_err(|e| {
-            eprintln!("Error downloading images: {}", e);
-        });
+    {
+        eprintln!("Error downloading images: {}", e);
+        if let Some(code) = image_download_failure_exit_code(cli.image_output.as_deref()) {
+            std::process::exit(code);
+        }
     }
 
     // Print the URL link of the current conversation thread
