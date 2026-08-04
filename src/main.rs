@@ -5490,6 +5490,66 @@ mod tests {
     }
 
     #[test]
+    fn an_output_failure_outranks_an_image_failure_in_the_exit_code() {
+        // A process has one exit status and both artifacts can fail in the same
+        // run, so one code has to lose. That is a decision, not a side effect of
+        // whichever combinator got typed: --output carries the answer, images
+        // are attachments, so --output wins and the image code is dropped. Both
+        // failures still print their own stderr line, so nothing is lost that
+        // the exit code was carrying.
+        //
+        // The image code here is synthetic (99 is not a code this CLI produces)
+        // precisely so the assertion can see which side won — with the real 1
+        // on both sides the precedence is invisible.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("answer.md");
+        std::fs::create_dir(&blocked).unwrap();
+
+        let code = finish_prompt_artifacts(
+            "the assistant answer",
+            Some(&markdown_output_at(&blocked)),
+            Some(99),
+            false,
+        );
+
+        assert_eq!(
+            code,
+            Some(1),
+            "when both artifacts fail the exit code must report the --output failure"
+        );
+    }
+
+    #[test]
+    fn both_fatal_artifact_paths_still_use_exit_code_one() {
+        // The precedence above is unobservable in production only because both
+        // producers return exactly 1. This pins that premise: if either path
+        // ever gains a distinctive code, the masking becomes real and this test
+        // fails, forcing the precedence to be re-decided instead of inherited.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("answer.md");
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert_eq!(
+            // Reached through finish_prompt_artifacts with no image failure, so
+            // this file never spells the entry point's name outside production
+            // code — the call-site tripwire below counts those occurrences.
+            finish_prompt_artifacts(
+                "the assistant answer",
+                Some(&markdown_output_at(&blocked)),
+                None,
+                false
+            ),
+            Some(1),
+            "a failed --output write is exit 1"
+        );
+        assert_eq!(
+            image_download_failure_exit_code(Some("shot.png")),
+            Some(1),
+            "a failed --image-output download is exit 1"
+        );
+    }
+
+    #[test]
     fn the_output_path_stays_private_to_its_module() {
         // Scope of this test, stated so it is not mistaken for the guarantee:
         //
@@ -6420,10 +6480,24 @@ fn download_images_and_exit_code(
 /// Write the Markdown artifacts a prompt run promised, then hand back whichever
 /// failure must end the run.
 ///
-/// Ordering is the point: a failed `--image-output` must not also cost the
+/// Ordering of the *work*: a failed `--image-output` must not also cost the
 /// caller the `--output` file, which is why the write happens here and the
 /// process exit is left to the caller. `open`/`get` already write `--output`
 /// before touching images; this keeps the default prompt path in line.
+///
+/// Ordering of the *exit code* is a separate, deliberate decision, because a
+/// process has one exit status and both artifacts can fail in the same run.
+/// `--output` carries the command's actual product — the answer — while
+/// `--image-output` carries attachments, so when both fail the exit code
+/// reports the `--output` failure and the image code is dropped. Nothing is
+/// lost by that: both failures print their own line to stderr regardless, so
+/// the exit code only has to answer "did every promised artifact arrive?".
+///
+/// Today the choice is unobservable, because both producers return exactly 1 —
+/// `image_download_failure_exit_code` and `markdown_output::write_if_requested`
+/// are pinned to that by `both_fatal_artifact_paths_still_use_exit_code_one`.
+/// If either ever gains a distinctive code, that test fails and this precedence
+/// must be re-decided rather than inherited.
 fn finish_prompt_artifacts(
     markdown: &str,
     output: Option<&MarkdownOutput>,
