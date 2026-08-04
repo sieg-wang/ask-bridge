@@ -5362,6 +5362,73 @@ mod tests {
         assert!(saved.contains(&"shot_2.png".to_string()), "{saved:?}");
     }
 
+    #[test]
+    fn a_fatal_image_failure_still_writes_the_requested_output_file() {
+        // Regression: the default prompt path used to exit on the image
+        // failure *before* writing --output, so
+        // `ask --output a.md --image-output b.png '...'` produced neither file.
+        // --output is its own promise; losing it because a second artifact
+        // failed is strictly worse than the bug we set out to fix.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("answer.md");
+
+        let code = finish_prompt_artifacts(
+            "the assistant answer",
+            output.to_str(),
+            Some(1), // --image-output failed and the run must die
+            false,
+        );
+
+        assert_eq!(code, Some(1), "the image failure must still be fatal");
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "the assistant answer",
+            "--output must be written before the image failure ends the run"
+        );
+    }
+
+    #[test]
+    fn a_successful_run_writes_output_and_reports_no_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("answer.md");
+
+        let code = finish_prompt_artifacts("the assistant answer", output.to_str(), None, false);
+
+        assert_eq!(code, None);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "the assistant answer"
+        );
+    }
+
+    #[test]
+    fn every_image_download_goes_through_the_exit_code_wrapper() {
+        // Tripwire for a rebase. The --image-output contract lives in three
+        // separate command paths, and a rebase onto upstream that drops the
+        // wrapper from just one of them restores the silent-success bug while
+        // every behavioural test, `cargo fmt --check` and
+        // `cargo clippy -D warnings` all stay green. Split literals keep this
+        // test from matching its own source text.
+        let source = include_str!("main.rs");
+        let raw = concat!("download_images_", "from_latest_message(");
+        let wrapped = concat!("download_images_", "and_exit_code(");
+        let call_sites = |needle: &str| {
+            source.matches(needle).count() - source.matches(&format!("fn {needle}")).count()
+        };
+
+        assert_eq!(
+            call_sites(raw),
+            1,
+            "the unguarded downloader may only be called by {wrapped} — a direct \
+             call bypasses the --image-output exit-code contract"
+        );
+        assert!(
+            call_sites(wrapped) >= 3,
+            "open <url>, get and the default prompt run each need the wrapper; found {}",
+            call_sites(wrapped)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn response_scratch_file_never_follows_a_preplanted_symlink() {
@@ -6116,6 +6183,55 @@ fn download_images_from_latest_message(
 /// printed, so the run still succeeded and stays exit 0 (upstream behaviour).
 fn image_download_failure_exit_code(image_output: Option<&str>) -> Option<i32> {
     image_output.map(|_| 1)
+}
+
+/// Download any generated images, report a failure, and return the exit code
+/// the command must terminate with (`None` = carry on).
+///
+/// The only supported way to reach the downloader: the `--image-output`
+/// contract has to hold on all three command paths (`open <url>`, `get`, and
+/// the default prompt run), and this fork is rebased onto upstream repeatedly.
+/// One wrapper means a rebase cannot leave the check on two paths and drop it
+/// from the third — the structural test in this module enforces that.
+///
+/// The exit code is returned rather than taken here so callers can finish
+/// writing the artifacts they already promised (`--output`) before dying.
+fn download_images_and_exit_code(
+    config_path: &str,
+    provider: Provider,
+    image_output: Option<&str>,
+    verbose: bool,
+) -> Option<i32> {
+    match download_images_from_latest_message(config_path, provider, image_output, verbose) {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("Error downloading images: {}", e);
+            image_download_failure_exit_code(image_output)
+        }
+    }
+}
+
+/// Write the Markdown artifacts a prompt run promised, then hand back the
+/// pending image exit code.
+///
+/// Ordering is the point: a failed `--image-output` must not also cost the
+/// caller the `--output` file, which is why the write happens here and the
+/// process exit is left to the caller. `open`/`get` already write `--output`
+/// before touching images; this keeps the default prompt path in line.
+fn finish_prompt_artifacts(
+    markdown: &str,
+    output_path: Option<&str>,
+    image_exit_code: Option<i32>,
+    verbose: bool,
+) -> Option<i32> {
+    if let Some(output_path) = output_path {
+        if let Err(e) = std::fs::write(output_path, markdown) {
+            eprintln!("Error writing output file: {}", e);
+        } else if verbose {
+            println!("Successfully wrote Markdown response to {}", output_path);
+        }
+    }
+    image_exit_code
 }
 
 /// Decode the scanned images and write them out, honouring an explicit
@@ -8051,18 +8167,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error rendering Markdown: {}", e);
                                 std::process::exit(1);
                             }
-                            if let Err(e) = download_images_from_latest_message(
+                            if let Some(code) = download_images_and_exit_code(
                                 &config_path,
                                 page_provider,
                                 cli.image_output.as_deref(),
                                 command_verbose,
                             ) {
-                                eprintln!("Error downloading images: {}", e);
-                                if let Some(code) =
-                                    image_download_failure_exit_code(cli.image_output.as_deref())
-                                {
-                                    std::process::exit(code);
-                                }
+                                std::process::exit(code);
                             }
                         }
                         Err(e) => {
@@ -8124,18 +8235,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Error rendering Markdown: {}", e);
                             std::process::exit(1);
                         }
-                        if let Err(e) = download_images_from_latest_message(
+                        if let Some(code) = download_images_and_exit_code(
                             &config_path,
                             page_provider,
                             cli.image_output.as_deref(),
                             command_verbose,
                         ) {
-                            eprintln!("Error downloading images: {}", e);
-                            if let Some(code) =
-                                image_download_failure_exit_code(cli.image_output.as_deref())
-                            {
-                                std::process::exit(code);
-                            }
+                            std::process::exit(code);
                         }
                     }
                     Err(e) => {
@@ -8549,18 +8655,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error rendering Markdown: {}", e);
     }
 
-    if finished
-        && let Err(e) = download_images_from_latest_message(
+    // Held, not acted on: the Thread Link and the `--output` file below were
+    // already promised to the caller and must still be produced.
+    let mut image_exit_code = None;
+    if finished {
+        image_exit_code = download_images_and_exit_code(
             &config_path,
             provider,
             cli.image_output.as_deref(),
             command_verbose,
-        )
-    {
-        eprintln!("Error downloading images: {}", e);
-        if let Some(code) = image_download_failure_exit_code(cli.image_output.as_deref()) {
-            std::process::exit(code);
-        }
+        );
     }
 
     // Print the URL link of the current conversation thread
@@ -8583,12 +8687,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(ref output_path) = cli.output {
-        if let Err(e) = std::fs::write(output_path, &last_markdown) {
-            eprintln!("Error writing output file: {}", e);
-        } else if command_verbose {
-            println!("Successfully wrote Markdown response to {}", output_path);
-        }
+    if let Some(code) = finish_prompt_artifacts(
+        &last_markdown,
+        cli.output.as_deref(),
+        image_exit_code,
+        command_verbose,
+    ) {
+        std::process::exit(code);
     }
 
     Ok(())
