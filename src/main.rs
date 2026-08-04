@@ -5402,6 +5402,68 @@ mod tests {
     }
 
     #[test]
+    fn an_unwritable_output_file_is_fatal_on_its_own() {
+        // --output is a promise of a file at a caller-chosen path, exactly like
+        // --image-output. The prompt path used to print the write error and
+        // still exit 0, so automation read a missing or stale answer file as a
+        // success. `open`/`get` have always exited 1 here; this is the third
+        // path catching up.
+        let dir = tempfile::tempdir().unwrap();
+        // A directory standing where the file was promised: std::fs::write can
+        // never succeed against it, on any platform.
+        let blocked = dir.path().join("answer.md");
+        std::fs::create_dir(&blocked).unwrap();
+
+        // No image failure at all — the --output failure alone must kill the run.
+        let code = finish_prompt_artifacts("the assistant answer", blocked.to_str(), None, false);
+
+        assert_eq!(
+            code,
+            Some(1),
+            "a failed --output write must fail the command"
+        );
+    }
+
+    #[test]
+    fn a_run_without_output_never_invents_a_failure() {
+        // Positive control for the test above: without --output there is no
+        // file promise to break, so the run must stay exit 0. A wrapper that
+        // fires on the None case would turn every plain `ask '...'` into a
+        // failure.
+        assert_eq!(
+            finish_prompt_artifacts("the assistant answer", None, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn every_output_file_write_goes_through_the_exit_code_wrapper() {
+        // Tripwire for a rebase, mirroring the --image-output one below. The
+        // --output contract lives in the same three command paths, and the bug
+        // this replaces was exactly one of them writing the file by hand and
+        // swallowing the error while the other two exited 1. Split literals
+        // keep this test from matching its own source text.
+        let source = include_str!("main.rs");
+        let raw = concat!("std::fs::write(", "output_path");
+        let wrapped = concat!("write_markdown_", "output(");
+        let call_sites = |needle: &str| {
+            source.matches(needle).count() - source.matches(&format!("fn {needle}")).count()
+        };
+
+        assert_eq!(
+            source.matches(raw).count(),
+            1,
+            "--output may only be written inside {wrapped} — a hand-rolled write \
+             is how one path silently kept exiting 0 on a write failure"
+        );
+        assert!(
+            call_sites(wrapped) >= 3,
+            "open <url>, get and the default prompt run each need the wrapper; found {}",
+            call_sites(wrapped)
+        );
+    }
+
+    #[test]
     fn every_image_download_goes_through_the_exit_code_wrapper() {
         // Tripwire for a rebase. The --image-output contract lives in three
         // separate command paths, and a rebase onto upstream that drops the
@@ -6241,8 +6303,44 @@ fn download_images_and_exit_code(
     }
 }
 
-/// Write the Markdown artifacts a prompt run promised, then hand back the
-/// pending image exit code.
+/// Write the `--output` file, report a failure, and return the exit code the
+/// command must terminate with (`None` = carry on, including when no
+/// `--output` was asked for).
+///
+/// `--output` names a path the caller intends to read back, so a failed write
+/// leaves automation consuming a missing or stale file while the exit status
+/// says the answer is there — the same contract `--image-output` enforces for
+/// images.
+///
+/// The only supported way to write that file: the contract has to hold on all
+/// three command paths (`open <url>`, `get`, and the default prompt run), and
+/// this fork is rebased onto upstream repeatedly. One wrapper means a rebase
+/// cannot leave the check on two paths and drop it from the third — the
+/// structural test in this module enforces that. A hand-rolled write on the
+/// prompt path is exactly how that path kept exiting 0 on a write failure while
+/// the other two exited 1.
+///
+/// The exit code is returned rather than taken here so callers can finish
+/// writing the artifacts they already promised before dying.
+fn write_markdown_output(output_path: Option<&str>, markdown: &str, verbose: bool) -> Option<i32> {
+    let output_path = output_path?;
+    match std::fs::write(output_path, markdown) {
+        Ok(()) => {
+            if verbose {
+                println!("Successfully wrote Markdown response to {}", output_path);
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("Error writing output file: {}", e);
+            // 1 is the code every other fatal path in this CLI uses.
+            Some(1)
+        }
+    }
+}
+
+/// Write the Markdown artifacts a prompt run promised, then hand back whichever
+/// failure must end the run.
 ///
 /// Ordering is the point: a failed `--image-output` must not also cost the
 /// caller the `--output` file, which is why the write happens here and the
@@ -6254,14 +6352,7 @@ fn finish_prompt_artifacts(
     image_exit_code: Option<i32>,
     verbose: bool,
 ) -> Option<i32> {
-    if let Some(output_path) = output_path {
-        if let Err(e) = std::fs::write(output_path, markdown) {
-            eprintln!("Error writing output file: {}", e);
-        } else if verbose {
-            println!("Successfully wrote Markdown response to {}", output_path);
-        }
-    }
-    image_exit_code
+    write_markdown_output(output_path, markdown, verbose).or(image_exit_code)
 }
 
 /// Decode the scanned images and write them out, honouring an explicit
@@ -8187,11 +8278,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match copy_latest_markdown(&config_path, page_provider) {
                         Ok(markdown) => {
-                            if let Some(ref output_path) = cli.output {
-                                let _ = std::fs::write(output_path, &markdown).map_err(|e| {
-                                    eprintln!("Error writing output file: {}", e);
-                                    std::process::exit(1);
-                                });
+                            if let Some(code) = write_markdown_output(
+                                cli.output.as_deref(),
+                                &markdown,
+                                command_verbose,
+                            ) {
+                                std::process::exit(code);
                             }
                             if let Err(e) = render_markdown(&markdown, use_glow) {
                                 eprintln!("Error rendering Markdown: {}", e);
@@ -8255,11 +8347,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match copy_latest_markdown(&config_path, page_provider) {
                     Ok(markdown) => {
-                        if let Some(ref output_path) = cli.output {
-                            let _ = std::fs::write(output_path, &markdown).map_err(|e| {
-                                eprintln!("Error writing output file: {}", e);
-                                std::process::exit(1);
-                            });
+                        if let Some(code) =
+                            write_markdown_output(cli.output.as_deref(), &markdown, command_verbose)
+                        {
+                            std::process::exit(code);
                         }
                         if let Err(e) = render_markdown(&markdown, use_glow) {
                             eprintln!("Error rendering Markdown: {}", e);
