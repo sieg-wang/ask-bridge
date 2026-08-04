@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { mkdtempSync, writeFileSync } = require('node:fs');
+const { existsSync, mkdtempSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
@@ -35,13 +35,35 @@ test('formats artifact names and release URLs', () => {
   assert.equal(releaseBaseUrl('1.2.3'), 'https://github.com/doggy8088/ask-bridge/releases/download/v1.2.3');
 });
 
-test('verifies sha256 checksums', () => {
+// Recorded by the checksum test below so the next test can prove the fixture
+// was removed. `node --test` runs the tests in this file in declaration order,
+// and an `after` hook completes before the following test starts.
+let checksumFixtureDir;
+
+test('verifies sha256 checksums', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'ask-bridge-'));
+  checksumFixtureDir = dir;
+  // Runs even when the assertions below throw, so a failing run leaks nothing.
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, 'sample.txt');
   writeFileSync(file, 'hello');
   const digest = sha256(file);
   verifyChecksum(file, `${digest}  sample.txt`);
   assert.throws(() => verifyChecksum(file, '0'.repeat(64)), /Checksum mismatch/);
+});
+
+test('the checksum fixture never outlives its test', () => {
+  // `npm test` runs on every install and in CI; a fixture directory per run
+  // accumulates in the shared temp directory forever.
+  assert.ok(
+    checksumFixtureDir,
+    'the checksum test must run first and record its fixture directory'
+  );
+  assert.equal(
+    existsSync(checksumFixtureDir),
+    false,
+    `checksum fixture ${checksumFixtureDir} survived the test run`
+  );
 });
 
 test('verifies native binary formats before installation', () => {
