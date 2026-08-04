@@ -5472,10 +5472,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn response_scratch_file_is_unguessable_exclusive_and_owner_only() {
+    fn response_scratch_file_is_unguessable_and_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
+        // Something the constructor must leave strictly alone.
+        std::fs::write(dir.path().join("decoy.md"), b"PRE-EXISTING").unwrap();
+
         let first = create_response_scratch_file(dir.path()).unwrap();
         let second = create_response_scratch_file(dir.path()).unwrap();
 
@@ -5502,16 +5505,43 @@ mod tests {
             );
         }
 
-        // Created O_EXCL, so it refuses to reuse anything already at the path:
-        // re-creating over an existing name is an error, never a silent open.
-        let taken = dir.path().join("taken.md");
-        std::fs::write(&taken, b"existing").unwrap();
+        // Creating the scratch file must never disturb what is already in the
+        // directory — no reuse, no truncation, no writing through a link.
         assert!(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&taken)
-                .is_err()
+            std::fs::symlink_metadata(first.path())
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the scratch file must be a real file, never a link to one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("decoy.md")).unwrap(),
+            "PRE-EXISTING"
+        );
+        assert_eq!(std::fs::metadata(first.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn response_scratch_file_is_created_exclusively() {
+        // O_EXCL is not observable from outside `create_response_scratch_file`:
+        // the name is random by design, so a test cannot pre-plant anything at
+        // the path the call will pick, and `tempfile` retries on collision
+        // rather than failing. Pin the implementation instead — a hand-rolled
+        // `File::create` / `OpenOptions::create(true)` passes every behavioural
+        // test above while silently reintroducing follow-and-truncate.
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once(concat!("fn create_response_", "scratch_file("))
+            .expect("the scratch-file constructor should exist")
+            .1
+            .split_once("\n}\n")
+            .expect("the constructor should have a body")
+            .0;
+
+        assert!(
+            body.contains("tempfile::Builder::new()") && body.contains(".tempfile_in("),
+            "the scratch file must come from tempfile's exclusive-create builder \
+             (O_CREAT|O_EXCL, 0600); found:\n{body}"
         );
     }
 }
