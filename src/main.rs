@@ -5361,6 +5361,92 @@ mod tests {
         assert!(saved.contains(&"shot_1.png".to_string()), "{saved:?}");
         assert!(saved.contains(&"shot_2.png".to_string()), "{saved:?}");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_scratch_file_never_follows_a_preplanted_symlink() {
+        // The scratch path used to be `ask_chatgpt_<pid>.md` in TMPDIR — a name
+        // anything running as this user (or any user, in a shared/sticky
+        // TMPDIR) can compute. `std::fs::write` follows symlinks, so a link
+        // planted at that name turns the round-trip into an arbitrary
+        // overwrite of a file the user owns.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("precious.txt");
+        std::fs::write(&sentinel, "DO NOT MODIFY").unwrap();
+        let guessable = dir
+            .path()
+            .join(format!("ask_chatgpt_{}.md", std::process::id()));
+        std::os::unix::fs::symlink(&sentinel, &guessable).unwrap();
+
+        let verified = roundtrip_response_via_temp_file(dir.path(), "assistant response").unwrap();
+
+        assert_eq!(verified, "assistant response");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "DO NOT MODIFY",
+            "the round-trip wrote through a pre-planted symlink"
+        );
+
+        // The scratch file holds the whole response, so it must not outlive the
+        // round-trip; only the fixtures planted above may remain.
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                format!("ask_chatgpt_{}.md", std::process::id()),
+                "precious.txt".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_scratch_file_is_unguessable_exclusive_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = create_response_scratch_file(dir.path()).unwrap();
+        let second = create_response_scratch_file(dir.path()).unwrap();
+
+        // Randomised: two scratch files in the same directory never collide, so
+        // nothing derives from the PID and no name can be planted in advance.
+        assert_ne!(first.path(), second.path());
+        let guessable = format!("ask_chatgpt_{}.md", std::process::id());
+        for scratch in [&first, &second] {
+            assert_ne!(
+                scratch.path().file_name().unwrap().to_string_lossy(),
+                guessable.as_str()
+            );
+            // 0600: the scratch file holds the full assistant response, which
+            // must not be readable by other users of a shared temp directory.
+            let mode = std::fs::metadata(scratch.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "scratch file {:?} is not owner-only",
+                scratch.path()
+            );
+        }
+
+        // Created O_EXCL, so it refuses to reuse anything already at the path:
+        // re-creating over an existing name is an error, never a silent open.
+        let taken = dir.path().join("taken.md");
+        std::fs::write(&taken, b"existing").unwrap();
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&taken)
+                .is_err()
+        );
+    }
 }
 
 fn read_clipboard() -> Result<String, String> {
@@ -5670,20 +5756,41 @@ fn copy_latest_markdown_via_clipboard(
     let content = copied_content
         .ok_or_else(|| "Timed out waiting for clipboard content after clicking copy".to_string())?;
 
-    // Create a temporary file path
-    let temp_path = std::env::temp_dir().join(format!("ask_chatgpt_{}.md", std::process::id()));
+    roundtrip_response_via_temp_file(&std::env::temp_dir(), &content)
+}
+
+/// Create the scratch file the copied response is round-tripped through.
+///
+/// Randomised name + `O_EXCL` + 0600 instead of the old fixed
+/// `ask_chatgpt_<pid>.md`: that name is computable by anyone, and
+/// `std::fs::write` follows symlinks, so a link planted at it in a shared or
+/// sticky `TMPDIR` (or by any process running as this user) redirected the
+/// write onto an arbitrary file the user could write. The exclusive create
+/// also refuses to reuse whatever is already sitting at the path, and 0600
+/// keeps the response body out of other users' reach.
+fn create_response_scratch_file(dir: &Path) -> Result<tempfile::NamedTempFile, String> {
+    tempfile::Builder::new()
+        .prefix(".ask_chatgpt.")
+        .suffix(".md")
+        .tempfile_in(dir)
+        .map_err(|e| format!("Failed to create temporary file: {}", e))
+}
+
+/// Write the copied response to a scratch file and read it back, then remove it.
+fn roundtrip_response_via_temp_file(dir: &Path, content: &str) -> Result<String, String> {
+    let mut scratch = create_response_scratch_file(dir)?;
 
     // Write the copied content immediately to the temporary file
-    std::fs::write(&temp_path, &content)
+    scratch
+        .write_all(content.as_bytes())
+        .and_then(|()| scratch.flush())
         .map_err(|e| format!("Failed to write to temporary file: {}", e))?;
 
     // Read the content back from the temporary file to output to the terminal
-    let verified_content = std::fs::read_to_string(&temp_path)
+    let verified_content = std::fs::read_to_string(scratch.path())
         .map_err(|e| format!("Failed to read from temporary file: {}", e))?;
 
-    // Clean up temporary file
-    let _ = std::fs::remove_file(&temp_path);
-
+    // Clean up temporary file (NamedTempFile removes it on drop)
     Ok(verified_content)
 }
 
