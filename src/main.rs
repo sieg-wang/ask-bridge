@@ -1490,23 +1490,32 @@ fn host_is_within(host: &str, root: &str) -> bool {
     }
 }
 
-/// Auth hosts that serve more than one destination, so reaching one says
-/// nothing about *whose* login it is.
+/// Whether `host` serves exactly one destination, so that arriving at it is
+/// itself proof of whose login it is.
+///
+/// `true` means the host alone authorises disposal. `false` means "not vetted,
+/// treat as shared infrastructure" and the caller must check the destination --
+/// so the default for anything unlisted is the safe one. The inverse spelling
+/// (enumerate the *shared* hosts, let everything else through on the host
+/// alone) fails open at the extension point: any host that enters some
+/// provider's [`Provider::auth_hosts`] without also being added here would
+/// silently inherit the host-only rule and start closing strangers' tabs. That
+/// covers more than a new provider -- an *existing* provider gaining an auth
+/// host (OpenAI adding Microsoft SSO would put `login.microsoftonline.com` into
+/// `ChatGpt.auth_hosts()`), or a host being dropped from the list below while
+/// still listed as some provider's auth host, reach it too.
+///
+/// Sub-domain matching, not equality: `sub.auth.openai.com` is still
+/// single-purpose. Equality here would silently demote it to needing a
+/// destination it does not carry.
 fn is_single_purpose_auth_host(host: &str) -> bool {
     SINGLE_PURPOSE_AUTH_HOSTS
         .iter()
         .any(|root| host_is_within(host, root))
 }
 
-/// Auth hosts that serve exactly one destination, where arriving at the host is
-/// itself proof of whose login it is.
-///
-/// This is an allow-list on purpose, so the default for an unlisted auth host
-/// is the *safe* one: treat it as shared and make it prove its destination.
-/// The inverse (listing the shared hosts) would fail open at the extension
-/// point -- adding a provider whose auth host is also shared infrastructure
-/// (`login.microsoftonline.com`, `login.okta.com`) would silently inherit the
-/// host-only rule and start closing strangers' tabs.
+/// Vetted single-destination auth hosts -- see [`is_single_purpose_auth_host`]
+/// for why this is an allow-list rather than a deny-list.
 const SINGLE_PURPOSE_AUTH_HOSTS: [&str; 2] = ["auth.openai.com", "auth0.openai.com"];
 
 /// Query parameters that carry a sign-in destination, in decreasing order of
@@ -4603,7 +4612,7 @@ mod tests {
     // Run them with: cargo test -- --ignored known_gap
     // ---------------------------------------------------------------------
 
-    /// VERIFIER TEST (G2): the premise the url-shape guard was removed on --
+    /// The premise the url-shape guard was removed on --
     /// "`page.url()` never contains a bare space, so ` (` can only come from
     /// the title boundary" -- is false for schemes with an OPAQUE path. The
     /// WHATWG URL serialiser percent-encodes SPACE in the path, query and
@@ -4628,7 +4637,7 @@ mod tests {
         );
     }
 
-    /// VERIFIER TEST (G2b): the consequence -- the forged tab is SELECTED on
+    /// The consequence -- the forged tab is SELECTED on
     /// the reuse path, i.e. it is the tab the prompt gets typed into.
     #[test]
     #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
@@ -4656,7 +4665,7 @@ mod tests {
         );
     }
 
-    /// VERIFIER TEST (G3): the same premise failure reached through the NEW
+    /// The same premise failure reached through the NEW
     /// isolatedContext stripper. The hardening only considered a hostile
     /// *title* embedding the marker; a hostile *URL* embedding it works,
     /// because the name it leaves behind ("y)") has no space.
@@ -4675,7 +4684,7 @@ mod tests {
         );
     }
 
-    /// VERIFIER TEST: reuse path with a stale auth tab present. Asserts the
+    /// Reuse path with a stale auth tab present. Asserts the
     /// ORDERING the fix depends on -- the replacement tab must be opened (and
     /// therefore identifiable) BEFORE anything is closed -- and that the auth
     /// tab is never selected.
@@ -4686,7 +4695,7 @@ mod tests {
     /// disposal's own safety argument rests on ("the tab we drive is already
     /// pinned"), and nothing else checks it.
     #[test]
-    fn vab_reuse_auth_order() {
+    fn reuse_path_opens_the_replacement_tab_before_disposing_anything() {
         let mut fake = FakeMcp::new(&[
             (
                 1,
@@ -4823,20 +4832,29 @@ mod tests {
         );
     }
 
-    /// The single-purpose allow-list must fail CLOSED: anything not vetted is
-    /// treated as shared infrastructure and has to prove its destination.
+    /// The single-purpose allow-list must fail CLOSED: any auth host that is
+    /// not vetted is treated as shared infrastructure and has to prove its
+    /// destination. That applies to every way a host can reach
+    /// `Provider::auth_hosts` without being vetted -- a new provider, an
+    /// existing provider gaining an auth host, or a host dropped from the
+    /// allow-list while still named as some provider's auth host.
     #[test]
     fn unvetted_auth_hosts_default_to_needing_a_destination() {
         assert!(is_single_purpose_auth_host("auth.openai.com"));
         assert!(is_single_purpose_auth_host("auth0.openai.com"));
+        // Sub-domain, not equality: a vetted host's sub-domain stays vetted.
+        // Matching on equality would silently demote it to needing a
+        // destination that a single-purpose login URL does not carry.
+        assert!(is_single_purpose_auth_host("sub.auth.openai.com"));
         // Shared today...
         assert!(!is_single_purpose_auth_host("accounts.google.com"));
-        // ...and the hosts a future provider would bring, which must not
+        // ...and the hosts an unvetted addition would bring, which must not
         // silently inherit the host-only rule.
         assert!(!is_single_purpose_auth_host("login.microsoftonline.com"));
         assert!(!is_single_purpose_auth_host("login.okta.com"));
         // Never a look-alike of a vetted host.
         assert!(!is_single_purpose_auth_host("auth.openai.com.evil.test"));
+        assert!(!is_single_purpose_auth_host("notauth.openai.com"));
     }
 
     /// A hostile page only has to *mention* a provider domain to be adopted as
@@ -4892,11 +4910,11 @@ mod tests {
         }
     }
 
-    /// VERIFIER TEST (A1): a `data:` URL has a scheme with no `//`, so any
+    /// A `data:` URL has a scheme with no `//`, so any
     /// "does the candidate look like a URL?" guard rejects it, keeps the whole
     /// label, and then reads the host out of the page's own *title*.
     #[test]
-    fn vab_title_beats_real_url_when_scheme_has_no_double_slash() {
+    fn page_title_cannot_outrank_the_real_url_for_schemes_without_a_double_slash() {
         let pages = parse_pages(concat!(
             "## Pages\n",
             "0: https://chatgpt.com/ (data:text/html,<h1>fake composer</h1>) [selected]\n",
@@ -4909,11 +4927,11 @@ mod tests {
         );
     }
 
-    /// VERIFIER TEST (A1): the consequence that matters -- the spoof tab is not
+    /// The consequence that matters -- the spoof tab is not
     /// merely misclassified, it is the tab that gets *selected*, which is the
     /// tab the prompt is then typed into.
     #[test]
-    fn vab_data_url_spoof_tab_is_selected_on_reuse_path() {
+    fn data_url_spoof_tab_is_never_selected_on_the_reuse_path() {
         let mut fake = FakeMcp::new(&[
             (
                 1,
@@ -5420,7 +5438,7 @@ mod tests {
         assert_eq!(fake.open_ids(), vec![1, 2, 3]);
     }
 
-    /// VERIFIER TEST (A2): three consecutive `--new` runs where an expired
+    /// Three consecutive `--new` runs where an expired
     /// session leaves the previous tab parked on the provider's auth host.
     /// Those tabs are neither provider-owned nor blank, so a
     /// same-provider-only filter never closes them and the tab count grows
@@ -5428,7 +5446,7 @@ mod tests {
     /// with too many tabs"). The census, not just the final state, is the
     /// assertion: it is what distinguishes "bounded" from "leaking".
     #[test]
-    fn vab_auth_drift_tabs_accumulate_across_new_runs() {
+    fn new_session_does_not_leak_tabs_that_drifted_to_the_auth_host() {
         let mut fake = FakeMcp::new(&[(1, "https://chatgpt.com/")]);
         let mut census = Vec::new();
         for _ in 0..3 {
