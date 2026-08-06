@@ -130,28 +130,52 @@ impl Provider {
 
     /// Hosts this provider's sign-in flow redirects through.
     ///
-    /// A tab parked on one of these is debris from *our own* login redirect,
-    /// not user content: when the session has expired the tab `--new` just
-    /// opened lands here instead of on the provider. It is neither
-    /// provider-owned nor blank, so without this list nothing ever closes it
-    /// and every `--new` leaves one more behind.
+    /// A tab parked on one of these is debris from *our own* login redirect:
+    /// when the session has expired the tab `--new` just opened lands here
+    /// instead of on the provider. It is neither provider-owned nor blank, so
+    /// without this list nothing ever closes it and every `--new` leaves one
+    /// more behind.
     fn auth_hosts(self) -> &'static [&'static str] {
         match self {
+            // Single purpose: reaching one of these means an ask-bridge login.
             Provider::ChatGpt => &["auth.openai.com", "auth0.openai.com"],
-            // claude.ai and Gemini both sign in through Google's account host,
-            // so a `--new` on either may reap the other's stale auth tab. That
-            // is transient redirect debris, never a page holding a
-            // conversation.
+            // Shared infrastructure -- see `is_shared_auth_host`.
             Provider::Gemini | Provider::Claude => &["accounts.google.com"],
         }
     }
 
+    /// Whether a tab parked on `url` is disposable login debris for *this*
+    /// provider.
+    ///
+    /// The test is not "is this an auth host" but "is this a page that cannot
+    /// be holding state the user cares about". `auth.openai.com` passes on the
+    /// host alone: it exists only to sign in to ChatGPT. `accounts.google.com`
+    /// does **not** -- it is the shared front door for every Google OAuth
+    /// integration on the web, so the same host serves a third-party app's
+    /// consent screen, an account chooser, a half-typed password and a 2FA
+    /// prompt waiting on a phone tap. Closing those to save a tab would break
+    /// this module's own rule that unrelated tabs are not ours to close.
+    ///
+    /// Google carries the destination in the URL, so ask for it: dispose of a
+    /// shared auth host only when it says it is on its way back to this
+    /// provider. No destination, or someone else's destination, means hands
+    /// off -- at worst that leaves one tab, which is the safe direction.
     fn owns_auth_url(self, url: &str) -> bool {
-        match url_host(url) {
-            Some(host) => self
-                .auth_hosts()
-                .iter()
-                .any(|root| host_is_within(&host, root)),
+        let Some(host) = url_host(url) else {
+            return false;
+        };
+        if !self
+            .auth_hosts()
+            .iter()
+            .any(|root| host_is_within(&host, root))
+        {
+            return false;
+        }
+        if !is_shared_auth_host(&host) {
+            return true;
+        }
+        match auth_destination_host(url) {
+            Some(dest) => host_is_within(&dest, self.primary_host()),
             None => false,
         }
     }
@@ -1455,6 +1479,70 @@ fn host_is_within(host: &str, root: &str) -> bool {
         Some(prefix) => prefix.is_empty() || prefix.ends_with('.'),
         None => false,
     }
+}
+
+/// Auth hosts that serve more than one destination, so reaching one says
+/// nothing about *whose* login it is.
+fn is_shared_auth_host(host: &str) -> bool {
+    host_is_within(host, "accounts.google.com")
+}
+
+/// Host of the destination a Google sign-in URL says it is heading to.
+///
+/// Google puts it in `continue`, `followup` (classic sign-in) or
+/// `redirect_uri` (OAuth consent); `service` is sometimes a bare service name
+/// rather than a URL, in which case it simply yields no host. The first
+/// parameter that resolves to a host wins; a URL with none returns `None`.
+fn auth_destination_host(url: &str) -> Option<String> {
+    let query = url.split_once('?').map(|(_, q)| q)?;
+    let query = query.split('#').next().unwrap_or("");
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !matches!(key, "continue" | "followup" | "redirect_uri" | "service") {
+            continue;
+        }
+        if let Some(host) = url_host(&percent_decode(value)) {
+            return Some(host);
+        }
+    }
+    None
+}
+
+/// Minimal `application/x-www-form-urlencoded` value decoder: `%XX` escapes and
+/// `+` as space. Invalid escapes are left verbatim -- this feeds a host check
+/// that fails closed, so a malformed value simply does not match.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn url_host(url: &str) -> Option<String> {
@@ -3066,9 +3154,27 @@ fn pages_from_tool_result(res: &Value, context: &str) -> Result<Vec<Page>, Strin
 /// `//` (`data:`, `blob:`, `javascript:`) would flunk it, the whole label would
 /// be kept instead, and the host would then be read out of the *title* -- which
 /// the page chooses. A page titled `https://chatgpt.com/` sitting on a `data:`
-/// URL is exactly that attack. The grammar is unambiguous here because
-/// `page.url()` never contains a bare space (spaces are percent-encoded), so
-/// the ` (` separator can only come from the title boundary.
+/// URL is exactly that attack.
+///
+/// # Known gap: this parse is only unambiguous for special schemes
+///
+/// The grammar can be read back reliably as long as `page.url()` cannot itself
+/// contain a bare ` (`. That holds for *special* schemes (`http`, `https`,
+/// `file`, and hierarchical ones like `chrome-extension`), whose path, query
+/// and fragment percent-encode SPACE. It does **not** hold for schemes with an
+/// **opaque path** (`data:`, `blob:`, `mailto:`, `javascript:`): WHATWG encodes
+/// those with the C0-control set, which does not include SPACE, so the space
+/// survives verbatim. Verified against the WHATWG implementation:
+/// `new URL("data:text/html,x (https://chatgpt.com/").href` keeps the space,
+/// while `https://evil.test/a b` becomes `a%20b`.
+///
+/// A `data:` page can therefore put a literal ` (` in its own URL and choose
+/// what the "trailing group" is -- see the `known_gap_g2_*` tests. This is
+/// **not** closed here, and it predates the host-matching work (`main` accepts
+/// the same payloads via its substring match). Closing it properly means not
+/// parsing prose at all: chrome-devtools-mcp already emits the same fields
+/// structurally (`createStructuredPage`, McpResponse.js:1035) behind the
+/// `--experimentalStructuredContent` server flag.
 fn page_url_from_label(label: &str) -> &str {
     if let Some(inner) = label.strip_suffix(')')
         && let Some((_title, url)) = inner.rsplit_once(" (")
@@ -3092,6 +3198,15 @@ fn page_url_from_label(label: &str) -> &str {
 /// Generated names never contain a space, but a hostile page *title* can embed
 /// the literal marker; splitting on those would truncate the label back to
 /// title text and hand host selection to the page again.
+///
+/// # Known gap (same root cause as [`page_url_from_label`])
+///
+/// The space-free-token rule closes the *title* side only. A page whose **URL**
+/// has an opaque path can embed the marker there -- `data:text/html,x
+/// isolatedContext=y` leaves the name `y)`, which is non-empty and space-free,
+/// so the guard accepts it, the label is truncated, and the host is read out of
+/// the title again. See `known_gap_g3_url_can_forge_the_isolated_context_marker`.
+/// Not closed here, and not a regression: `main` accepts the same payload.
 fn strip_isolated_context_suffix(rest: &str) -> &str {
     match rest.rsplit_once(" isolatedContext=") {
         Some((head, name)) if !name.is_empty() && !name.contains(' ') => head.trim_end(),
@@ -4433,6 +4548,95 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // KNOWN GAP: opaque-path URLs can forge the listing grammar.
+    //
+    // These three tests assert the behaviour we *want*, and they FAIL today.
+    // They are `#[ignore]`d rather than deleted so the gap stays visible and
+    // so nobody pins the current behaviour as correct. The root cause is that
+    // `page.url()` keeps raw spaces for opaque-path schemes (`data:`, `blob:`,
+    // `mailto:`), so the page controls where the ` (` and ` isolatedContext=`
+    // separators appear -- see `page_url_from_label`.
+    //
+    // NOT a regression: `main` accepts every one of these payloads too (its
+    // substring match never looked at the grammar at all). Fixing them means
+    // dropping the prose parser for chrome-devtools-mcp's structured output
+    // (`--experimentalStructuredContent`), not adding another heuristic here.
+    // Run them with: cargo test -- --ignored known_gap
+    // ---------------------------------------------------------------------
+
+    /// VERIFIER TEST (G2): the premise the url-shape guard was removed on --
+    /// "`page.url()` never contains a bare space, so ` (` can only come from
+    /// the title boundary" -- is false for schemes with an OPAQUE path. The
+    /// WHATWG URL serialiser percent-encodes SPACE in the path, query and
+    /// fragment of a *special* scheme, but an opaque path (`data:`, `blob:`)
+    /// is encoded with the C0-control set only, which does not contain SPACE.
+    /// So a `data:` page can put a literal ` (` inside its own URL and choose
+    /// what the "trailing parenthesised group" is.
+    #[test]
+    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
+    fn known_gap_g2_data_url_can_forge_the_trailing_group() {
+        // One self-contained hostile page: the HTML sets its own title, and the
+        // URL carries the forged separator.
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: Free VPN (data:text/html,<title>Free VPN</title>x (https://chatgpt.com/)\n",
+        ));
+        assert_eq!(
+            Provider::from_url(&pages[0].url),
+            None,
+            "a data: page forged the trailing group and was adopted as a provider (parsed url = {:?})",
+            pages[0].url
+        );
+    }
+
+    /// VERIFIER TEST (G2b): the consequence -- the forged tab is SELECTED on
+    /// the reuse path, i.e. it is the tab the prompt gets typed into.
+    #[test]
+    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
+    fn known_gap_g2_forged_tab_is_selected_on_reuse_path() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "Free VPN (data:text/html,<title>Free VPN</title>x (https://chatgpt.com/)",
+            ),
+            (2, "https://example.com/"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "the forged data: tab was SELECTED: {:?}",
+            fake.page_ids_for("select_page")
+        );
+    }
+
+    /// VERIFIER TEST (G3): the same premise failure reached through the NEW
+    /// isolatedContext stripper. The hardening only considered a hostile
+    /// *title* embedding the marker; a hostile *URL* embedding it works,
+    /// because the name it leaves behind ("y)") has no space.
+    #[test]
+    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
+    fn known_gap_g3_url_can_forge_the_isolated_context_marker() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: https://chatgpt.com/ (data:text/html,x isolatedContext=y)\n",
+        ));
+        assert_eq!(
+            Provider::from_url(&pages[0].url),
+            None,
+            "a data: page forged the isolatedContext marker and was adopted (parsed url = {:?})",
+            pages[0].url
+        );
+    }
+
     /// A hostile page only has to *mention* a provider domain to be adopted as
     /// that provider's tab when ownership is decided by substring. Ownership
     /// must be decided by the canonical host instead.
@@ -5058,18 +5262,17 @@ mod tests {
     /// Gemini/Claude sign-in flow.
     #[test]
     fn auth_host_disposal_is_scoped_to_the_provider() {
+        const GEMINI_SIGNIN: &str = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp";
         assert!(Provider::ChatGpt.owns_auth_url("https://auth.openai.com/authorize"));
-        assert!(!Provider::ChatGpt.owns_auth_url("https://accounts.google.com/signin"));
-        assert!(Provider::Gemini.owns_auth_url("https://accounts.google.com/signin"));
+        assert!(!Provider::ChatGpt.owns_auth_url(GEMINI_SIGNIN));
+        assert!(Provider::Gemini.owns_auth_url(GEMINI_SIGNIN));
         assert!(!Provider::Gemini.owns_auth_url("https://auth.openai.com/authorize"));
         // Never a real page, and never a look-alike of the auth host either.
         assert!(!Provider::ChatGpt.owns_auth_url("https://chatgpt.com/c/abc"));
         assert!(!Provider::ChatGpt.owns_auth_url("https://auth.openai.com.evil.test/"));
 
-        let mut fake = FakeMcp::new(&[
-            (1, "https://accounts.google.com/signin"),
-            (2, "https://auth.openai.com/authorize"),
-        ]);
+        let mut fake =
+            FakeMcp::new(&[(1, GEMINI_SIGNIN), (2, "https://auth.openai.com/authorize")]);
         let result = ensure_provider_tab_with(
             &mut |tool, args| fake.call(tool, args),
             Provider::ChatGpt,
@@ -5091,9 +5294,8 @@ mod tests {
     }
 
     /// M13: a close failure must escape the close loop instead of being
-    /// dropped inside it. The caller turns these into a warning; what is pinned
-    /// here is that it still has something to warn about (and `#[must_use]`
-    /// stops it going back to discarding them).
+    /// dropped inside it. Its journey out to the caller is pinned separately by
+    /// `close_failures_reach_the_caller`.
     #[test]
     fn close_failures_are_returned_not_swallowed() {
         let mut fake = FakeMcp::new(&[
@@ -5124,6 +5326,183 @@ mod tests {
         );
         // The one that could close, did; the stubborn one is still open.
         assert_eq!(fake.open_ids(), vec![2, 3]);
+    }
+
+    /// N1/N4: the failures must survive the *call site* too. Collecting them
+    /// inside `close_tabs` and then discarding them there (`let _ = ...`, or
+    /// consuming the vec and reporting nothing) just moves the silence one
+    /// frame out, so pin the value the caller actually receives.
+    #[test]
+    fn close_failures_reach_the_caller() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com/c/old"),
+            (2, "https://gemini.google.com/app"),
+        ]);
+        fake.close_failures = vec![1];
+
+        let outcome = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect("tab preparation should still succeed");
+
+        assert_eq!(
+            outcome.close_failures.len(),
+            1,
+            "caller was not told about the close failure: {:?}",
+            outcome.close_failures
+        );
+        assert_eq!(outcome.close_failures[0].0, 1);
+        // A clean run must not invent failures.
+        let mut clean = FakeMcp::new(&[(1, "https://chatgpt.com/c/old")]);
+        let ok = ensure_provider_tab_with(
+            &mut |tool, args| clean.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect("tab preparation should succeed");
+        assert!(ok.close_failures.is_empty());
+    }
+
+    /// Item 2: `accounts.google.com` is shared infrastructure, so the host
+    /// alone must not authorise closing a tab. Only a sign-in URL that says it
+    /// is heading back to *this* provider counts as our debris.
+    #[test]
+    fn shared_google_auth_host_is_disposable_only_for_its_own_destination() {
+        // continue= pointing at the provider -> ours.
+        assert!(Provider::Gemini.owns_auth_url(
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp"
+        ));
+        assert!(Provider::Gemini.owns_auth_url(
+            "https://accounts.google.com/ServiceLogin?continue=https://gemini.google.com/app&hl=en"
+        ));
+        // Claude signs in through Google OAuth, which carries redirect_uri.
+        assert!(Provider::Claude.owns_auth_url(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fauth%2Fcallback%2Fgoogle&scope=email"
+        ));
+
+        // An unrelated app's consent screen -> never ours, for any provider.
+        let stranger = "https://accounts.google.com/o/oauth2/v2/auth?client_id=999&redirect_uri=https%3A%2F%2Fnotion.so%2Fcallback&scope=drive";
+        for provider in [Provider::Gemini, Provider::Claude, Provider::ChatGpt] {
+            assert!(
+                !provider.owns_auth_url(stranger),
+                "{:?} claimed a third-party consent screen",
+                provider
+            );
+        }
+
+        // No destination parameter at all -> hands off (account chooser, a
+        // half-typed password, a 2FA prompt waiting on a phone).
+        for bare in [
+            "https://accounts.google.com/AccountChooser",
+            "https://accounts.google.com/signin/v2/identifier",
+            "https://accounts.google.com/",
+            "https://accounts.google.com/signin?hl=en&flowName=GlifWebSignIn",
+        ] {
+            for provider in [Provider::Gemini, Provider::Claude] {
+                assert!(
+                    !provider.owns_auth_url(bare),
+                    "{:?} claimed a bare Google page: {}",
+                    provider,
+                    bare
+                );
+            }
+        }
+
+        // A destination that only look-alikes the provider is not a match.
+        assert!(!Provider::Gemini.owns_auth_url(
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com.evil.test%2F"
+        ));
+        // The single-purpose host still needs no destination check.
+        assert!(Provider::ChatGpt.owns_auth_url("https://auth.openai.com/authorize"));
+    }
+
+    /// The user's in-progress Google sign-in for something else survives a
+    /// `--new`, while the provider's own drifted tab still gets cleaned up.
+    #[test]
+    fn new_session_spares_an_unrelated_google_consent_screen() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id=999&redirect_uri=https%3A%2F%2Fnotion.so%2Fcallback",
+            ),
+            (
+                2,
+                "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp",
+            ),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::Gemini,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(
+            fake.page_ids_for("close_page"),
+            vec![2],
+            "only the tab heading back to Gemini may be closed"
+        );
+        assert!(
+            fake.open_ids().contains(&1),
+            "a third-party consent screen was closed"
+        );
+    }
+
+    /// Item 4: the default (reuse) path opens a tab whenever no provider tab is
+    /// found -- which is exactly what a drifted login tab looks like -- so
+    /// without disposal it leaks one tab per invocation. Disposing is safe here
+    /// only because the tab being driven is the freshly opened, already pinned
+    /// one; the login page is never selected.
+    #[test]
+    fn reuse_path_does_not_leak_drifted_login_tabs() {
+        let mut fake = FakeMcp::new(&[(
+            1,
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp",
+        )]);
+        let mut census = Vec::new();
+        for _ in 0..3 {
+            let ok = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::Gemini,
+                false,
+                true,
+                false,
+                Duration::ZERO,
+            );
+            assert!(ok.is_ok(), "unexpected error: {:?}", ok);
+            let drifted = fake.selected.expect("a tab is selected");
+            for page in fake.pages.iter_mut() {
+                if page.0 == drifted {
+                    page.1 =
+                        "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp"
+                            .to_string();
+                }
+            }
+            census.push(fake.open_ids().len());
+        }
+        assert_eq!(
+            census,
+            vec![1, 1, 1],
+            "the reuse path leaked drifted login tabs: {:?}",
+            census
+        );
+        // The login tab is disposed of, never driven.
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "a login page was selected: {:?}",
+            fake.page_ids_for("select_page")
+        );
     }
 
     /// M15: when more than one tab appears (a provider popup, a restored
@@ -8831,9 +9210,16 @@ fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> V
 ///
 /// Closing is best effort -- a tab that will not close is no longer a hazard
 /// once the replacement tab is pinned by ID -- but the failures are handed back
-/// as data rather than dropped inside the loop, so a cleanup that did not
-/// happen can never be reported as one that did. `#[must_use]` is what keeps
-/// that honest: a caller cannot go back to silently discarding them.
+/// as data rather than dropped inside the loop, and travel out of
+/// [`ensure_provider_tab_with`] in [`TabOutcome`] so a test can assert the
+/// caller was actually told.
+///
+/// `#[must_use]` is a nudge, **not** a guarantee: `let _ = close_tabs(..)` is
+/// the idiomatic way to silence it and neither `cargo test` nor
+/// `clippy -D warnings` would notice. What is genuinely enforced is that the
+/// failures reach `TabOutcome`; the final `eprintln!` in `ensure_provider_tab`
+/// is a presentation detail no test observes (libtest intercepts `eprintln!`
+/// before fd 2, so capturing it is not possible in-process).
 #[must_use = "a tab that refused to close must be surfaced, not discarded"]
 fn close_tabs<F>(
     call: &mut F,
@@ -8872,14 +9258,29 @@ fn ensure_provider_tab(
     headless: bool,
     verbose: bool,
 ) -> Result<(), String> {
-    ensure_provider_tab_with(
+    let outcome = ensure_provider_tab_with(
         &mut |tool: &str, args: Value| call_mcp_tool(config_path, tool, args),
         provider,
         force_new,
         headless,
         verbose,
         READY_POLL_INTERVAL,
-    )
+    )?;
+    for (id, e) in outcome.close_failures {
+        eprintln!("Warning: failed to close old tab (ID: {}): {}", id, e);
+    }
+    Ok(())
+}
+
+/// What a tab-preparation run committed to, plus the cleanup it could not
+/// finish.
+///
+/// The failures travel out as data instead of being printed where they happen,
+/// so "the caller was told" is an assertion a test can make rather than a claim
+/// in a comment.
+#[derive(Debug)]
+struct TabOutcome {
+    close_failures: Vec<(usize, String)>,
 }
 
 /// How long to wait between readiness probes while a provider page loads.
@@ -8896,13 +9297,14 @@ fn ensure_provider_tab_with<F>(
     headless: bool,
     verbose: bool,
     poll_interval: Duration,
-) -> Result<(), String>
+) -> Result<TabOutcome, String>
 where
     F: FnMut(&str, Value) -> Result<Value, String>,
 {
     if verbose {
         println!("Checking open Chrome tabs...");
     }
+    let mut close_failures: Vec<(usize, String)> = Vec::new();
     let list_res = call("list_pages", serde_json::json!({}))?;
     let pages = pages_from_tool_result(&list_res, "list_pages")?;
 
@@ -8969,9 +9371,7 @@ where
             .into_iter()
             .filter(|id| *id != new_page_id)
             .collect();
-        for (id, e) in close_tabs(call, &doomed, provider, verbose) {
-            eprintln!("Warning: failed to close old tab (ID: {}): {}", id, e);
-        }
+        close_failures.extend(close_tabs(call, &doomed, provider, verbose));
 
         if verbose {
             println!(
@@ -9070,14 +9470,39 @@ where
                     // Nothing stale can be re-selected here (the tab was just
                     // created), so an unidentifiable ID only costs the pinning,
                     // not correctness.
-                    match pages_from_tool_result(&opened, "new_page")
+                    let opened_id = match pages_from_tool_result(&opened, "new_page")
                         .map(|after| fresh_page_ids(&before_ids, &after, provider))
                         .unwrap_or_default()
                         .as_slice()
                     {
                         [id] => Some(*id),
                         _ => None,
-                    }
+                    };
+
+                    // Reaching here means no provider tab was found, which is
+                    // also what happens when the previous run's tab drifted to
+                    // the login host -- so without this the default path opens
+                    // one more tab on every invocation, forever. Disposing is
+                    // safe where *adopting* was not: the tab we drive is the
+                    // one just opened and already pinned above, so a login page
+                    // is never selected, never probed for readiness, and never
+                    // receives the prompt.
+                    let stale_auth: Vec<usize> = pages
+                        .iter()
+                        .filter(|p| provider.owns_auth_url(&p.url))
+                        .map(|p| p.id)
+                        // Belt and braces on a destructive call. Redundant
+                        // today -- `pages` is the snapshot taken before
+                        // `new_page`, and page IDs are allocated monotonically
+                        // and never reused, so the tab just opened cannot
+                        // appear in it -- but never closing the tab we are
+                        // about to drive is worth stating locally rather than
+                        // inferring from two invariants declared elsewhere.
+                        .filter(|id| Some(*id) != opened_id)
+                        .collect();
+                    close_failures.extend(close_tabs(call, &stale_auth, provider, verbose));
+
+                    opened_id
                 }
             }
         };
@@ -9149,7 +9574,7 @@ where
         if let Ok(parsed) = parse_script_result(&ready_res) {
             let is_ready = parsed.as_bool().unwrap_or(false);
             if is_ready {
-                return Ok(());
+                return Ok(TabOutcome { close_failures });
             }
         }
         thread::sleep(poll_interval);
