@@ -1400,7 +1400,15 @@ fn run_update_command() -> Result<(), String> {
 
 struct Page {
     id: usize,
-    url: String,
+    /// The tab's URL, or `None` when its listing line could not be read back
+    /// unambiguously (see [`page_url_from_label`]).
+    ///
+    /// `None` means "unknown", not "blank": a tab we cannot name is not this
+    /// provider's, is not disposable debris, and is not a blank tab to
+    /// navigate. Every consumer has to say which of those it means, which is
+    /// why this is an `Option` rather than a sentinel string -- a sentinel
+    /// would silently take whichever branch it happened to fall through to.
+    url: Option<String>,
     selected: bool,
 }
 
@@ -3192,43 +3200,107 @@ fn pages_from_tool_result(res: &Value, context: &str) -> Result<Vec<Page>, Strin
     Ok(parse_pages(text))
 }
 
+/// Schemes that can appear as a *whole tab's* URL with a raw space in them.
+///
+/// The list is what makes the ambiguity rule in [`page_url_from_label`] narrow
+/// enough to be usable, so it is an allow-list of things a browser can actually
+/// do, not of things a URL parser would tolerate. Three conditions have to hold
+/// together: chrome-devtools-mcp can list a top-level document on the scheme,
+/// its path is *opaque* (so the serialiser's C0-control set leaves SPACE
+/// verbatim instead of writing `%20`), and its content is chosen by whoever
+/// opened the tab rather than minted by the browser.
+///
+/// `data:` meets all three, and is the only scheme that does:
+/// * `blob:` is a real top-level document URL, but the UA mints
+///   `blob:<origin>/<uuid>` -- no caller input, no space.
+/// * `about:` is likewise UA-minted (`about:blank`, `about:srcdoc`).
+/// * `filesystem:` and `view-source:` wrap a *hierarchical* URL, which is
+///   percent-encoded on the way in, so no raw space survives either.
+/// * `mailto:` and `javascript:` never become a top-level document URL at all:
+///   Chrome hands `mailto:` to an external protocol handler, and a
+///   `javascript:` navigation replaces the document without changing its URL.
+///
+/// Excluding a scheme is not a hole. Whitespace-free candidates of *every*
+/// scheme stay possible (see [`is_possible_page_url`]), so this list only
+/// decides which lines are ambiguous; and if a scheme ever did reach a tab with
+/// a space in it, [`verify_selected_page_is_provider`] asks the tab itself
+/// before any prompt is typed.
+const SPACE_BEARING_PAGE_SCHEMES: [&str; 1] = ["data"];
+
+/// Whether `candidate` could be a value of `page.url()` at all -- i.e. whether
+/// a browser could have put a tab on this exact string.
+///
+/// A URL starts with a scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`)
+/// and, for everything outside [`SPACE_BEARING_PAGE_SCHEMES`], carries no
+/// whitespace: SPACE is in the path, query and fragment percent-encode sets, so
+/// `https://evil.test/a b` serialises as `a%20b`.
+fn is_possible_page_url(candidate: &str) -> bool {
+    let Some((scheme, _rest)) = candidate.split_once(':') else {
+        return false;
+    };
+    let mut scheme_chars = scheme.chars();
+    if !scheme_chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !scheme_chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return false;
+    }
+    if candidate.chars().any(char::is_control) {
+        return false;
+    }
+    if !candidate.chars().any(char::is_whitespace) {
+        return true;
+    }
+    SPACE_BEARING_PAGE_SCHEMES
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+}
+
 /// chrome-devtools-mcp renders a page as `<title> (<url>)` when the page has a
 /// title and as a bare `<url>` when it does not (McpResponse.js:664).
 ///
-/// The URL is the *trailing* parenthesised group, and that position is decided
-/// by the grammar alone -- deliberately with no "does this look like a URL?"
-/// test on the candidate. Such a test can only fail open: a scheme without
-/// `//` (`data:`, `blob:`, `javascript:`) would flunk it, the whole label would
-/// be kept instead, and the host would then be read out of the *title* -- which
-/// the page chooses. A page titled `https://chatgpt.com/` sitting on a `data:`
-/// URL is exactly that attack.
+/// Reading that back is guesswork: the separator is a bare ` (`, and both
+/// halves are chosen by the page. So this returns a URL only when exactly one
+/// reading of the line is possible, and `None` -- "this tab's URL is unknown"
+/// -- otherwise. `None` is never "no provider matched but here is a string
+/// anyway": see [`Page::url`] for what the callers owe it.
 ///
-/// # Known gap: this parse is only unambiguous for special schemes
+/// # Why "the trailing parenthesised group" was not enough
 ///
-/// The grammar can be read back reliably as long as `page.url()` cannot itself
-/// contain a bare ` (`. That holds for *special* schemes (`http`, `https`,
-/// `file`, and hierarchical ones like `chrome-extension`), whose path, query
-/// and fragment percent-encode SPACE. It does **not** hold for schemes with an
-/// **opaque path** (`data:`, `blob:`, `mailto:`, `javascript:`): WHATWG encodes
-/// those with the C0-control set, which does not include SPACE, so the space
-/// survives verbatim. Verified against the WHATWG implementation:
-/// `new URL("data:text/html,x (https://chatgpt.com/").href` keeps the space,
-/// while `https://evil.test/a b` becomes `a%20b`.
+/// Taking the last ` (` rests on `page.url()` never containing one. That holds
+/// wherever the serialiser percent-encodes SPACE, but not for a `data:` URL
+/// (see [`SPACE_BEARING_PAGE_SCHEMES`]), so a `data:` page can put a literal
+/// ` (` inside its own URL and decide what the trailing group is.
+/// `data:text/html,<title>Free VPN</title>x (https://chatgpt.com/` renders as a
+/// line whose trailing group is `https://chatgpt.com/`; that tab was then
+/// adopted as the provider's, selected, and typed into.
 ///
-/// A `data:` page can therefore put a literal ` (` in its own URL and choose
-/// what the "trailing group" is -- see the `known_gap_g2_*` tests. This is
-/// **not** closed here, and it predates the host-matching work (`main` accepts
-/// the same payloads via its substring match). Closing it properly means not
-/// parsing prose at all: chrome-devtools-mcp already emits the same fields
-/// structurally (`createStructuredPage`, McpResponse.js:1035) behind the
-/// `--experimentalStructuredContent` server flag.
-fn page_url_from_label(label: &str) -> &str {
-    if let Some(inner) = label.strip_suffix(')')
-        && let Some((_title, url)) = inner.rsplit_once(" (")
-    {
-        return url;
+/// # The rule
+///
+/// Every ` (`-to-final-`)` split is a possible reading, and so is the whole
+/// line (an untitled page). Readings a browser could not have produced are
+/// discarded. Exactly one survivor is the answer; zero or two or more means the
+/// line is ambiguous and the tab is treated as unidentified.
+///
+/// A forgery always leaves **two** survivors, because the attacker's own
+/// `data:` URL is itself always one of them -- it starts either at the line
+/// start or at the ` (` the server put in front of it -- so it can never yield
+/// a unique provider reading. Ordinary parenthesised titles are unaffected:
+/// `Fix bug (error: undefined)` produces the candidate `error: undefined) (...`,
+/// which has a space and a scheme that is not `data:`, so it is discarded and
+/// the real URL is the only survivor.
+fn page_url_from_label(label: &str) -> Option<&str> {
+    let titled = label
+        .strip_suffix(')')
+        .into_iter()
+        .flat_map(|inner| inner.match_indices(" (").map(|(at, _)| &inner[at + 2..]));
+    let mut readings = std::iter::once(label)
+        .chain(titled)
+        .filter(|reading| is_possible_page_url(reading));
+    match (readings.next(), readings.next()) {
+        (Some(url), None) => Some(url),
+        _ => None,
     }
-    label
 }
 
 /// Strip the trailing ` isolatedContext=<name>` marker that is appended after
@@ -3246,14 +3318,14 @@ fn page_url_from_label(label: &str) -> &str {
 /// the literal marker; splitting on those would truncate the label back to
 /// title text and hand host selection to the page again.
 ///
-/// # Known gap (same root cause as [`page_url_from_label`])
-///
 /// The space-free-token rule closes the *title* side only. A page whose **URL**
-/// has an opaque path can embed the marker there -- `data:text/html,x
+/// has an opaque path can still embed the marker there -- `data:text/html,x
 /// isolatedContext=y` leaves the name `y)`, which is non-empty and space-free,
-/// so the guard accepts it, the label is truncated, and the host is read out of
-/// the title again. See `known_gap_g3_url_can_forge_the_isolated_context_marker`.
-/// Not closed here, and not a regression: `main` accepts the same payload.
+/// so the guard accepts it and truncates the label mid-URL. Nothing here can
+/// tell that apart from a real marker; what stops it is that the truncated
+/// remainder is no longer a readable line, so [`page_url_from_label`] reports
+/// the tab as unidentified rather than reading the host out of the title. See
+/// `known_gap_g3_url_can_forge_the_isolated_context_marker`.
 fn strip_isolated_context_suffix(rest: &str) -> &str {
     match rest.rsplit_once(" isolatedContext=") {
         Some((head, name)) if !name.is_empty() && !name.contains(' ') => head.trim_end(),
@@ -3282,7 +3354,7 @@ fn parse_pages(text: &str) -> Vec<Page> {
             } else {
                 (rest, false)
             };
-            let url = page_url_from_label(label).to_string();
+            let url = page_url_from_label(label).map(str::to_string);
             pages.push(Page { id, url, selected });
         }
     }
@@ -4595,21 +4667,130 @@ mod tests {
         }
     }
 
+    /// Realistic ChatGPT tab titles, each rendered the way the server would
+    /// (`<title> (<url>)`). `R*` are the ones a rule that treats any
+    /// `scheme:`-shaped token as an opaque URL wrongly refuses; `K*` are the
+    /// ones that must keep working under any rule.
+    const TITLE_CORPUS: &[(&str, &str)] = &[
+        (
+            "R01",
+            "Fix bug (error: undefined) (https://chatgpt.com/c/abc)",
+        ),
+        ("R02", "npm (ERR: ELIFECYCLE) (https://chatgpt.com/c/abc)"),
+        ("R03", "Report (Q1: 2026) (https://chatgpt.com/c/abc)"),
+        ("R04", "Notes (see: docs) (https://chatgpt.com/c/abc)"),
+        ("R05", "Deploy (ref: #123) (https://chatgpt.com/c/abc)"),
+        ("R06", "TODO (urgent: ship) (https://chatgpt.com/c/abc)"),
+        (
+            "R07",
+            "Build fails (C:\\dev\\app) (https://chatgpt.com/c/abc)",
+        ),
+        ("R08", "Migration (v2: beta) (https://chatgpt.com/c/abc)"),
+        ("R09", "SQL (WHERE: id=1) (https://chatgpt.com/c/abc)"),
+        (
+            "R10",
+            "Docker setup (note: use compose) (https://chatgpt.com/c/abc)",
+        ),
+        ("R11", "Ratio (a:b) explained (https://chatgpt.com/c/abc)"),
+        (
+            "R12",
+            "ChatGPT (GPT-5: thinking) (https://chatgpt.com/c/abc)",
+        ),
+        ("R13", "Setup (npm: install) (https://chatgpt.com/c/abc)"),
+        ("K14", "ChatGPT (2 unread) (https://chatgpt.com/c/abc)"),
+        ("K15", "Standup (10:30 AM) (https://chatgpt.com/c/abc)"),
+        ("K16", "除錯 (錯誤: 未定義) (https://chatgpt.com/c/abc)"),
+        (
+            "K17",
+            "Compare (http://a.com vs b.com) (https://chatgpt.com/c/abc)",
+        ),
+        ("K18", "Foo (bar) (baz) (https://chatgpt.com/c/abc)"),
+        ("K19", "Q3 plan (draft) (https://chatgpt.com/c/abc)"),
+        ("K20", "Plan (phase (one)) (https://chatgpt.com/c/abc)"),
+        ("K21", "https://chatgpt.com/ (https://chatgpt.com/c/abc)"),
+        ("K22", "https://chatgpt.com/c/abc"),
+    ];
+
+    /// Every forgery shape, as whole `list_pages` lines so the `[selected]` and
+    /// ` isolatedContext=` suffixes are peeled by the code under test. None of
+    /// these may ever resolve to a provider.
+    const HOSTILE_CORPUS: &[(&str, &str)] = &[
+        (
+            "H01 data titled",
+            "0: Free VPN (data:text/html,<title>Free VPN</title>x (https://chatgpt.com/)",
+        ),
+        (
+            "H02 data untitled",
+            "0: data:text/html,x (https://chatgpt.com/)",
+        ),
+        (
+            "H03 data titled+selected",
+            "0: Free VPN (data:text/html,x (https://chatgpt.com/) [selected]",
+        ),
+        (
+            "H04 data untitled+selected",
+            "0: data:text/html,x (https://chatgpt.com/) [selected]",
+        ),
+        (
+            "H05 data isolatedContext truncation",
+            "0: https://chatgpt.com/ (data:text/html,x isolatedContext=y)",
+        ),
+        (
+            "H06 data isolatedContext double-forge",
+            "0: T (data:text/html,x (https://chatgpt.com/) isolatedContext=q)",
+        ),
+        (
+            "H07 data double-forge",
+            "0: A (data:x (https://chatgpt.com/) (https://chatgpt.com/)",
+        ),
+        (
+            "H08 near-miss: forged group, marker eats the tail",
+            "0: data:text/html,q (https://chatgpt.com/ isolatedContext=y)",
+        ),
+        (
+            "H09 blob titled",
+            "0: https://chatgpt.com/ (blob:https://chatgpt.com/6c8f-1234)",
+        ),
+        ("H10 blob untitled", "0: blob:https://chatgpt.com/6c8f-1234"),
+        (
+            "H11 javascript titled",
+            "0: ChatGPT (javascript:location.href='https://chatgpt.com/')",
+        ),
+        (
+            "H12 javascript untitled",
+            "0: javascript:location.href='https://chatgpt.com/'",
+        ),
+        ("H13 mailto untitled", "0: mailto:ops@chatgpt.com"),
+        (
+            "H14 data with userinfo lookalike",
+            "0: T (data:text/html,x (https://chatgpt.com@evil.test/)",
+        ),
+    ];
+
+    /// What the production filters ask of a listed page: the provider that owns
+    /// it, or `None` when the line could not be read (`Page::url == None`) or
+    /// the URL is nobody's.
+    fn provider_of(page: &Page) -> Option<Provider> {
+        page.url.as_deref().and_then(Provider::from_url)
+    }
+
+    /// The URL of the tab that is selected when tab preparation returns -- i.e.
+    /// the tab `submit_regular_prompt` would type the prompt into.
+    fn prompt_target_url(fake: &FakeMcp) -> String {
+        fake.live_url(fake.selected.expect("a page must be selected"))
+    }
+
     // ---------------------------------------------------------------------
-    // KNOWN GAP: opaque-path URLs can forge the listing grammar.
+    // CLOSED GAP (was: opaque-path URLs can forge the listing grammar).
     //
-    // These three tests assert the behaviour we *want*, and they FAIL today.
-    // They are `#[ignore]`d rather than deleted so the gap stays visible and
-    // so nobody pins the current behaviour as correct. The root cause is that
-    // `page.url()` keeps raw spaces for opaque-path schemes (`data:`, `blob:`,
-    // `mailto:`), so the page controls where the ` (` and ` isolatedContext=`
-    // separators appear -- see `page_url_from_label`.
-    //
-    // NOT a regression: `main` accepts every one of these payloads too (its
-    // substring match never looked at the grammar at all). Fixing them means
-    // dropping the prose parser for chrome-devtools-mcp's structured output
-    // (`--experimentalStructuredContent`), not adding another heuristic here.
-    // Run them with: cargo test -- --ignored known_gap
+    // These three tests were written red and `#[ignore]`d while the gap was
+    // open. They are the acceptance criteria for closing it, so they now run in
+    // the ordinary suite and their names are kept for traceability rather than
+    // renamed. What closes them is `page_url_from_label` refusing to answer
+    // when a line has more than one possible reading; the root cause -- that
+    // `page.url()` keeps raw spaces for opaque-path schemes, so the page
+    // chooses where the ` (` and ` isolatedContext=` separators fall -- is
+    // unchanged and unfixable in the prose.
     // ---------------------------------------------------------------------
 
     /// The premise the url-shape guard was removed on --
@@ -4621,7 +4802,6 @@ mod tests {
     /// So a `data:` page can put a literal ` (` inside its own URL and choose
     /// what the "trailing parenthesised group" is.
     #[test]
-    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
     fn known_gap_g2_data_url_can_forge_the_trailing_group() {
         // One self-contained hostile page: the HTML sets its own title, and the
         // URL carries the forged separator.
@@ -4630,17 +4810,20 @@ mod tests {
             "0: Free VPN (data:text/html,<title>Free VPN</title>x (https://chatgpt.com/)\n",
         ));
         assert_eq!(
-            Provider::from_url(&pages[0].url),
+            provider_of(&pages[0]),
             None,
             "a data: page forged the trailing group and was adopted as a provider (parsed url = {:?})",
             pages[0].url
         );
+        // Not merely "no provider matched": the line is unreadable, so the tab
+        // has no URL at all and cannot be mistaken for blank or disposable
+        // either.
+        assert_eq!(pages[0].url, None);
     }
 
     /// The consequence -- the forged tab is SELECTED on
     /// the reuse path, i.e. it is the tab the prompt gets typed into.
     #[test]
-    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
     fn known_gap_g2_forged_tab_is_selected_on_reuse_path() {
         let mut fake = FakeMcp::new(&[
             (
@@ -4648,7 +4831,11 @@ mod tests {
                 "Free VPN (data:text/html,<title>Free VPN</title>x (https://chatgpt.com/)",
             ),
             (2, "https://example.com/"),
-        ]);
+        ])
+        .on_live_url(
+            1,
+            "data:text/html,<title>Free VPN</title>x (https://chatgpt.com/",
+        );
         let result = ensure_provider_tab_with(
             &mut |tool, args| fake.call(tool, args),
             Provider::ChatGpt,
@@ -4663,6 +4850,7 @@ mod tests {
             "the forged data: tab was SELECTED: {:?}",
             fake.page_ids_for("select_page")
         );
+        assert_eq!(prompt_target_url(&fake), "https://chatgpt.com/");
     }
 
     /// The same premise failure reached through the NEW
@@ -4670,17 +4858,484 @@ mod tests {
     /// *title* embedding the marker; a hostile *URL* embedding it works,
     /// because the name it leaves behind ("y)") has no space.
     #[test]
-    #[ignore = "known gap: opaque-path URLs keep raw spaces and can forge the listing grammar"]
     fn known_gap_g3_url_can_forge_the_isolated_context_marker() {
         let pages = parse_pages(concat!(
             "## Pages\n",
             "0: https://chatgpt.com/ (data:text/html,x isolatedContext=y)\n",
         ));
         assert_eq!(
-            Provider::from_url(&pages[0].url),
+            provider_of(&pages[0]),
             None,
             "a data: page forged the isolatedContext marker and was adopted (parsed url = {:?})",
             pages[0].url
+        );
+        assert_eq!(pages[0].url, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // The whole seam, one scheme at a time: what `list_pages` printed -> which
+    // tab preparation adopts -> which tab the prompt would be typed into.
+    //
+    // Each case states what is actually known about that scheme. Only `data:`
+    // has runtime evidence of a *forgeable separator* (the three tests above,
+    // which failed before this guard existed); the others are here because they
+    // share the opaque-path property that makes a line unreadable, and the
+    // assertions are limited to what each payload demonstrates.
+    // ---------------------------------------------------------------------
+
+    /// The hostile tab and the tab the prompt lands on, for a listing that no
+    /// provider tab can be read out of.
+    fn drive_reuse_path(fake: &mut FakeMcp, provider: Provider) -> (Vec<usize>, String) {
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            provider,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        (fake.page_ids_for("select_page"), prompt_target_url(fake))
+    }
+
+    /// `data:` -- the one with runtime evidence. The URL keeps a raw ` (`, so
+    /// the page decides where the title/URL boundary appears; here it moves the
+    /// boundary with the ` isolatedContext=` marker instead of a second group,
+    /// which is the G3 payload driven through the whole seam rather than
+    /// through `parse_pages` alone.
+    #[test]
+    fn data_scheme_tab_reaches_neither_selection_nor_the_prompt() {
+        // The hostile tab is deliberately not the selected one. ` [selected]` is
+        // appended *after* the marker (McpResponse.js:666), and a trailing
+        // ` [selected]` puts a space into the forged name, which the stripper
+        // already refuses -- so the payload only bites on a line without it.
+        let mut fake = FakeMcp::new(&[
+            (1, "https://example.com/"),
+            (
+                2,
+                "https://chatgpt.com/ (data:text/html,x isolatedContext=y)",
+            ),
+        ])
+        .on_live_url(2, "data:text/html,x isolatedContext=y");
+        let (selected, prompt_target) = drive_reuse_path(&mut fake, Provider::ChatGpt);
+
+        assert!(
+            selected.is_empty(),
+            "the data: tab was selected: {selected:?}"
+        );
+        assert_eq!(prompt_target, "https://chatgpt.com/");
+        assert!(
+            fake.open_ids().contains(&2),
+            "a tab we could not identify is not ours to close"
+        );
+    }
+
+    /// `blob:` -- a real top-level page URL (`URL.createObjectURL`) that
+    /// *contains* the provider's origin, so it is the scheme most likely to
+    /// survive a host check written as a substring match.
+    ///
+    /// **What this pins is [`url_host`]'s pre-existing http(s)-only rule.** The
+    /// line reads back unambiguously under both the old parser and the new one
+    /// -- the UA mints `blob:<origin>/<uuid>` with no space in it, so no
+    /// separator can be forged -- and the *rejection* comes entirely from the
+    /// scheme check. Removing that check turns this test red.
+    ///
+    /// It is not immune to the reading rule, though, and an earlier version of
+    /// this comment wrongly claimed it was: a rule broad enough to drop the
+    /// whitespace condition makes the whole line a second possible reading, the
+    /// URL stops resolving at all, and this test fails on its `parse_pages`
+    /// assertion instead (measured: `left: None, right:
+    /// Some("blob:https://chatgpt.com/6c8f-1234")`). What it is insensitive to
+    /// is the live-URL gate.
+    #[test]
+    fn blob_scheme_tab_reaches_neither_selection_nor_the_prompt() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "https://chatgpt.com/ (blob:https://chatgpt.com/6c8f-1234)",
+            ),
+            (2, "https://example.com/"),
+        ])
+        .on_live_url(1, "blob:https://chatgpt.com/6c8f-1234");
+        let (selected, prompt_target) = drive_reuse_path(&mut fake, Provider::ChatGpt);
+
+        // The line is readable -- exactly one reading survives -- so this tab is
+        // rejected on its scheme, not on ambiguity.
+        let pages =
+            parse_pages("## Pages\n0: https://chatgpt.com/ (blob:https://chatgpt.com/6c8f-1234)\n");
+        assert_eq!(
+            pages[0].url.as_deref(),
+            Some("blob:https://chatgpt.com/6c8f-1234")
+        );
+        assert!(
+            selected.is_empty(),
+            "the blob: tab was selected: {selected:?}"
+        );
+        assert_eq!(prompt_target, "https://chatgpt.com/");
+    }
+
+    /// `javascript:` -- a wrapper payload carrying the provider's own URL.
+    ///
+    /// Same standing as the `blob:` case above: **this pins [`url_host`]'s
+    /// http(s)-only rule**, not the ambiguity rule. The line is unambiguous
+    /// under every parser variant, so only removing the scheme check turns it
+    /// red. Whether Chrome ever leaves a tab on a `javascript:` URL is not
+    /// established here -- a `javascript:` navigation replaces the document
+    /// without changing its URL -- so no claim is made beyond "a line that
+    /// reads as one never reaches the composer".
+    #[test]
+    fn javascript_scheme_tab_reaches_neither_selection_nor_the_prompt() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "ChatGPT (javascript:location.href='https://chatgpt.com/')",
+            ),
+            (2, "https://example.com/"),
+        ])
+        .on_live_url(1, "javascript:location.href='https://chatgpt.com/'");
+        let (selected, prompt_target) = drive_reuse_path(&mut fake, Provider::ChatGpt);
+
+        assert!(
+            selected.is_empty(),
+            "the javascript: tab was selected: {selected:?}"
+        );
+        assert_eq!(prompt_target, "https://chatgpt.com/");
+    }
+
+    /// `mailto:` -- the case the scheme allow-list deliberately resolves
+    /// *against* the parser, and therefore the one that shows why there are two
+    /// locks.
+    ///
+    /// `mailto:ops@evil.test (https://chatgpt.com/)` has two readings a URL
+    /// parser would accept: an untitled tab sitting on that whole string, or a
+    /// real ChatGPT tab titled `mailto:ops@evil.test`. Only the second is
+    /// something a browser can produce -- Chrome hands `mailto:` to an external
+    /// protocol handler and never leaves a tab on it -- so
+    /// [`SPACE_BEARING_PAGE_SCHEMES`] excludes it and the line resolves to the
+    /// provider. That is the right call for real titles and it is exactly the
+    /// call that would be wrong if the premise were ever false, so this test
+    /// asserts the premise being false is still safe: the tab really is on the
+    /// `mailto:` URL, and [`verify_selected_page_is_provider`] refuses it before
+    /// anything is typed.
+    #[test]
+    fn mailto_scheme_tab_reaches_neither_selection_nor_the_prompt() {
+        let pages = parse_pages("## Pages\n0: mailto:ops@evil.test (https://chatgpt.com/)\n");
+        assert_eq!(
+            pages[0].url.as_deref(),
+            Some("https://chatgpt.com/"),
+            "a mailto:-shaped title must not cost a real provider tab"
+        );
+
+        let mut fake = FakeMcp::new(&[
+            (1, "mailto:ops@evil.test (https://chatgpt.com/)"),
+            (2, "https://example.com/"),
+        ])
+        .on_live_url(1, "mailto:ops@evil.test (https://chatgpt.com/)");
+        let err = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect_err("expected a refusal, got Ok");
+
+        assert!(
+            err.contains("mailto:ops@evil.test") && err.contains("refusing"),
+            "the error must name what the tab really is: {err}"
+        );
+        assert!(
+            fake.urls_for("new_page").is_empty(),
+            "no prompt-bearing tab was reached"
+        );
+    }
+
+    /// The second lock, on the assumption the first one is built from: the
+    /// listing says this tab is ChatGPT's and it reads back unambiguously, but
+    /// the tab is really on a `data:` page. That is what a wrong serialisation
+    /// model -- or a tab that navigated between `list_pages` and `select_page`
+    /// -- looks like from here, and `location.href` is the one answer that does
+    /// not come from the prose.
+    #[test]
+    fn a_tab_whose_live_url_contradicts_the_listing_never_gets_the_prompt() {
+        let mut fake = FakeMcp::new(&[(1, "https://chatgpt.com/c/abc")])
+            .on_live_url(1, "data:text/html,<h1>fake composer</h1>");
+        let err = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect_err("expected a refusal, got Ok");
+
+        assert!(
+            err.contains("data:text/html,<h1>fake composer</h1>") && err.contains("refusing"),
+            "the error must name what the tab really is: {err}"
+        );
+        // Nothing was typed anywhere: the caller exits before the composer.
+        assert!(fake.urls_for("new_page").is_empty());
+    }
+
+    /// Every realistic title in [`TITLE_CORPUS`] must still resolve to the real
+    /// URL. The `R*` half is the measured cost of an ambiguity rule that treats
+    /// any `scheme:`-shaped token as a possible opaque URL: all 13 of them read
+    /// back correctly at HEAD and return `None` under that rule, which turns a
+    /// working provider tab into one extra tab on every run, forever.
+    #[test]
+    fn every_realistic_title_still_reads_back_to_the_real_url() {
+        let refused: Vec<&str> = TITLE_CORPUS
+            .iter()
+            .filter(|(_, label)| page_url_from_label(label) != Some("https://chatgpt.com/c/abc"))
+            .map(|(tag, _)| *tag)
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "these titles no longer resolve to their tab's URL: {refused:?}"
+        );
+    }
+
+    /// Every forgery shape in [`HOSTILE_CORPUS`], as whole listing lines so the
+    /// `[selected]` and ` isolatedContext=` suffixes are peeled by the code
+    /// under test. Titled and untitled, single and double forge, and the
+    /// near-miss where the marker eats the tail of a forged group.
+    #[test]
+    fn no_forged_listing_line_ever_resolves_to_a_provider() {
+        let adopted: Vec<(&str, Option<String>)> = HOSTILE_CORPUS
+            .iter()
+            .map(|(tag, line)| (*tag, parse_pages(&format!("## Pages\n{line}\n"))))
+            .filter(|(_, pages)| provider_of(&pages[0]).is_some())
+            .map(|(tag, pages)| (tag, pages[0].url.clone()))
+            .collect();
+        assert!(
+            adopted.is_empty(),
+            "these forged lines were adopted as a provider: {adopted:?}"
+        );
+    }
+
+    /// `--new` promises to clean up *this* provider's previous tabs, and a tab
+    /// whose line reads back is still disposed of -- a parenthesised title must
+    /// not turn the documented cleanup into a leak of one tab per run.
+    ///
+    /// The unreadable tab is deliberately NOT disposed of. `--new`'s own rule is
+    /// that tabs which are not this provider's are not ours to close, and a tab
+    /// we cannot name has not been shown to be ours. HEAD closed it, but only as
+    /// a side effect of mis-reading it as the provider's -- the same mis-reading
+    /// that got the prompt typed into it.
+    #[test]
+    fn new_session_disposes_readable_provider_tabs_and_spares_unreadable_ones() {
+        for (label, live, expected_after) in [
+            (
+                "Fix bug (error: undefined) (https://chatgpt.com/c/abc)",
+                "https://chatgpt.com/c/abc",
+                vec![2, 3],
+            ),
+            (
+                "https://chatgpt.com/c/abc",
+                "https://chatgpt.com/c/abc",
+                vec![2, 3],
+            ),
+            (
+                "Free VPN (data:text/html,x (https://chatgpt.com/)",
+                "data:text/html,x (https://chatgpt.com/",
+                vec![1, 2, 3],
+            ),
+        ] {
+            let mut fake =
+                FakeMcp::new(&[(1, label), (2, "https://example.com/other")]).on_live_url(1, live);
+            let result = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                true,
+                true,
+                false,
+                Duration::ZERO,
+            );
+            assert!(result.is_ok(), "unexpected error for {label:?}: {result:?}");
+            assert_eq!(
+                fake.open_ids(),
+                expected_after,
+                "wrong --new disposal for {label:?}"
+            );
+        }
+    }
+
+    /// The path that has no pinned tab: `new_page` came back without an
+    /// identifiable fresh ID, so nothing was ever committed to and the readiness
+    /// probe runs against whichever tab happens to be selected. Without a check
+    /// at the return, a passing probe on a hostile page is enough to send the
+    /// prompt there.
+    #[test]
+    fn an_unpinned_run_verifies_the_tab_before_reporting_success() {
+        let mut fake = FakeMcp::new(&[(1, "https://evil.test/")]);
+        fake.new_page_opens_nothing = true;
+        let err = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect_err("expected a refusal, got Ok");
+
+        assert!(
+            err.contains("https://evil.test/") && err.contains("refusing"),
+            "the error must name the tab that would have received the prompt: {err}"
+        );
+    }
+
+    /// The unpinned path is reachable exactly when a logged-out session
+    /// redirects the fresh tab to a sign-in host *and* a second tab appears at
+    /// the same time (a provider popup, a restored session), which is what
+    /// leaves [`fresh_page_ids`] unable to name the tab this run opened.
+    ///
+    /// Measured: with the gate refusing anything but [`Provider::owns_url`],
+    /// both Gemini and ChatGPT returned `Err("...reports
+    /// https://accounts.google.com/... instead; refusing to drive it")` where
+    /// they previously returned `Ok` and let [`check_login_status`] print the
+    /// actionable "run `ask-bridge login`" message. Accepting a provider-owned
+    /// sign-in origin restores that, and the second half of this test pins how
+    /// narrow the acceptance is.
+    #[test]
+    fn a_logged_out_fresh_tab_still_reaches_the_login_message() {
+        for (provider, landing) in [
+            (
+                Provider::Gemini,
+                "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp",
+            ),
+            (Provider::ChatGpt, "https://auth.openai.com/authorize?x=1"),
+        ] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_lands_on = Some(landing.to_string());
+            fake.new_page_also_opens = Some("https://example.com/popup".to_string());
+            let result = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                provider,
+                false,
+                true,
+                false,
+                Duration::ZERO,
+            );
+            assert!(
+                result.is_ok(),
+                "a sign-in redirect must still reach the login check for {}: {:?}",
+                provider.display_name(),
+                result
+            );
+        }
+
+        // Narrow: a sign-in host that is not on its way back to this provider,
+        // and a page that is not a sign-in host at all, are both still refused.
+        for landing in [
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fevil.test%2F",
+            "https://evil.test/composer",
+        ] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_lands_on = Some(landing.to_string());
+            fake.new_page_also_opens = Some("https://example.com/popup".to_string());
+            let err = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::Gemini,
+                false,
+                true,
+                false,
+                Duration::ZERO,
+            )
+            .expect_err("expected a refusal, got Ok");
+            assert!(err.contains("refusing"), "wrong error for {landing}: {err}");
+        }
+    }
+
+    /// The accepted cost of the ambiguity rule, pinned so it cannot change
+    /// silently.
+    ///
+    /// A title that itself contains ` (data:` makes its line unreadable: the
+    /// `data:` candidate it creates is a URL a browser really could be on, so
+    /// nothing in the prose separates "a ChatGPT tab titled `talk about (data:
+    /// urls)`" from "a tab sitting on `data: urls) (https://chatgpt.com/c/abc`".
+    /// This was NOT narrowed away. Requiring a `data:` candidate to contain a
+    /// comma (a real data URL must) would fix the first case below but not the
+    /// second, and its failure direction is the wrong one: if the premise were
+    /// ever false, a comma-less forgery would become the *unique* reading and be
+    /// adopted. The current rule's failure direction is one extra tab.
+    ///
+    /// The empty-title line is included for completeness: it is refused too,
+    /// but it was already unreadable at HEAD, so it is not a regression.
+    ///
+    /// The cost is bounded and does not accumulate -- the second run adopts the
+    /// readable tab the first run opened, rather than opening a third.
+    #[test]
+    fn a_title_quoting_a_data_url_costs_one_tab_and_is_never_adopted() {
+        for line in [
+            "1: talk about (data: urls) (https://chatgpt.com/c/abc)",
+            "1: A (data:text/html,x) (https://chatgpt.com/c/abc)",
+            "1:  (https://chatgpt.com/c/abc)",
+        ] {
+            let pages = parse_pages(&format!("## Pages\n{line}\n"));
+            assert_eq!(pages[0].url, None, "expected an unreadable line: {line}");
+        }
+
+        let mut fake = FakeMcp::new(&[(1, "talk about (data: urls) (https://chatgpt.com/c/abc)")])
+            .on_live_url(1, "https://chatgpt.com/c/abc");
+        for run in 1..=2 {
+            let result = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                false,
+                true,
+                false,
+                Duration::ZERO,
+            );
+            assert!(result.is_ok(), "run {run} failed: {result:?}");
+        }
+        assert_eq!(
+            fake.open_ids(),
+            vec![1, 2],
+            "the orphaned tab must cost exactly one tab, not one per run"
+        );
+        assert!(
+            !fake.page_ids_for("select_page").contains(&1),
+            "the unreadable tab was selected: {:?}",
+            fake.page_ids_for("select_page")
+        );
+    }
+
+    /// The reading rule itself: one possible reading is the answer, and both
+    /// "none" and "more than one" are refusals. Written against the boundary
+    /// cases the seam tests above cannot show individually.
+    #[test]
+    fn a_label_is_read_only_when_exactly_one_reading_is_possible() {
+        // Unique: the title cannot be a URL, so only the group can be.
+        assert_eq!(
+            page_url_from_label("ChatGPT (4o) (https://chatgpt.com/c/abc)"),
+            Some("https://chatgpt.com/c/abc"),
+            "a parenthesised title must not make an unambiguous line unreadable"
+        );
+        // Unique: an untitled page.
+        assert_eq!(
+            page_url_from_label("about:blank"),
+            Some("about:blank"),
+            "blank-tab handling depends on non-http schemes still being read"
+        );
+        // Two readings -- the opaque URL is one of them.
+        assert_eq!(
+            page_url_from_label("T (data:text/html,x (https://chatgpt.com/)"),
+            None
+        );
+        // Two readings -- an untitled tab on the whole opaque URL, or a titled
+        // tab on the group.
+        assert_eq!(
+            page_url_from_label("data:text/html,x (https://chatgpt.com/)"),
+            None
+        );
+        // No reading at all: the isolatedContext stripper cut a line mid-URL,
+        // and what is left is not something a serialiser emits.
+        assert_eq!(
+            page_url_from_label("https://chatgpt.com/ (data:text/html,x"),
+            None
         );
     }
 
@@ -4920,7 +5575,7 @@ mod tests {
             "0: https://chatgpt.com/ (data:text/html,<h1>fake composer</h1>) [selected]\n",
         ));
         assert_eq!(
-            Provider::from_url(&pages[0].url),
+            provider_of(&pages[0]),
             None,
             "a data: page titled with a provider URL was adopted as that provider (parsed url = {:?})",
             pages[0].url
@@ -4938,7 +5593,8 @@ mod tests {
                 "https://chatgpt.com/ (data:text/html,<h1>fake composer</h1>)",
             ),
             (2, "https://example.com/"),
-        ]);
+        ])
+        .on_live_url(1, "data:text/html,<h1>fake composer</h1>");
         let result = ensure_provider_tab_with(
             &mut |tool, args| fake.call(tool, args),
             Provider::ChatGpt,
@@ -4992,22 +5648,22 @@ mod tests {
             "3: Visit https://chatgpt.com now (https://evil.test/)\n",
             "4: Sneaky (https://chatgpt.com/) (https://evil.test/)\n",
         ));
-        let urls: Vec<&str> = pages.iter().map(|p| p.url.as_str()).collect();
+        let urls: Vec<Option<&str>> = pages.iter().map(|p| p.url.as_deref()).collect();
         assert_eq!(
             urls,
             vec![
-                "https://chatgpt.com/c/abc",
-                "https://gemini.google.com/app",
-                "https://en.wikipedia.org/wiki/Foo_(bar)",
-                "https://evil.test/",
-                "https://evil.test/",
+                Some("https://chatgpt.com/c/abc"),
+                Some("https://gemini.google.com/app"),
+                Some("https://en.wikipedia.org/wiki/Foo_(bar)"),
+                Some("https://evil.test/"),
+                Some("https://evil.test/"),
             ]
         );
         assert!(pages[0].selected);
         assert!(!pages[1].selected);
-        assert_eq!(Provider::from_url(&pages[0].url), Some(Provider::ChatGpt));
-        assert_eq!(Provider::from_url(&pages[3].url), None);
-        assert_eq!(Provider::from_url(&pages[4].url), None);
+        assert_eq!(provider_of(&pages[0]), Some(Provider::ChatGpt));
+        assert_eq!(provider_of(&pages[3]), None);
+        assert_eq!(provider_of(&pages[4]), None);
     }
 
     /// A3: `chrome-devtools-mcp` auto-discovers externally created
@@ -5023,18 +5679,30 @@ mod tests {
             "2: https://chatgpt.com/c/ghi isolatedContext=ask\n",
             "3: https://gemini.google.com/app [selected] isolatedContext=isolated-context-2\n",
         ));
-        let parsed: Vec<(&str, bool, Option<Provider>)> = pages
+        let parsed: Vec<(Option<&str>, bool, Option<Provider>)> = pages
             .iter()
-            .map(|p| (p.url.as_str(), p.selected, Provider::from_url(&p.url)))
+            .map(|p| (p.url.as_deref(), p.selected, provider_of(p)))
             .collect();
         assert_eq!(
             parsed,
             vec![
-                ("https://chatgpt.com/c/abc", true, Some(Provider::ChatGpt)),
-                ("https://chatgpt.com/c/def", false, Some(Provider::ChatGpt)),
-                ("https://chatgpt.com/c/ghi", false, Some(Provider::ChatGpt)),
                 (
-                    "https://gemini.google.com/app",
+                    Some("https://chatgpt.com/c/abc"),
+                    true,
+                    Some(Provider::ChatGpt)
+                ),
+                (
+                    Some("https://chatgpt.com/c/def"),
+                    false,
+                    Some(Provider::ChatGpt)
+                ),
+                (
+                    Some("https://chatgpt.com/c/ghi"),
+                    false,
+                    Some(Provider::ChatGpt)
+                ),
+                (
+                    Some("https://gemini.google.com/app"),
                     true,
                     Some(Provider::Gemini)
                 ),
@@ -5053,10 +5721,10 @@ mod tests {
             "0: https://chatgpt.com/ isolatedContext=z (https://evil.test/)\n",
             "1: https://chatgpt.com/ isolatedContext=z (data:text/html,x)\n",
         ));
-        assert_eq!(pages[0].url, "https://evil.test/");
-        assert_eq!(Provider::from_url(&pages[0].url), None);
-        assert_eq!(pages[1].url, "data:text/html,x");
-        assert_eq!(Provider::from_url(&pages[1].url), None);
+        assert_eq!(pages[0].url.as_deref(), Some("https://evil.test/"));
+        assert_eq!(provider_of(&pages[0]), None);
+        assert_eq!(pages[1].url.as_deref(), Some("data:text/html,x"));
+        assert_eq!(provider_of(&pages[1]), None);
     }
 
     /// A4: `Provider::from_url` needs an explicit http(s) scheme. This is user
@@ -5128,8 +5796,17 @@ mod tests {
     /// the real server keeps (monotonically increasing IDs, `new_page` selects
     /// the page it opened) and records every call, so tab bookkeeping can be
     /// asserted without ever starting a browser.
+    ///
+    /// `pages` holds the *listing line* for each tab, which is what the real
+    /// server prints and the only thing the parser gets to see. What the tab is
+    /// really on is a separate fact -- that is the whole point of the attack --
+    /// so it lives in `live_urls`, defaults to the listing line (true for the
+    /// untitled tabs most fixtures use), and is set explicitly by any test
+    /// where the two must disagree. Nothing here derives one from the other;
+    /// deriving it would put the code under test into the harness.
     struct FakeMcp {
         pages: Vec<(usize, String)>,
+        live_urls: Vec<(usize, String)>,
         selected: Option<usize>,
         next_id: usize,
         calls: Vec<(String, Value)>,
@@ -5138,6 +5815,13 @@ mod tests {
         not_ready_probes: usize,
         vanish_page_after_probes: Option<(usize, usize)>,
         new_page_opens_nothing: bool,
+        /// Where the tab `new_page` opens actually lands, when that is not the
+        /// URL it was asked for -- i.e. a redirect that has already happened by
+        /// the time the server echoes the page list.
+        new_page_lands_on: Option<String>,
+        /// A second tab that appears alongside the one `new_page` opened (a
+        /// provider popup, a restored session).
+        new_page_also_opens: Option<String>,
     }
 
     impl FakeMcp {
@@ -5147,6 +5831,7 @@ mod tests {
                     .iter()
                     .map(|(id, url)| (*id, (*url).to_string()))
                     .collect(),
+                live_urls: Vec::new(),
                 selected: pages.first().map(|(id, _)| *id),
                 next_id: pages.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1,
                 calls: Vec::new(),
@@ -5155,7 +5840,31 @@ mod tests {
                 not_ready_probes: 0,
                 vanish_page_after_probes: None,
                 new_page_opens_nothing: false,
+                new_page_lands_on: None,
+                new_page_also_opens: None,
             }
+        }
+
+        /// Say what tab `id` is *really* on, when its listing line says
+        /// something else.
+        fn on_live_url(mut self, id: usize, url: &str) -> Self {
+            self.live_urls.push((id, url.to_string()));
+            self
+        }
+
+        /// What `() => location.href` answers for tab `id`.
+        fn live_url(&self, id: usize) -> String {
+            self.live_urls
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, url)| url.clone())
+                .or_else(|| {
+                    self.pages
+                        .iter()
+                        .find(|(pid, _)| *pid == id)
+                        .map(|(_, label)| label.clone())
+                })
+                .unwrap_or_default()
         }
 
         fn text_result(text: String) -> Value {
@@ -5193,13 +5902,19 @@ mod tests {
                     if !self.new_page_opens_nothing {
                         let id = self.next_id;
                         self.next_id += 1;
-                        let url = args
-                            .get("url")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("about:blank")
-                            .to_string();
+                        let url = self.new_page_lands_on.clone().unwrap_or_else(|| {
+                            args.get("url")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("about:blank")
+                                .to_string()
+                        });
                         self.pages.push((id, url));
                         self.selected = Some(id);
+                        if let Some(extra) = self.new_page_also_opens.clone() {
+                            let extra_id = self.next_id;
+                            self.next_id += 1;
+                            self.pages.push((extra_id, extra));
+                        }
                     }
                     Ok(Self::text_result(self.page_list_text()))
                 }
@@ -5237,6 +5952,19 @@ mod tests {
                     Ok(Self::text_result(self.page_list_text()))
                 }
                 "evaluate_script" => {
+                    let function = args.get("function").and_then(|f| f.as_str()).unwrap_or("");
+                    // Exact match, not `contains`: production also evaluates
+                    // `() => window.location.href` elsewhere, and a loose match
+                    // would silently answer those with a page URL too.
+                    if function == LIVE_URL_PROBE_JS {
+                        // Not a readiness probe -- do not advance `probes`, or
+                        // the tests that count them would drift.
+                        let selected = self.selected.expect("a page must be selected");
+                        return Ok(Self::text_result(format!(
+                            "Script ran.\n```json\n{}\n```",
+                            serde_json::json!(self.live_url(selected))
+                        )));
+                    }
                     self.probes += 1;
                     if let Some((probe, id)) = self.vanish_page_after_probes
                         && self.probes == probe
@@ -5813,7 +6541,8 @@ mod tests {
         let mut fake = FakeMcp::new(&[
             (4, "https://example.com/"),
             (5, "ChatGPT (https://chatgpt.com/c/abc)"),
-        ]);
+        ])
+        .on_live_url(5, "https://chatgpt.com/c/abc");
         let result = ensure_provider_tab_with(
             &mut |tool, args| fake.call(tool, args),
             Provider::ChatGpt,
@@ -6376,29 +7105,29 @@ mod tests {
         let before = [
             Page {
                 id: 1,
-                url: "https://chatgpt.com/c/existing".to_string(),
+                url: Some("https://chatgpt.com/c/existing".to_string()),
                 selected: true,
             },
             Page {
                 id: 2,
-                url: "https://example.com/".to_string(),
+                url: Some("https://example.com/".to_string()),
                 selected: false,
             },
         ];
         let after = [
             Page {
                 id: 1,
-                url: "https://chatgpt.com/c/existing".to_string(),
+                url: Some("https://chatgpt.com/c/existing".to_string()),
                 selected: false,
             },
             Page {
                 id: 2,
-                url: "https://example.com/".to_string(),
+                url: Some("https://example.com/".to_string()),
                 selected: false,
             },
             Page {
                 id: 7,
-                url: "https://chatgpt.com/".to_string(),
+                url: Some("https://chatgpt.com/".to_string()),
                 selected: true,
             },
         ];
@@ -6410,23 +7139,23 @@ mod tests {
     fn refuses_to_guess_when_new_page_identity_is_ambiguous() {
         let before = [Page {
             id: 1,
-            url: "https://chatgpt.com/c/existing".to_string(),
+            url: Some("https://chatgpt.com/c/existing".to_string()),
             selected: true,
         }];
         let after = [
             Page {
                 id: 1,
-                url: "https://chatgpt.com/c/existing".to_string(),
+                url: Some("https://chatgpt.com/c/existing".to_string()),
                 selected: false,
             },
             Page {
                 id: 7,
-                url: "https://chatgpt.com/".to_string(),
+                url: Some("https://chatgpt.com/".to_string()),
                 selected: true,
             },
             Page {
                 id: 8,
-                url: "https://example.com/popup".to_string(),
+                url: Some("https://example.com/popup".to_string()),
                 selected: false,
             },
         ];
@@ -6440,12 +7169,12 @@ mod tests {
     fn refuses_to_reuse_an_existing_page_when_no_new_page_appears() {
         let before = [Page {
             id: 1,
-            url: "https://chatgpt.com/c/existing".to_string(),
+            url: Some("https://chatgpt.com/c/existing".to_string()),
             selected: true,
         }];
         let after = [Page {
             id: 1,
-            url: "https://chatgpt.com/c/existing".to_string(),
+            url: Some("https://chatgpt.com/c/existing".to_string()),
             selected: true,
         }];
 
@@ -7559,7 +8288,11 @@ fn open_url_tab(
         .ok_or_else(|| format!("Invalid list_pages response structure: {:?}", list_res))?;
 
     let pages_before = parse_pages(text);
-    let target_page_id = if pages_before.len() == 1 && is_blank_tab_url(&pages_before[0].url) {
+    // `url == None` is "unknown", never "blank": a tab whose listing line did
+    // not read back unambiguously is not a blank tab to navigate away.
+    let target_page_id = if pages_before.len() == 1
+        && pages_before[0].url.as_deref().is_some_and(is_blank_tab_url)
+    {
         call_mcp_tool(
             config_path,
             "navigate_page",
@@ -7590,6 +8323,10 @@ fn open_url_tab(
                 )
             })?;
         let refreshed_pages = parse_pages(refreshed_text);
+        // Upstream `c1da128`: bind the new tab by page-ID set difference, not
+        // by matching its listed URL. That is the stronger rule here -- an ID
+        // the browser minted cannot be forged by a page, whereas the URL this
+        // used to compare against comes out of the listing prose.
         unique_new_page_id(&pages_before, &refreshed_pages)?
     };
 
@@ -9416,7 +10153,9 @@ fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> V
     if fresh.len() > 1 {
         let owned: Vec<usize> = after
             .iter()
-            .filter(|p| fresh.contains(&p.id) && provider.owns_url(&p.url))
+            .filter(|p| {
+                fresh.contains(&p.id) && p.url.as_deref().is_some_and(|url| provider.owns_url(url))
+            })
             .map(|p| p.id)
             .collect();
         if owned.len() == 1 {
@@ -9506,6 +10245,86 @@ struct TabOutcome {
 /// How long to wait between readiness probes while a provider page loads.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The probe [`verify_selected_page_is_provider`] sends. `location` is
+/// `[LegacyUnforgeable]`, so a page can neither shadow nor redefine it.
+const LIVE_URL_PROBE_JS: &str = "() => location.href";
+
+/// Ask the tab that is currently selected who it is, and refuse to go on unless
+/// the answer is `provider`.
+///
+/// This is the second lock on the same door, and deliberately not made of the
+/// same material as the first. Everything else in this module learns a tab's
+/// identity from [`parse_pages`], i.e. from prose that chrome-devtools-mcp
+/// formats and a page partly writes; [`page_url_from_label`] can only ever be
+/// as right as its model of how URLs serialise. `location.href` is
+/// `[LegacyUnforgeable]` in the HTML spec -- a page cannot shadow, redefine or
+/// proxy it -- and `evaluate_script` returns it as JSON rather than as prose,
+/// so this answer does not pass through the ambiguous grammar at all.
+///
+/// # Call sites
+///
+/// Both places where a tab can reach the composer without this run having
+/// chosen and identified it:
+///
+/// 1. **Adoption.** A tab inherited from a previous run, identified by reading
+///    the listing -- that reading is what is being checked.
+/// 2. **An unpinned run.** `new_page` came back without an identifiable fresh
+///    ID, so nothing was ever committed to and the readiness probe runs against
+///    whichever tab happens to be selected.
+///
+/// A run that pinned a tab it navigated itself is not checked -- both the
+/// freshly opened tab and the reused blank tab, which this run navigates to
+/// [`Provider::home_url`] before pinning. Neither identity came from the
+/// listing, so neither was ever in question.
+///
+/// # Why a sign-in origin passes
+///
+/// [`Provider::owns_auth_url`] is accepted as well as [`Provider::owns_url`],
+/// and that is load-bearing rather than lenient. Case 2 is reachable exactly
+/// when a logged-out session redirects the fresh tab to a sign-in host *and*
+/// something else opened a tab at the same time; refusing there replaced
+/// [`check_login_status`]'s actionable "run `ask-bridge login`" message with a
+/// bare refusal (measured on Gemini and ChatGPT). Nothing is given away: an
+/// attacker cannot serve `auth.openai.com`, and `accounts.google.com` only
+/// counts when the URL itself names this provider as its destination.
+///
+/// The safety here rests on that origin restriction alone. It is tempting to
+/// add "and a sign-in page has no composer anyway", but nothing enforces that:
+/// [`main`] proceeds on both `Ok(Unknown)` and `Err(_)` from
+/// [`check_login_status`], so a page that this gate blesses AND that presents a
+/// composer-shaped DOM would be typed into. Widening what passes here widens
+/// exactly that -- weigh any future change against the origin check, not
+/// against an assumption about the page's contents.
+///
+/// Failure is an error rather than a silent re-open: the listing having lied
+/// about a tab is not a condition to paper over, and the prompt -- which is
+/// what gets typed into whatever tab this call blesses -- has not been sent
+/// yet.
+fn verify_selected_page_is_provider<F>(call: &mut F, provider: Provider) -> Result<(), String>
+where
+    F: FnMut(&str, Value) -> Result<Value, String>,
+{
+    let res = call(
+        "evaluate_script",
+        serde_json::json!({ "function": LIVE_URL_PROBE_JS }),
+    )?;
+    let href = parse_script_result(&res)?;
+    let href = href.as_str().ok_or_else(|| {
+        format!(
+            "Could not read the URL of the tab picked as {}'s; refusing to drive it",
+            provider.display_name()
+        )
+    })?;
+    if provider.owns_url(href) || provider.owns_auth_url(href) {
+        return Ok(());
+    }
+    Err(format!(
+        "The tab listed as {}'s reports {} instead; refusing to drive it",
+        provider.display_name(),
+        href
+    ))
+}
+
 /// Test seam for [`ensure_provider_tab`]: every browser interaction goes
 /// through `call` and the readiness poll interval is injectable, so the tab
 /// bookkeeping can be exercised against a fake MCP without ever starting a
@@ -9547,9 +10366,16 @@ where
         let disposable_ids: Vec<usize> = pages
             .iter()
             .filter(|p| {
-                provider.owns_url(&p.url)
-                    || provider.owns_auth_url(&p.url)
-                    || is_blank_tab_url(&p.url)
+                // A tab whose line did not read back (`url == None`) is left
+                // alone. The rule above is that tabs which are not this
+                // provider's are not ours to close, and a tab we cannot name
+                // has not been shown to be ours. That is a real difference from
+                // the pre-guard behaviour, which did close it -- but only as a
+                // side effect of mis-reading it as the provider's, which is the
+                // same mis-reading that got the prompt typed into it.
+                p.url.as_deref().is_some_and(|url| {
+                    provider.owns_url(url) || provider.owns_auth_url(url) || is_blank_tab_url(url)
+                })
             })
             .map(|p| p.id)
             .collect();
@@ -9611,7 +10437,11 @@ where
     } else {
         let provider_pages: Vec<&Page> = pages
             .iter()
-            .filter(|page| provider.owns_url(&page.url))
+            .filter(|page| {
+                page.url
+                    .as_deref()
+                    .is_some_and(|url| provider.owns_url(url))
+            })
             .collect();
 
         let provider_page_id = if provider_pages.len() > 1 {
@@ -9658,11 +10488,12 @@ where
                         "bringToFront": !headless
                     }),
                 )?;
+                verify_selected_page_is_provider(call, provider)?;
                 Some(page.id)
             }
             None => {
                 // No provider tab. If there is only one blank tab, navigate it. Otherwise open a new page.
-                if pages.len() == 1 && is_blank_tab_url(&pages[0].url) {
+                if pages.len() == 1 && pages[0].url.as_deref().is_some_and(is_blank_tab_url) {
                     if verbose {
                         println!(
                             "Navigating existing blank tab to {}...",
@@ -9709,7 +10540,11 @@ where
                     // receives the prompt.
                     let stale_auth: Vec<usize> = pages
                         .iter()
-                        .filter(|p| provider.owns_auth_url(&p.url))
+                        .filter(|p| {
+                            p.url
+                                .as_deref()
+                                .is_some_and(|url| provider.owns_auth_url(url))
+                        })
                         .map(|p| p.id)
                         // Belt and braces on a destructive call. Redundant
                         // today -- `pages` is the snapshot taken before
@@ -9756,7 +10591,7 @@ where
                     }
                     None => listed
                         .iter()
-                        .find(|p| provider.owns_url(&p.url))
+                        .find(|p| p.url.as_deref().is_some_and(|url| provider.owns_url(url)))
                         .map(|p| p.id),
                 };
                 if let Some(page_id) = target {
@@ -9794,6 +10629,16 @@ where
         if let Ok(parsed) = parse_script_result(&ready_res) {
             let is_ready = parsed.as_bool().unwrap_or(false);
             if is_ready {
+                // No pinned ID means this call never managed to identify the
+                // tab it opened, so the tab that just passed the readiness
+                // probe is whichever one happened to be selected -- possibly
+                // one re-derived from the listing prose a few lines above.
+                // That is the one path out of here whose target was never
+                // verified against anything but the parser, so verify it now,
+                // before the caller starts typing.
+                if pinned_page_id.is_none() {
+                    verify_selected_page_is_provider(call, provider)?;
+                }
                 return Ok(TabOutcome { close_failures });
             }
         }
