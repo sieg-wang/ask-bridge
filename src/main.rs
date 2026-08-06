@@ -109,6 +109,7 @@ impl Provider {
     /// imitate the provider's composer. The dot boundary is what makes the
     /// match safe: `evil.chatgpt.com` needs control of `chatgpt.com`'s DNS,
     /// while `chatgpt.com.evil.test` does not.
+    ///
     /// The scheme test is upstream's (`10fbe91` made `from_url` reject
     /// `http://chatgpt.com/c/abc`); the canonical-host test is this fork's.
     /// Both are kept: upstream's exact-host list would reject `sora.chatgpt.com`
@@ -121,12 +122,36 @@ impl Provider {
         if !scheme.eq_ignore_ascii_case("https") {
             return false;
         }
-        let Some(host) = url_host(url) else {
-            return false;
-        };
-        let root = self.primary_host();
-        match host.strip_suffix(root) {
-            Some(prefix) => prefix.is_empty() || prefix.ends_with('.'),
+        match url_host(url) {
+            Some(host) => host_is_within(&host, self.primary_host()),
+            None => false,
+        }
+    }
+
+    /// Hosts this provider's sign-in flow redirects through.
+    ///
+    /// A tab parked on one of these is debris from *our own* login redirect,
+    /// not user content: when the session has expired the tab `--new` just
+    /// opened lands here instead of on the provider. It is neither
+    /// provider-owned nor blank, so without this list nothing ever closes it
+    /// and every `--new` leaves one more behind.
+    fn auth_hosts(self) -> &'static [&'static str] {
+        match self {
+            Provider::ChatGpt => &["auth.openai.com", "auth0.openai.com"],
+            // claude.ai and Gemini both sign in through Google's account host,
+            // so a `--new` on either may reap the other's stale auth tab. That
+            // is transient redirect debris, never a page holding a
+            // conversation.
+            Provider::Gemini | Provider::Claude => &["accounts.google.com"],
+        }
+    }
+
+    fn owns_auth_url(self, url: &str) -> bool {
+        match url_host(url) {
+            Some(host) => self
+                .auth_hosts()
+                .iter()
+                .any(|root| host_is_within(&host, root)),
             None => false,
         }
     }
@@ -1421,6 +1446,17 @@ fn resolve_session_target(
 /// `https://chatgpt.com@evil.test/` the host is `evil.test`, so anything that
 /// decides trust from this function cannot be fooled by a domain parked in the
 /// userinfo. Ports, a trailing root dot and letter case are normalised away.
+/// Whether `host` is `root` or a sub-domain of it, matched on the dot boundary.
+///
+/// The boundary is what makes the match safe: `evil.chatgpt.com` requires
+/// control of `chatgpt.com`'s DNS, while `chatgpt.com.evil.test` does not.
+fn host_is_within(host: &str, root: &str) -> bool {
+    match host.strip_suffix(root) {
+        Some(prefix) => prefix.is_empty() || prefix.ends_with('.'),
+        None => false,
+    }
+}
+
 fn url_host(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -3022,21 +3058,45 @@ fn pages_from_tool_result(res: &Value, context: &str) -> Result<Vec<Page>, Strin
 }
 
 /// chrome-devtools-mcp renders a page as `<title> (<url>)` when the page has a
-/// title and as a bare `<url>` when it does not.
+/// title and as a bare `<url>` when it does not (McpResponse.js:664).
 ///
-/// The URL is always the *trailing* parenthesised group. That matters for more
-/// than tidiness: the title is chosen by the page, so a page titled
-/// `Visit https://chatgpt.com now` would otherwise let an attacker decide which
-/// provider owns the tab. Anything that does not look like a URL is left alone,
-/// which keeps an unexpected label shape harmless instead of mis-parsed.
+/// The URL is the *trailing* parenthesised group, and that position is decided
+/// by the grammar alone -- deliberately with no "does this look like a URL?"
+/// test on the candidate. Such a test can only fail open: a scheme without
+/// `//` (`data:`, `blob:`, `javascript:`) would flunk it, the whole label would
+/// be kept instead, and the host would then be read out of the *title* -- which
+/// the page chooses. A page titled `https://chatgpt.com/` sitting on a `data:`
+/// URL is exactly that attack. The grammar is unambiguous here because
+/// `page.url()` never contains a bare space (spaces are percent-encoded), so
+/// the ` (` separator can only come from the title boundary.
 fn page_url_from_label(label: &str) -> &str {
     if let Some(inner) = label.strip_suffix(')')
-        && let Some((_title, candidate)) = inner.rsplit_once(" (")
-        && (candidate.contains("://") || candidate.starts_with("about:"))
+        && let Some((_title, url)) = inner.rsplit_once(" (")
     {
-        return candidate;
+        return url;
     }
     label
+}
+
+/// Strip the trailing ` isolatedContext=<name>` marker that is appended after
+/// `[selected]` (McpResponse.js:666).
+///
+/// This is not opt-in: chrome-devtools-mcp auto-discovers externally created
+/// BrowserContexts and names them `isolated-context-<n>` (McpContext.js:513-519),
+/// so a user opening one incognito window is enough to put the marker on a line.
+/// Without stripping it, a titled provider page in that window parses to the
+/// whole label and becomes invisible -- every run opens another tab and `--new`
+/// can never close them.
+///
+/// The marker is honoured only when the entire tail is one space-free token.
+/// Generated names never contain a space, but a hostile page *title* can embed
+/// the literal marker; splitting on those would truncate the label back to
+/// title text and hand host selection to the page again.
+fn strip_isolated_context_suffix(rest: &str) -> &str {
+    match rest.rsplit_once(" isolatedContext=") {
+        Some((head, name)) if !name.is_empty() && !name.contains(' ') => head.trim_end(),
+        _ => rest,
+    }
 }
 
 fn parse_pages(text: &str) -> Vec<Page> {
@@ -3051,7 +3111,10 @@ fn parse_pages(text: &str) -> Vec<Page> {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let rest = rest.trim();
+            // Line grammar (McpResponse.js:666):
+            //   <id>: <label>[ [selected]][ isolatedContext=<name>]
+            // Peel the optional suffixes right to left, in that order.
+            let rest = strip_isolated_context_suffix(rest.trim());
             let (label, selected) = if rest.ends_with("[selected]") {
                 (rest.strip_suffix("[selected]").unwrap().trim(), true)
             } else {
@@ -4423,6 +4486,75 @@ mod tests {
         }
     }
 
+    /// VERIFIER TEST (A1): a `data:` URL has a scheme with no `//`, so any
+    /// "does the candidate look like a URL?" guard rejects it, keeps the whole
+    /// label, and then reads the host out of the page's own *title*.
+    #[test]
+    fn vab_title_beats_real_url_when_scheme_has_no_double_slash() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: https://chatgpt.com/ (data:text/html,<h1>fake composer</h1>) [selected]\n",
+        ));
+        assert_eq!(
+            Provider::from_url(&pages[0].url),
+            None,
+            "a data: page titled with a provider URL was adopted as that provider (parsed url = {:?})",
+            pages[0].url
+        );
+    }
+
+    /// VERIFIER TEST (A1): the consequence that matters -- the spoof tab is not
+    /// merely misclassified, it is the tab that gets *selected*, which is the
+    /// tab the prompt is then typed into.
+    #[test]
+    fn vab_data_url_spoof_tab_is_selected_on_reuse_path() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "https://chatgpt.com/ (data:text/html,<h1>fake composer</h1>)",
+            ),
+            (2, "https://example.com/"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "the data: spoof tab was SELECTED: {:?}",
+            fake.page_ids_for("select_page")
+        );
+    }
+
+    /// Other schemes that carry no `//` and would have slipped through the same
+    /// guard, plus the `<scheme>:<http url>` wrappers.
+    #[test]
+    fn non_http_schemes_are_never_provider_owned() {
+        for url in [
+            "data:text/html,<h1>x</h1>",
+            "blob:https://chatgpt.com/6c8f-1234",
+            "javascript:alert(document.domain)",
+            "view-source:https://chatgpt.com/",
+            "filesystem:https://chatgpt.com/temporary/x",
+            "chrome-extension://abcdefghijklmnop/panel.html",
+            "file:///Users/x/chatgpt.com/index.html",
+            "about:blank",
+        ] {
+            assert_eq!(
+                Provider::from_url(url),
+                None,
+                "accepted non-http URL: {}",
+                url
+            );
+        }
+    }
+
     /// chrome-devtools-mcp renders a titled page as `<title> (<url>)`. The URL
     /// is the trailing parenthesised group; taking anything else lets a page
     /// title (attacker-controlled) decide which provider owns the tab.
@@ -4452,6 +4584,120 @@ mod tests {
         assert_eq!(Provider::from_url(&pages[0].url), Some(Provider::ChatGpt));
         assert_eq!(Provider::from_url(&pages[3].url), None);
         assert_eq!(Provider::from_url(&pages[4].url), None);
+    }
+
+    /// A3: `chrome-devtools-mcp` auto-discovers externally created
+    /// BrowserContexts, so one incognito window is enough to append
+    /// ` isolatedContext=<name>` *after* `[selected]`. All three shapes must
+    /// parse to the real URL and the right selection flag.
+    #[test]
+    fn parse_pages_handles_the_isolated_context_suffix() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: ChatGPT (https://chatgpt.com/c/abc) [selected]\n",
+            "1: ChatGPT (https://chatgpt.com/c/def) isolatedContext=isolated-context-1\n",
+            "2: https://chatgpt.com/c/ghi isolatedContext=ask\n",
+            "3: https://gemini.google.com/app [selected] isolatedContext=isolated-context-2\n",
+        ));
+        let parsed: Vec<(&str, bool, Option<Provider>)> = pages
+            .iter()
+            .map(|p| (p.url.as_str(), p.selected, Provider::from_url(&p.url)))
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                ("https://chatgpt.com/c/abc", true, Some(Provider::ChatGpt)),
+                ("https://chatgpt.com/c/def", false, Some(Provider::ChatGpt)),
+                ("https://chatgpt.com/c/ghi", false, Some(Provider::ChatGpt)),
+                (
+                    "https://gemini.google.com/app",
+                    true,
+                    Some(Provider::Gemini)
+                ),
+            ]
+        );
+    }
+
+    /// The isolatedContext marker must be anchored to the grammar, not merely
+    /// searched for: a page can put the literal marker in its *title*, and
+    /// splitting on that would truncate the label back to attacker-chosen text
+    /// -- the same failure mode as A1, through a different door.
+    #[test]
+    fn a_title_cannot_fake_the_isolated_context_marker() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: https://chatgpt.com/ isolatedContext=z (https://evil.test/)\n",
+            "1: https://chatgpt.com/ isolatedContext=z (data:text/html,x)\n",
+        ));
+        assert_eq!(pages[0].url, "https://evil.test/");
+        assert_eq!(Provider::from_url(&pages[0].url), None);
+        assert_eq!(pages[1].url, "data:text/html,x");
+        assert_eq!(Provider::from_url(&pages[1].url), None);
+    }
+
+    /// A4: `Provider::from_url` needs an explicit http(s) scheme. This is user
+    /// reachable -- `ask-bridge open <url>` and `get <url>` both run
+    /// `Provider::from_url(&url).unwrap_or(provider)` -- so a bare host now
+    /// falls back to the *configured* provider instead of being sniffed out of
+    /// the string. Pinned deliberately: a scheme-less argument is not a URL a
+    /// browser can navigate to anyway.
+    #[test]
+    fn scheme_less_urls_do_not_identify_a_provider() {
+        for url in [
+            "chatgpt.com",
+            "chatgpt.com/c/abc",
+            "www.chatgpt.com/",
+            "gemini.google.com/app",
+            "claude.ai/new",
+            "//chatgpt.com/c/abc",
+            "   https://chatgpt.com/",
+        ] {
+            assert_eq!(
+                Provider::from_url(url),
+                None,
+                "scheme-less input identified a provider: {}",
+                url
+            );
+        }
+    }
+
+    /// `url_host` pins userinfo handling in *both* directions. Only the second
+    /// case proves the strip is load-bearing: without it a legitimate provider
+    /// URL carrying userinfo is rejected, which is the failure the first case
+    /// alone cannot detect.
+    #[test]
+    fn url_host_resolves_userinfo_ports_and_backslashes_like_a_browser() {
+        // Userinfo is not the host.
+        assert_eq!(
+            url_host("https://chatgpt.com@evil.test/"),
+            Some("evil.test".to_string())
+        );
+        // ...and the host still wins when the userinfo is the scary-looking part.
+        assert_eq!(
+            url_host("https://evil.test@chatgpt.com/c/abc"),
+            Some("chatgpt.com".to_string())
+        );
+        assert!(Provider::ChatGpt.owns_url("https://evil.test@chatgpt.com/c/abc"));
+        assert!(!Provider::ChatGpt.owns_url("https://chatgpt.com@evil.test/"));
+        // A backslash ends the authority just like a slash, so it cannot be
+        // used to smuggle the real host into what looks like a path.
+        assert_eq!(
+            url_host("https://evil.test\\@chatgpt.com/"),
+            Some("evil.test".to_string())
+        );
+        assert!(!Provider::ChatGpt.owns_url("https://evil.test\\@chatgpt.com/"));
+        // Ports, IPv6 literals, root dot and case.
+        assert_eq!(
+            url_host("https://chatgpt.com:8443/c/abc"),
+            Some("chatgpt.com".to_string())
+        );
+        assert_eq!(url_host("http://[::1]:9223/json"), Some("::1".to_string()));
+        assert_eq!(
+            url_host("https://ChatGPT.COM./"),
+            Some("chatgpt.com".to_string())
+        );
+        assert_eq!(url_host("https:///nohost"), None);
+        assert_eq!(url_host("chatgpt.com/c/abc"), None);
     }
 
     /// An offline stand-in for `chrome-devtools-mcp`. It models the page list
@@ -4766,6 +5012,145 @@ mod tests {
             fake.page_ids_for("close_page")
         );
         assert_eq!(fake.open_ids(), vec![1, 2, 3]);
+    }
+
+    /// VERIFIER TEST (A2): three consecutive `--new` runs where an expired
+    /// session leaves the previous tab parked on the provider's auth host.
+    /// Those tabs are neither provider-owned nor blank, so a
+    /// same-provider-only filter never closes them and the tab count grows
+    /// linearly -- against README.en.md:197 ("avoid cluttering your browser
+    /// with too many tabs"). The census, not just the final state, is the
+    /// assertion: it is what distinguishes "bounded" from "leaking".
+    #[test]
+    fn vab_auth_drift_tabs_accumulate_across_new_runs() {
+        let mut fake = FakeMcp::new(&[(1, "https://chatgpt.com/")]);
+        let mut census = Vec::new();
+        for _ in 0..3 {
+            let ok = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                true,
+                true,
+                false,
+                Duration::ZERO,
+            );
+            assert!(ok.is_ok(), "unexpected error: {:?}", ok);
+            // The tab --new just opened gets redirected to the auth host,
+            // exactly as an expired session does in the browser.
+            let drifted = fake.selected.expect("a tab is selected");
+            for page in fake.pages.iter_mut() {
+                if page.0 == drifted {
+                    page.1 = "https://auth.openai.com/authorize".to_string();
+                }
+            }
+            census.push(fake.open_ids().len());
+        }
+        assert_eq!(
+            census,
+            vec![1, 1, 1],
+            "--new leaked auth-host tabs: open-tab count after runs 1..3 was {:?}",
+            census
+        );
+    }
+
+    /// The auth-host allowance is scoped to the provider being opened: a
+    /// ChatGPT `--new` must not reap a Google account tab, which belongs to the
+    /// Gemini/Claude sign-in flow.
+    #[test]
+    fn auth_host_disposal_is_scoped_to_the_provider() {
+        assert!(Provider::ChatGpt.owns_auth_url("https://auth.openai.com/authorize"));
+        assert!(!Provider::ChatGpt.owns_auth_url("https://accounts.google.com/signin"));
+        assert!(Provider::Gemini.owns_auth_url("https://accounts.google.com/signin"));
+        assert!(!Provider::Gemini.owns_auth_url("https://auth.openai.com/authorize"));
+        // Never a real page, and never a look-alike of the auth host either.
+        assert!(!Provider::ChatGpt.owns_auth_url("https://chatgpt.com/c/abc"));
+        assert!(!Provider::ChatGpt.owns_auth_url("https://auth.openai.com.evil.test/"));
+
+        let mut fake = FakeMcp::new(&[
+            (1, "https://accounts.google.com/signin"),
+            (2, "https://auth.openai.com/authorize"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(
+            fake.page_ids_for("close_page"),
+            vec![2],
+            "only ChatGPT's own auth tab may be disposed of"
+        );
+        assert!(
+            fake.open_ids().contains(&1),
+            "Google account tab was closed"
+        );
+    }
+
+    /// M13: a close failure must escape the close loop instead of being
+    /// dropped inside it. The caller turns these into a warning; what is pinned
+    /// here is that it still has something to warn about (and `#[must_use]`
+    /// stops it going back to discarding them).
+    #[test]
+    fn close_failures_are_returned_not_swallowed() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com/c/old"),
+            (2, "https://chatgpt.com/c/older"),
+            (3, "https://gemini.google.com/app"),
+        ]);
+        fake.close_failures = vec![2];
+
+        let failures = close_tabs(
+            &mut |tool, args| fake.call(tool, args),
+            &[1, 2],
+            Provider::ChatGpt,
+            false,
+        );
+
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure: {:?}",
+            failures
+        );
+        assert_eq!(failures[0].0, 2);
+        assert!(
+            failures[0].1.contains("close_page failed"),
+            "the underlying error must be carried, got {:?}",
+            failures[0].1
+        );
+        // The one that could close, did; the stubborn one is still open.
+        assert_eq!(fake.open_ids(), vec![2, 3]);
+    }
+
+    /// M15: when more than one tab appears (a provider popup, a restored
+    /// session) the provider-owned one is the answer, and a genuinely
+    /// ambiguous result stays ambiguous so the caller fails loud.
+    #[test]
+    fn fresh_page_ids_disambiguates_by_provider_ownership() {
+        let after = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: https://chatgpt.com/\n",
+            "3: https://tracker.example.net/popup\n",
+        ));
+        assert_eq!(fresh_page_ids(&[1], &after, Provider::ChatGpt), vec![2]);
+        // Nothing new at all, and two equally plausible new tabs, both stay
+        // un-disambiguated -- that is what makes the caller refuse to guess.
+        assert!(fresh_page_ids(&[1, 2, 3], &after, Provider::ChatGpt).is_empty());
+        let two_owned = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: https://chatgpt.com/\n",
+            "3: https://chatgpt.com/c/other\n",
+        ));
+        assert_eq!(
+            fresh_page_ids(&[1], &two_owned, Provider::ChatGpt),
+            vec![2, 3]
+        );
     }
 
     /// While waiting for the page to load, the periodic re-focus must go back
@@ -8442,6 +8827,44 @@ fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> V
     fresh
 }
 
+/// Close `ids`, returning `(id, error)` for each tab that refused to close.
+///
+/// Closing is best effort -- a tab that will not close is no longer a hazard
+/// once the replacement tab is pinned by ID -- but the failures are handed back
+/// as data rather than dropped inside the loop, so a cleanup that did not
+/// happen can never be reported as one that did. `#[must_use]` is what keeps
+/// that honest: a caller cannot go back to silently discarding them.
+#[must_use = "a tab that refused to close must be surfaced, not discarded"]
+fn close_tabs<F>(
+    call: &mut F,
+    ids: &[usize],
+    provider: Provider,
+    verbose: bool,
+) -> Vec<(usize, String)>
+where
+    F: FnMut(&str, Value) -> Result<Value, String>,
+{
+    let mut failures = Vec::new();
+    for &id in ids {
+        if verbose {
+            println!(
+                "Closing old {} tab (ID: {})...",
+                provider.display_name(),
+                id
+            );
+        }
+        if let Err(e) = call(
+            "close_page",
+            serde_json::json!({
+                "pageId": id
+            }),
+        ) {
+            failures.push((id, e));
+        }
+    }
+    failures
+}
+
 fn ensure_provider_tab(
     config_path: &str,
     provider: Provider,
@@ -8493,12 +8916,19 @@ where
         let before_ids: Vec<usize> = pages.iter().map(|p| p.id).collect();
         // `--new` is documented (README.md:194 / README.en.md:195) to clean up
         // the *same provider's* previous tabs. Other providers' tabs and the
-        // user's unrelated tabs are not ours to close; a blank tab carries no
-        // content and was already disposed of before this fix, so it stays on
-        // the list.
+        // user's unrelated tabs are not ours to close. Blank tabs and tabs
+        // parked on this provider's auth host carry no user content and were
+        // both disposed of by the pre-fix "close everything" behaviour, so they
+        // stay on the list -- dropping them would make tabs accumulate one per
+        // run (blank: once per browser session; auth: every run, once the
+        // session expires).
         let disposable_ids: Vec<usize> = pages
             .iter()
-            .filter(|p| provider.owns_url(&p.url) || is_blank_tab_url(&p.url))
+            .filter(|p| {
+                provider.owns_url(&p.url)
+                    || provider.owns_auth_url(&p.url)
+                    || is_blank_tab_url(&p.url)
+            })
             .map(|p| p.id)
             .collect();
 
@@ -8535,25 +8965,12 @@ where
             }
         };
 
-        for id in disposable_ids.into_iter().filter(|id| *id != new_page_id) {
-            if verbose {
-                println!(
-                    "Closing old {} tab (ID: {})...",
-                    provider.display_name(),
-                    id
-                );
-            }
-            if let Err(e) = call(
-                "close_page",
-                serde_json::json!({
-                    "pageId": id
-                }),
-            ) {
-                // Best effort: a tab that refuses to close is no longer a
-                // hazard now that the new tab is pinned by ID, but it must not
-                // be swallowed silently either.
-                eprintln!("Warning: failed to close old tab (ID: {}): {}", id, e);
-            }
+        let doomed: Vec<usize> = disposable_ids
+            .into_iter()
+            .filter(|id| *id != new_page_id)
+            .collect();
+        for (id, e) in close_tabs(call, &doomed, provider, verbose) {
+            eprintln!("Warning: failed to close old tab (ID: {}): {}", id, e);
         }
 
         if verbose {
