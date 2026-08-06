@@ -90,22 +90,51 @@ impl Provider {
         }
     }
 
+    /// Registrable domain that identifies this provider's pages.
+    fn primary_host(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "chatgpt.com",
+            Provider::Gemini => "gemini.google.com",
+            Provider::Claude => "claude.ai",
+        }
+    }
+
+    /// Whether `url` is one of this provider's pages.
+    ///
+    /// Decided on the canonical host, never on a substring: `chatgpt.com` also
+    /// appears in `https://chatgpt.com.evil.test/`, `https://evil.test/?next=
+    /// chatgpt.com` and `https://chatgpt.com@evil.test/`, all of which are
+    /// pages an attacker controls. Adopting one of those as the provider tab
+    /// means selecting it and typing the prompt into a DOM that only has to
+    /// imitate the provider's composer. The dot boundary is what makes the
+    /// match safe: `evil.chatgpt.com` needs control of `chatgpt.com`'s DNS,
+    /// while `chatgpt.com.evil.test` does not.
+    /// The scheme test is upstream's (`10fbe91` made `from_url` reject
+    /// `http://chatgpt.com/c/abc`); the canonical-host test is this fork's.
+    /// Both are kept: upstream's exact-host list would reject `sora.chatgpt.com`
+    /// and `chatgpt.com.` that this fork's tests pin as legitimate, and this
+    /// fork's host rule alone would trust a plain-http origin.
     fn owns_url(self, url: &str) -> bool {
-        Self::from_url(url) == Some(self)
+        let Some((scheme, _rest)) = url.split_once("://") else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("https") {
+            return false;
+        }
+        let Some(host) = url_host(url) else {
+            return false;
+        };
+        let root = self.primary_host();
+        match host.strip_suffix(root) {
+            Some(prefix) => prefix.is_empty() || prefix.ends_with('.'),
+            None => false,
+        }
     }
 
     fn from_url(url: &str) -> Option<Self> {
-        let parsed = Url::parse(url).ok()?;
-        if parsed.scheme() != "https" {
-            return None;
-        }
-
-        match parsed.host_str()?.to_ascii_lowercase().as_str() {
-            "chatgpt.com" | "www.chatgpt.com" => Some(Provider::ChatGpt),
-            "gemini.google.com" => Some(Provider::Gemini),
-            "claude.ai" | "www.claude.ai" => Some(Provider::Claude),
-            _ => None,
-        }
+        [Provider::ChatGpt, Provider::Gemini, Provider::Claude]
+            .into_iter()
+            .find(|provider| provider.owns_url(url))
     }
 
     fn conversation_url_from_id(self, session_id: &str) -> String {
@@ -1383,6 +1412,34 @@ fn resolve_session_target(
         selected_provider,
         selected_provider.conversation_url_from_id(session),
     ))
+}
+
+/// Canonical lowercase host of an absolute http(s) URL, or `None` when the URL
+/// is not http(s) or carries no host.
+///
+/// Userinfo is discarded the way a browser resolves it: in
+/// `https://chatgpt.com@evil.test/` the host is `evil.test`, so anything that
+/// decides trust from this function cannot be fooled by a domain parked in the
+/// userinfo. Ports, a trailing root dot and letter case are normalised away.
+fn url_host(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // A backslash terminates the authority in browsers just like a slash does.
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    let host = match authority.strip_prefix('[') {
+        // IPv6 literal: the host ends at ']', a ':' inside it is not a port.
+        Some(inside) => inside.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() { None } else { Some(host) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2950,6 +3007,38 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
     }
 }
 
+/// Extract the `## Pages` listing out of an MCP tool result. `list_pages`,
+/// `new_page`, `select_page` and `close_page` all echo the current page list,
+/// so every caller that needs page IDs goes through here.
+fn pages_from_tool_result(res: &Value, context: &str) -> Result<Vec<Page>, String> {
+    let text = res
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("Invalid {} response structure: {:?}", context, res))?;
+    Ok(parse_pages(text))
+}
+
+/// chrome-devtools-mcp renders a page as `<title> (<url>)` when the page has a
+/// title and as a bare `<url>` when it does not.
+///
+/// The URL is always the *trailing* parenthesised group. That matters for more
+/// than tidiness: the title is chosen by the page, so a page titled
+/// `Visit https://chatgpt.com now` would otherwise let an attacker decide which
+/// provider owns the tab. Anything that does not look like a URL is left alone,
+/// which keeps an unexpected label shape harmless instead of mis-parsed.
+fn page_url_from_label(label: &str) -> &str {
+    if let Some(inner) = label.strip_suffix(')')
+        && let Some((_title, candidate)) = inner.rsplit_once(" (")
+        && (candidate.contains("://") || candidate.starts_with("about:"))
+    {
+        return candidate;
+    }
+    label
+}
+
 fn parse_pages(text: &str) -> Vec<Page> {
     let mut pages = Vec::new();
     for line in text.lines() {
@@ -2963,12 +3052,12 @@ fn parse_pages(text: &str) -> Vec<Page> {
                 Err(_) => continue,
             };
             let rest = rest.trim();
-            let (url, selected) = if rest.ends_with("[selected]") {
-                let url = rest.strip_suffix("[selected]").unwrap().trim().to_string();
-                (url, true)
+            let (label, selected) = if rest.ends_with("[selected]") {
+                (rest.strip_suffix("[selected]").unwrap().trim(), true)
             } else {
-                (rest.to_string(), false)
+                (rest, false)
             };
+            let url = page_url_from_label(label).to_string();
             pages.push(Page { id, url, selected });
         }
     }
@@ -4279,6 +4368,504 @@ mod tests {
                 "expected {invalid:?} to be rejected"
             );
         }
+    }
+
+    /// A hostile page only has to *mention* a provider domain to be adopted as
+    /// that provider's tab when ownership is decided by substring. Ownership
+    /// must be decided by the canonical host instead.
+    #[test]
+    fn provider_ownership_rejects_lookalike_hosts() {
+        for spoof in [
+            "https://chatgpt.com.evil.test/",
+            "https://evil.test/?next=chatgpt.com",
+            "https://chatgpt.com@evil.test/",
+            "https://notchatgpt.com/",
+            "https://evil.test/chatgpt.com/c/abc",
+            "https://evil.test/#https://chatgpt.com/",
+            "https://gemini.google.com.evil.test/",
+            "https://gemini.google.com@evil.test/",
+            "https://claude.ai.evil.test/",
+            "https://claude.ai@evil.test/",
+            "https://evil.test/?u=claude.ai",
+        ] {
+            assert_eq!(Provider::from_url(spoof), None, "spoof accepted: {}", spoof);
+            for provider in [Provider::ChatGpt, Provider::Gemini, Provider::Claude] {
+                assert!(
+                    !provider.owns_url(spoof),
+                    "{:?} claimed spoof URL {}",
+                    provider,
+                    spoof
+                );
+            }
+        }
+    }
+
+    /// The narrowing must not break the hosts real usage lands on: the bare
+    /// host, `www.`, sub-domains, an explicit port, a trailing root dot and
+    /// mixed case.
+    #[test]
+    fn provider_ownership_accepts_real_provider_hosts() {
+        for (url, expected) in [
+            ("https://chatgpt.com/", Provider::ChatGpt),
+            ("https://chatgpt.com/c/abc?x=1#y", Provider::ChatGpt),
+            ("https://www.chatgpt.com/", Provider::ChatGpt),
+            ("https://CHATGPT.com/c/abc", Provider::ChatGpt),
+            ("https://chatgpt.com./c/abc", Provider::ChatGpt),
+            ("https://chatgpt.com:443/c/abc", Provider::ChatGpt),
+            ("https://sora.chatgpt.com/", Provider::ChatGpt),
+            ("https://gemini.google.com/app", Provider::Gemini),
+            ("https://gemini.google.com/app/abc", Provider::Gemini),
+            ("https://claude.ai/new", Provider::Claude),
+            ("https://claude.ai/chat/abc", Provider::Claude),
+            ("https://www.claude.ai/login", Provider::Claude),
+        ] {
+            assert_eq!(Provider::from_url(url), Some(expected), "rejected: {}", url);
+        }
+    }
+
+    /// chrome-devtools-mcp renders a titled page as `<title> (<url>)`. The URL
+    /// is the trailing parenthesised group; taking anything else lets a page
+    /// title (attacker-controlled) decide which provider owns the tab.
+    #[test]
+    fn parse_pages_reads_the_url_out_of_a_titled_label() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: ChatGPT (https://chatgpt.com/c/abc) [selected]\n",
+            "1: https://gemini.google.com/app\n",
+            "2: Wiki (https://en.wikipedia.org/wiki/Foo_(bar))\n",
+            "3: Visit https://chatgpt.com now (https://evil.test/)\n",
+            "4: Sneaky (https://chatgpt.com/) (https://evil.test/)\n",
+        ));
+        let urls: Vec<&str> = pages.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://chatgpt.com/c/abc",
+                "https://gemini.google.com/app",
+                "https://en.wikipedia.org/wiki/Foo_(bar)",
+                "https://evil.test/",
+                "https://evil.test/",
+            ]
+        );
+        assert!(pages[0].selected);
+        assert!(!pages[1].selected);
+        assert_eq!(Provider::from_url(&pages[0].url), Some(Provider::ChatGpt));
+        assert_eq!(Provider::from_url(&pages[3].url), None);
+        assert_eq!(Provider::from_url(&pages[4].url), None);
+    }
+
+    /// An offline stand-in for `chrome-devtools-mcp`. It models the page list
+    /// the real server keeps (monotonically increasing IDs, `new_page` selects
+    /// the page it opened) and records every call, so tab bookkeeping can be
+    /// asserted without ever starting a browser.
+    struct FakeMcp {
+        pages: Vec<(usize, String)>,
+        selected: Option<usize>,
+        next_id: usize,
+        calls: Vec<(String, Value)>,
+        close_failures: Vec<usize>,
+        probes: usize,
+        not_ready_probes: usize,
+        vanish_page_after_probes: Option<(usize, usize)>,
+        new_page_opens_nothing: bool,
+    }
+
+    impl FakeMcp {
+        fn new(pages: &[(usize, &str)]) -> Self {
+            FakeMcp {
+                pages: pages
+                    .iter()
+                    .map(|(id, url)| (*id, (*url).to_string()))
+                    .collect(),
+                selected: pages.first().map(|(id, _)| *id),
+                next_id: pages.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1,
+                calls: Vec::new(),
+                close_failures: Vec::new(),
+                probes: 0,
+                not_ready_probes: 0,
+                vanish_page_after_probes: None,
+                new_page_opens_nothing: false,
+            }
+        }
+
+        fn text_result(text: String) -> Value {
+            serde_json::json!({"content": [{"type": "text", "text": text}]})
+        }
+
+        fn page_list_text(&self) -> String {
+            let mut out = String::from("## Pages\n");
+            for (id, url) in &self.pages {
+                out.push_str(&format!(
+                    "{}: {}{}\n",
+                    id,
+                    url,
+                    if self.selected == Some(*id) {
+                        " [selected]"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            out
+        }
+
+        fn page_id_arg(args: &Value) -> usize {
+            args.get("pageId")
+                .and_then(|v| v.as_u64())
+                .expect("pageId argument") as usize
+        }
+
+        fn call(&mut self, tool: &str, args: Value) -> Result<Value, String> {
+            self.calls.push((tool.to_string(), args.clone()));
+            match tool {
+                "list_pages" => Ok(Self::text_result(self.page_list_text())),
+                "new_page" => {
+                    if !self.new_page_opens_nothing {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let url = args
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("about:blank")
+                            .to_string();
+                        self.pages.push((id, url));
+                        self.selected = Some(id);
+                    }
+                    Ok(Self::text_result(self.page_list_text()))
+                }
+                "navigate_page" => {
+                    let url = args
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("about:blank")
+                        .to_string();
+                    let selected = self.selected.expect("a page must be selected");
+                    for page in self.pages.iter_mut() {
+                        if page.0 == selected {
+                            page.1 = url.clone();
+                        }
+                    }
+                    Ok(Self::text_result(self.page_list_text()))
+                }
+                "close_page" => {
+                    let id = Self::page_id_arg(&args);
+                    if self.close_failures.contains(&id) {
+                        return Err(format!("close_page failed for page {}", id));
+                    }
+                    self.pages.retain(|(pid, _)| *pid != id);
+                    if self.selected == Some(id) {
+                        self.selected = self.pages.first().map(|(pid, _)| *pid);
+                    }
+                    Ok(Self::text_result(self.page_list_text()))
+                }
+                "select_page" => {
+                    let id = Self::page_id_arg(&args);
+                    if !self.pages.iter().any(|(pid, _)| *pid == id) {
+                        return Err("No page found".to_string());
+                    }
+                    self.selected = Some(id);
+                    Ok(Self::text_result(self.page_list_text()))
+                }
+                "evaluate_script" => {
+                    self.probes += 1;
+                    if let Some((probe, id)) = self.vanish_page_after_probes
+                        && self.probes == probe
+                    {
+                        self.pages.retain(|(pid, _)| *pid != id);
+                    }
+                    let ready = self.probes > self.not_ready_probes;
+                    Ok(Self::text_result(format!(
+                        "Script ran.\n```json\n{}\n```",
+                        ready
+                    )))
+                }
+                other => Err(format!("unexpected MCP tool call: {}", other)),
+            }
+        }
+
+        fn open_ids(&self) -> Vec<usize> {
+            self.pages.iter().map(|(id, _)| *id).collect()
+        }
+
+        fn page_ids_for(&self, tool: &str) -> Vec<usize> {
+            self.calls
+                .iter()
+                .filter(|(name, _)| name == tool)
+                .filter_map(|(_, args)| args.get("pageId").and_then(|v| v.as_u64()))
+                .map(|id| id as usize)
+                .collect()
+        }
+
+        fn urls_for(&self, tool: &str) -> Vec<String> {
+            self.calls
+                .iter()
+                .filter(|(name, _)| name == tool)
+                .filter_map(|(_, args)| args.get("url").and_then(|v| v.as_str()))
+                .map(|url| url.to_string())
+                .collect()
+        }
+    }
+
+    /// `--new` promises (README.md:194 / README.en.md:195) to clean up *this*
+    /// provider's old tabs. Closing every other tab takes the user's Gemini,
+    /// Claude and unrelated tabs with it.
+    #[test]
+    fn new_session_leaves_other_providers_tabs_open() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com/c/old"),
+            (2, "https://gemini.google.com/app"),
+            (7, "https://example.com/notes"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(
+            fake.page_ids_for("close_page"),
+            vec![1],
+            "--new must close only the old ChatGPT tab"
+        );
+        assert_eq!(fake.open_ids(), vec![2, 7, 8]);
+        assert_eq!(fake.selected, Some(8));
+    }
+
+    /// A blank launcher tab is not the user's content, and the pre-fix code
+    /// disposed of it. Keep doing that so `--new` does not leave one behind.
+    #[test]
+    fn new_session_still_disposes_of_a_blank_tab() {
+        let mut fake = FakeMcp::new(&[(1, "about:blank")]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(fake.page_ids_for("close_page"), vec![1]);
+        assert_eq!(fake.open_ids(), vec![2]);
+        assert_eq!(fake.selected, Some(2));
+    }
+
+    /// Closing the old tab is best effort. When it fails, the freshly opened
+    /// tab must still be the one that gets driven -- picking "the first tab
+    /// whose URL looks like the provider" hands the prompt back to the stale
+    /// conversation `--new` was asked to escape.
+    #[test]
+    fn new_session_never_falls_back_to_a_tab_that_failed_to_close() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com/c/old"),
+            (2, "https://gemini.google.com/app"),
+        ]);
+        fake.close_failures = vec![1];
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert!(
+            !fake.page_ids_for("select_page").contains(&1),
+            "stale tab 1 was selected: {:?}",
+            fake.page_ids_for("select_page")
+        );
+        assert_eq!(fake.selected, Some(3));
+        assert!(fake.open_ids().contains(&2), "Gemini tab was closed");
+    }
+
+    /// If the new tab cannot be identified, there is no safe fallback: driving
+    /// whatever happens to be selected is how a prompt ends up on the wrong
+    /// page. Fail immediately instead of waiting out the readiness timeout.
+    #[test]
+    fn new_session_fails_loud_when_the_new_tab_cannot_be_identified() {
+        let mut fake = FakeMcp::new(&[(1, "https://example.com/")]);
+        fake.new_page_opens_nothing = true;
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        let err = result.expect_err("expected a loud failure, got Ok");
+        assert!(
+            err.contains("identify"),
+            "error should name the unidentifiable tab: {}",
+            err
+        );
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "nothing may be selected when the new tab is unknown"
+        );
+    }
+
+    /// H1 through the tab-selection seam: a page that merely mentions the
+    /// provider domain must never be selected, so a prompt can never be typed
+    /// into it.
+    #[test]
+    fn lookalike_tab_is_never_selected_on_the_reuse_path() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com.evil.test/"),
+            (2, "https://example.com/?next=chatgpt.com"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "a lookalike tab was selected: {:?}",
+            fake.page_ids_for("select_page")
+        );
+        assert_eq!(fake.urls_for("new_page"), vec!["https://chatgpt.com/"]);
+        assert!(fake.open_ids().contains(&1), "lookalike tab was closed");
+    }
+
+    /// H1 through the `--new` seam: a lookalike tab is neither adopted as the
+    /// old provider tab (so it is not closed) nor selected as the new one.
+    #[test]
+    fn lookalike_tab_is_never_selected_or_closed_on_the_new_path() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com.evil.test/"),
+            (2, "https://gemini.google.com/app"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(fake.selected, Some(3));
+        assert!(
+            fake.page_ids_for("close_page").is_empty(),
+            "closed tabs that --new must not touch: {:?}",
+            fake.page_ids_for("close_page")
+        );
+        assert_eq!(fake.open_ids(), vec![1, 2, 3]);
+    }
+
+    /// While waiting for the page to load, the periodic re-focus must go back
+    /// to the tab this call pinned. Re-deriving "the first tab that looks like
+    /// the provider" hands the session to the stale tab that failed to close.
+    #[test]
+    fn readiness_refocus_returns_to_the_pinned_tab() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://chatgpt.com/c/old"),
+            (2, "https://gemini.google.com/app"),
+        ]);
+        fake.close_failures = vec![1];
+        // Force the loop past the attempt-10 re-focus checkpoint.
+        fake.not_ready_probes = 10;
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(
+            fake.page_ids_for("select_page"),
+            vec![3, 3],
+            "the re-focus must return to the pinned tab, not the stale one"
+        );
+    }
+
+    /// If the pinned tab is gone there is nothing safe to fall back to: the
+    /// readiness probe would run against whatever is selected, and the
+    /// Gemini/Claude probes treat a bare "Sign in|登入" on *any* page as ready.
+    #[test]
+    fn readiness_fails_loud_when_the_pinned_tab_disappears() {
+        let mut fake = FakeMcp::new(&[(1, "https://chatgpt.com/c/old")]);
+        fake.not_ready_probes = 50;
+        fake.vanish_page_after_probes = Some((5, 2));
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        let err = result.expect_err("expected a loud failure, got Ok");
+        assert!(
+            err.contains("disappeared"),
+            "error should say the pinned tab vanished: {}",
+            err
+        );
+    }
+
+    /// Regression guard for the ordinary reuse path: a real provider tab is
+    /// still found and focused instead of opening yet another tab.
+    #[test]
+    fn reuse_path_still_focuses_an_existing_provider_tab() {
+        let mut fake = FakeMcp::new(&[
+            (4, "https://example.com/"),
+            (5, "ChatGPT (https://chatgpt.com/c/abc)"),
+        ]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(fake.page_ids_for("select_page"), vec![5]);
+        assert!(fake.urls_for("new_page").is_empty());
+        assert_eq!(fake.open_ids(), vec![4, 5]);
+    }
+
+    /// Regression guard: a lone blank tab is still navigated in place rather
+    /// than leaving a spare tab behind.
+    #[test]
+    fn reuse_path_still_navigates_a_lone_blank_tab() {
+        let mut fake = FakeMcp::new(&[(1, "about:blank")]);
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::Gemini,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {:?}", result);
+        assert_eq!(
+            fake.urls_for("navigate_page"),
+            vec!["https://gemini.google.com/app"]
+        );
+        assert!(fake.urls_for("new_page").is_empty());
+        assert_eq!(fake.open_ids(), vec![1]);
     }
 
     #[test]
@@ -7831,6 +8418,30 @@ fn submit_prompt_to_provider(
     submit_regular_prompt(config_path, provider, prompt)
 }
 
+/// IDs present in `after` that were not in `before_ids` -- i.e. the tabs that
+/// appeared since the snapshot. When more than one appeared (a provider popup,
+/// a restored session) the provider-owned one wins, so the caller still gets a
+/// single unambiguous answer. An empty or still-ambiguous result is the
+/// caller's cue to fail rather than guess.
+fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> Vec<usize> {
+    let fresh: Vec<usize> = after
+        .iter()
+        .filter(|p| !before_ids.contains(&p.id))
+        .map(|p| p.id)
+        .collect();
+    if fresh.len() > 1 {
+        let owned: Vec<usize> = after
+            .iter()
+            .filter(|p| fresh.contains(&p.id) && provider.owns_url(&p.url))
+            .map(|p| p.id)
+            .collect();
+        if owned.len() == 1 {
+            return owned;
+        }
+    }
+    fresh
+}
+
 fn ensure_provider_tab(
     config_path: &str,
     provider: Provider,
@@ -7838,67 +8449,128 @@ fn ensure_provider_tab(
     headless: bool,
     verbose: bool,
 ) -> Result<(), String> {
+    ensure_provider_tab_with(
+        &mut |tool: &str, args: Value| call_mcp_tool(config_path, tool, args),
+        provider,
+        force_new,
+        headless,
+        verbose,
+        READY_POLL_INTERVAL,
+    )
+}
+
+/// How long to wait between readiness probes while a provider page loads.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Test seam for [`ensure_provider_tab`]: every browser interaction goes
+/// through `call` and the readiness poll interval is injectable, so the tab
+/// bookkeeping can be exercised against a fake MCP without ever starting a
+/// browser and without waiting out real poll intervals.
+fn ensure_provider_tab_with<F>(
+    call: &mut F,
+    provider: Provider,
+    force_new: bool,
+    headless: bool,
+    verbose: bool,
+    poll_interval: Duration,
+) -> Result<(), String>
+where
+    F: FnMut(&str, Value) -> Result<Value, String>,
+{
     if verbose {
         println!("Checking open Chrome tabs...");
     }
-    let list_res = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
+    let list_res = call("list_pages", serde_json::json!({}))?;
+    let pages = pages_from_tool_result(&list_res, "list_pages")?;
 
-    let text = list_res
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("text"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| format!("Invalid list_pages response structure: {:?}", list_res))?;
-
-    let pages = parse_pages(text);
-
-    let mut new_session_page_id = None;
+    // The tab this call commits to driving, pinned by ID. Everything after
+    // this point re-selects *that* tab rather than re-deriving "a tab whose URL
+    // looks like the provider", which is what let a stale tab (one that failed
+    // to close) or a lookalike tab take over the session.
+    let pinned_page_id: Option<usize>;
 
     if force_new {
+        let before_ids: Vec<usize> = pages.iter().map(|p| p.id).collect();
+        // `--new` is documented (README.md:194 / README.en.md:195) to clean up
+        // the *same provider's* previous tabs. Other providers' tabs and the
+        // user's unrelated tabs are not ours to close; a blank tab carries no
+        // content and was already disposed of before this fix, so it stays on
+        // the list.
+        let disposable_ids: Vec<usize> = pages
+            .iter()
+            .filter(|p| provider.owns_url(&p.url) || is_blank_tab_url(&p.url))
+            .map(|p| p.id)
+            .collect();
+
         if verbose {
             println!("Opening a brand new {} session...", provider.display_name());
         }
-        call_mcp_tool(
-            config_path,
+        let new_page_res = call(
             "new_page",
             serde_json::json!({
                 "url": provider.home_url()
             }),
         )?;
 
-        let refreshed_pages_res = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
-        let refreshed_text = refreshed_pages_res
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|obj| obj.get("text"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "Invalid refreshed list_pages response structure: {:?}",
-                    refreshed_pages_res
-                )
-            })?;
-        let refreshed_pages = parse_pages(refreshed_text);
-        let new_page_id = unique_new_page_id(&pages, &refreshed_pages)?;
+        // chrome-devtools-mcp hands out monotonically increasing page IDs and
+        // never reuses them, so "the ID that was not there before" identifies
+        // the tab just opened exactly. `new_page` echoes the page list; if a
+        // build ever stops doing that, ask again before anything is closed.
+        let mut fresh = pages_from_tool_result(&new_page_res, "new_page")
+            .map(|after| fresh_page_ids(&before_ids, &after, provider))
+            .unwrap_or_default();
+        if fresh.len() != 1 {
+            let listed = call("list_pages", serde_json::json!({}))?;
+            let after = pages_from_tool_result(&listed, "list_pages")?;
+            fresh = fresh_page_ids(&before_ids, &after, provider);
+        }
+        let new_page_id = match fresh.as_slice() {
+            [id] => *id,
+            _ => {
+                return Err(format!(
+                    "Could not identify the new {} tab after new_page (candidate IDs: {:?}); refusing to drive an existing tab",
+                    provider.display_name(),
+                    fresh
+                ));
+            }
+        };
+
+        for id in disposable_ids.into_iter().filter(|id| *id != new_page_id) {
+            if verbose {
+                println!(
+                    "Closing old {} tab (ID: {})...",
+                    provider.display_name(),
+                    id
+                );
+            }
+            if let Err(e) = call(
+                "close_page",
+                serde_json::json!({
+                    "pageId": id
+                }),
+            ) {
+                // Best effort: a tab that refuses to close is no longer a
+                // hazard now that the new tab is pinned by ID, but it must not
+                // be swallowed silently either.
+                eprintln!("Warning: failed to close old tab (ID: {}): {}", id, e);
+            }
+        }
 
         if verbose {
             println!(
-                "Selecting new {} tab (ID: {}) while preserving existing tabs...",
+                "Selecting new {} tab (ID: {})...",
                 provider.display_name(),
                 new_page_id
             );
         }
-        call_mcp_tool(
-            config_path,
+        call(
             "select_page",
             serde_json::json!({
                 "pageId": new_page_id,
                 "bringToFront": !headless
             }),
         )?;
-        new_session_page_id = Some(new_page_id);
+        pinned_page_id = Some(new_page_id);
     } else {
         let provider_pages: Vec<&Page> = pages
             .iter()
@@ -7908,16 +8580,15 @@ fn ensure_provider_tab(
         let provider_page_id = if provider_pages.len() > 1 {
             let mut page_states = Vec::with_capacity(provider_pages.len());
             for page in &provider_pages {
-                call_mcp_tool(
-                    config_path,
+                call(
                     "select_page",
                     serde_json::json!({
                         "pageId": page.id,
                         "bringToFront": false
                     }),
                 )?;
-                let login_state = check_login_status(config_path, provider, verbose)
-                    .unwrap_or(LoginState::Unknown);
+                let login_state =
+                    check_login_status_with(call, provider, verbose).unwrap_or(LoginState::Unknown);
                 page_states.push(PageLoginState {
                     id: page.id,
                     selected: page.selected,
@@ -7929,7 +8600,7 @@ fn ensure_provider_tab(
             provider_pages.first().map(|page| page.id)
         };
 
-        match provider_page_id {
+        pinned_page_id = match provider_page_id {
             Some(page_id) => {
                 let page = provider_pages
                     .iter()
@@ -7943,14 +8614,14 @@ fn ensure_provider_tab(
                         page.selected
                     );
                 }
-                call_mcp_tool(
-                    config_path,
+                call(
                     "select_page",
                     serde_json::json!({
                         "pageId": page.id,
                         "bringToFront": !headless
                     }),
                 )?;
+                Some(page.id)
             }
             None => {
                 // No provider tab. If there is only one blank tab, navigate it. Otherwise open a new page.
@@ -7961,27 +8632,38 @@ fn ensure_provider_tab(
                             provider.display_name()
                         );
                     }
-                    call_mcp_tool(
-                        config_path,
+                    call(
                         "navigate_page",
                         serde_json::json!({
                             "url": provider.home_url()
                         }),
                     )?;
+                    Some(pages[0].id)
                 } else {
                     if verbose {
                         println!("Opening a new tab for {}...", provider.display_name());
                     }
-                    call_mcp_tool(
-                        config_path,
+                    let before_ids: Vec<usize> = pages.iter().map(|p| p.id).collect();
+                    let opened = call(
                         "new_page",
                         serde_json::json!({
                             "url": provider.home_url()
                         }),
                     )?;
+                    // Nothing stale can be re-selected here (the tab was just
+                    // created), so an unidentifiable ID only costs the pinning,
+                    // not correctness.
+                    match pages_from_tool_result(&opened, "new_page")
+                        .map(|after| fresh_page_ids(&before_ids, &after, provider))
+                        .unwrap_or_default()
+                        .as_slice()
+                    {
+                        [id] => Some(*id),
+                        _ => None,
+                    }
                 }
             }
-        }
+        };
     }
 
     // Wait for the provider composer to be present.
@@ -7990,73 +8672,44 @@ fn ensure_provider_tab(
     }
     for attempt in 0..90 {
         if attempt > 0 && attempt % 10 == 0 {
-            if let Some(page_id) = new_session_page_id {
-                let current_pages_res =
-                    call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
-                let current_pages_text = current_pages_res
-                    .get("content")
-                    .and_then(|content| content.as_array())
-                    .and_then(|items| items.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|text| text.as_str())
-                    .ok_or_else(|| {
-                        format!(
-                            "Invalid list_pages response while verifying new tab: {:?}",
-                            current_pages_res
-                        )
-                    })?;
-                let page = parse_pages(current_pages_text)
-                    .into_iter()
-                    .find(|page| page.id == page_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "New {} tab (ID: {}) disappeared; refusing to reuse an existing tab",
-                            provider.display_name(),
-                            page_id
-                        )
-                    })?;
-
-                call_mcp_tool(
-                    config_path,
-                    "select_page",
-                    serde_json::json!({
-                        "pageId": page.id,
-                        "bringToFront": !headless
-                    }),
-                )?;
-                continue;
-            }
-
-            let page_opt = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))
+            let listed = call("list_pages", serde_json::json!({}))
                 .ok()
-                .and_then(|response| {
-                    response
-                        .get("content")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|obj| obj.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(|t| t.to_string())
-                })
-                .and_then(|text| {
-                    parse_pages(&text)
-                        .into_iter()
-                        .find(|page| provider.owns_url(&page.url))
-                });
-            if let Some(page) = page_opt {
-                let _ = call_mcp_tool(
-                    config_path,
-                    "select_page",
-                    serde_json::json!({
-                        "pageId": page.id,
-                        "bringToFront": !headless
-                    }),
-                );
+                .and_then(|res| pages_from_tool_result(&res, "list_pages").ok());
+            if let Some(listed) = listed {
+                let target = match pinned_page_id {
+                    // Re-focus the tab this call committed to. If it is gone,
+                    // there is nothing safe to fall back to: the readiness
+                    // probe would run against whichever page happens to be
+                    // selected, and the Gemini/Claude probes accept a generic
+                    // "Sign in|登入" on any page at all.
+                    Some(id) => {
+                        if !listed.iter().any(|p| p.id == id) {
+                            return Err(format!(
+                                "The {} tab (ID: {}) disappeared while waiting for it to load",
+                                provider.display_name(),
+                                id
+                            ));
+                        }
+                        Some(id)
+                    }
+                    None => listed
+                        .iter()
+                        .find(|p| provider.owns_url(&p.url))
+                        .map(|p| p.id),
+                };
+                if let Some(page_id) = target {
+                    let _ = call(
+                        "select_page",
+                        serde_json::json!({
+                            "pageId": page_id,
+                            "bringToFront": !headless
+                        }),
+                    );
+                }
             }
         }
 
-        let ready_res = call_mcp_tool(
-            config_path,
+        let ready_res = call(
             "evaluate_script",
             serde_json::json!({
                 "function": provider.ready_check_js()
@@ -8072,7 +8725,7 @@ fn ensure_provider_tab(
                         e
                     );
                 }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(poll_interval);
                 continue;
             }
         };
@@ -8082,7 +8735,7 @@ fn ensure_provider_tab(
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(poll_interval);
     }
 
     Err(format!(
@@ -8096,8 +8749,22 @@ fn check_login_status(
     provider: Provider,
     verbose: bool,
 ) -> Result<LoginState, String> {
-    let res = call_mcp_tool(
-        config_path,
+    check_login_status_with(
+        &mut |tool: &str, args: Value| call_mcp_tool(config_path, tool, args),
+        provider,
+        verbose,
+    )
+}
+
+fn check_login_status_with<F>(
+    call: &mut F,
+    provider: Provider,
+    verbose: bool,
+) -> Result<LoginState, String>
+where
+    F: FnMut(&str, Value) -> Result<Value, String>,
+{
+    let res = call(
         "evaluate_script",
         serde_json::json!({
             "function": provider.login_signals_js()
