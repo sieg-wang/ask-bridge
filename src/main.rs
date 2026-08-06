@@ -171,9 +171,18 @@ impl Provider {
         {
             return false;
         }
-        if !is_shared_auth_host(&host) {
+        if is_single_purpose_auth_host(&host) {
             return true;
         }
+        // Shared host (or one we have not vetted): it must say it is on its way
+        // back to us.
+        //
+        // ASSUMPTION, not captured from a live flow: that this provider's OAuth
+        // callback lives under its own primary host -- e.g. Anthropic's
+        // registered `redirect_uri` being on `claude.ai`. The tests encode that
+        // belief rather than an observed URL, so they cannot detect it being
+        // wrong. Failure direction is safe (no disposal, one leaked tab). Swap
+        // in a real captured URL next time a genuine logout happens.
         match auth_destination_host(url) {
             Some(dest) => host_is_within(&dest, self.primary_host()),
             None => false,
@@ -1483,28 +1492,57 @@ fn host_is_within(host: &str, root: &str) -> bool {
 
 /// Auth hosts that serve more than one destination, so reaching one says
 /// nothing about *whose* login it is.
-fn is_shared_auth_host(host: &str) -> bool {
-    host_is_within(host, "accounts.google.com")
+fn is_single_purpose_auth_host(host: &str) -> bool {
+    SINGLE_PURPOSE_AUTH_HOSTS
+        .iter()
+        .any(|root| host_is_within(host, root))
 }
 
-/// Host of the destination a Google sign-in URL says it is heading to.
+/// Auth hosts that serve exactly one destination, where arriving at the host is
+/// itself proof of whose login it is.
 ///
-/// Google puts it in `continue`, `followup` (classic sign-in) or
-/// `redirect_uri` (OAuth consent); `service` is sometimes a bare service name
-/// rather than a URL, in which case it simply yields no host. The first
-/// parameter that resolves to a host wins; a URL with none returns `None`.
+/// This is an allow-list on purpose, so the default for an unlisted auth host
+/// is the *safe* one: treat it as shared and make it prove its destination.
+/// The inverse (listing the shared hosts) would fail open at the extension
+/// point -- adding a provider whose auth host is also shared infrastructure
+/// (`login.microsoftonline.com`, `login.okta.com`) would silently inherit the
+/// host-only rule and start closing strangers' tabs.
+const SINGLE_PURPOSE_AUTH_HOSTS: [&str; 2] = ["auth.openai.com", "auth0.openai.com"];
+
+/// Query parameters that carry a sign-in destination, in decreasing order of
+/// authority. The order is what the lookup iterates, so a low-fidelity signal
+/// can never outrank an authoritative one just by appearing earlier in the
+/// query string.
+///
+/// `redirect_uri` is where OAuth *must* put the callback (it is a required
+/// parameter of Google's authorization endpoint), so it is the most reliable.
+/// `continue`/`followup` carry classic sign-in destinations. `service` is
+/// usually a bare service code (`lso`, `mail`, `cl`) rather than a URL, so it
+/// is last and normally yields no host at all.
+const AUTH_DESTINATION_KEYS: [&str; 4] = ["redirect_uri", "continue", "followup", "service"];
+
+/// Host of the destination a shared sign-in URL says it is heading to, or
+/// `None` when it does not say.
+///
+/// Only the parameters in [`AUTH_DESTINATION_KEYS`] are consulted. Reading a
+/// destination out of *any* parameter would let a crafted link nominate one
+/// through a field the login flow never uses.
 fn auth_destination_host(url: &str) -> Option<String> {
+    // Cut the fragment first: a `?` that appears inside a fragment starts no
+    // query, so splitting on `?` before `#` would read the wrong string.
+    let url = url.split('#').next().unwrap_or("");
     let query = url.split_once('?').map(|(_, q)| q)?;
-    let query = query.split('#').next().unwrap_or("");
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if !matches!(key, "continue" | "followup" | "redirect_uri" | "service") {
-            continue;
-        }
-        if let Some(host) = url_host(&percent_decode(value)) {
-            return Some(host);
+    for key in AUTH_DESTINATION_KEYS {
+        for pair in query.split('&') {
+            let Some((found, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if found != key {
+                continue;
+            }
+            if let Some(host) = url_host(&percent_decode(value)) {
+                return Some(host);
+            }
         }
     }
     None
@@ -4635,6 +4673,170 @@ mod tests {
             "a data: page forged the isolatedContext marker and was adopted (parsed url = {:?})",
             pages[0].url
         );
+    }
+
+    /// VERIFIER TEST: reuse path with a stale auth tab present. Asserts the
+    /// ORDERING the fix depends on -- the replacement tab must be opened (and
+    /// therefore identifiable) BEFORE anything is closed -- and that the auth
+    /// tab is never selected.
+    ///
+    /// The ordering is not cosmetic. If the stale auth tab is the *only* tab,
+    /// closing it first leaves the browser with zero pages, which takes the
+    /// window and the CDP connection with it. This is the invariant the
+    /// disposal's own safety argument rests on ("the tab we drive is already
+    /// pinned"), and nothing else checks it.
+    #[test]
+    fn vab_reuse_auth_order() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp",
+            ),
+            (2, "https://example.com/notes"),
+        ]);
+        let r = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::Gemini,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+        assert!(r.is_ok(), "unexpected error: {:?}", r);
+        let seq: Vec<String> = fake
+            .calls
+            .iter()
+            .map(|(t, a)| {
+                format!(
+                    "{}{}",
+                    t,
+                    a.get("pageId")
+                        .map(|v| format!("#{}", v))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+
+        let new_page_at = seq.iter().position(|c| c.starts_with("new_page"));
+        let close_at = seq.iter().position(|c| c.starts_with("close_page"));
+        match (new_page_at, close_at) {
+            (Some(n), Some(c)) => assert!(
+                n < c,
+                "disposal ran BEFORE the replacement tab existed: {:?}",
+                seq
+            ),
+            other => panic!("expected both a new_page and a close_page: {:?}", other),
+        }
+        assert!(
+            fake.page_ids_for("select_page").is_empty(),
+            "an auth tab was selected: {:?}",
+            fake.page_ids_for("select_page")
+        );
+        assert!(
+            !fake.open_ids().contains(&1),
+            "stale auth tab survived: {:?}",
+            fake.open_ids()
+        );
+        assert!(
+            fake.open_ids().contains(&2),
+            "the user's unrelated tab was closed: {:?}",
+            fake.open_ids()
+        );
+    }
+
+    /// Q16: the reuse path's disposal must report its close failures the same
+    /// way the `--new` path does. The asymmetry was untested.
+    #[test]
+    fn reuse_path_close_failures_also_reach_the_caller() {
+        let mut fake = FakeMcp::new(&[
+            (
+                1,
+                "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp",
+            ),
+            (2, "https://example.com/notes"),
+        ]);
+        fake.close_failures = vec![1];
+
+        let outcome = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::Gemini,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect("tab preparation should still succeed");
+
+        assert_eq!(
+            outcome.close_failures.len(),
+            1,
+            "reuse-path close failure never reached the caller: {:?}",
+            outcome.close_failures
+        );
+        assert_eq!(outcome.close_failures[0].0, 1);
+    }
+
+    /// Q8: only the parameters that a sign-in flow actually uses may nominate a
+    /// destination, and the authoritative one wins regardless of query order.
+    #[test]
+    fn auth_destination_comes_only_from_known_keys_in_priority_order() {
+        // A field the flow never uses cannot smuggle in a destination.
+        for smuggled in [
+            "https://accounts.google.com/signin?hint=https%3A%2F%2Fgemini.google.com%2Fapp",
+            "https://accounts.google.com/signin?state=https%3A%2F%2Fgemini.google.com%2F",
+            "https://accounts.google.com/signin?ref=https://gemini.google.com/app",
+        ] {
+            assert_eq!(auth_destination_host(smuggled), None, "{}", smuggled);
+            assert!(
+                !Provider::Gemini.owns_auth_url(smuggled),
+                "a non-destination parameter nominated a destination: {}",
+                smuggled
+            );
+        }
+
+        // `redirect_uri` outranks weaker carriers wherever it appears.
+        let service_first = "https://accounts.google.com/o/oauth2/v2/auth?service=https%3A%2F%2Fgemini.google.com%2Fapp&redirect_uri=https%3A%2F%2Fnotion.so%2Fcb";
+        assert_eq!(
+            auth_destination_host(service_first),
+            Some("notion.so".to_string())
+        );
+        assert!(!Provider::Gemini.owns_auth_url(service_first));
+
+        let continue_first = "https://accounts.google.com/o/oauth2/v2/auth?continue=https%3A%2F%2Fclaude.ai%2F&redirect_uri=https%3A%2F%2Fnotion.so%2Fcb";
+        assert_eq!(
+            auth_destination_host(continue_first),
+            Some("notion.so".to_string())
+        );
+        assert!(!Provider::Claude.owns_auth_url(continue_first));
+
+        // A bare service code yields no host, so a real callback still wins.
+        let real = "https://accounts.google.com/o/oauth2/v2/auth?service=lso&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fauth%2Fcallback%2Fgoogle";
+        assert_eq!(auth_destination_host(real), Some("claude.ai".to_string()));
+        assert!(Provider::Claude.owns_auth_url(real));
+
+        // A `?` inside a fragment starts no query.
+        assert_eq!(
+            auth_destination_host(
+                "https://accounts.google.com/signin#x?continue=https%3A%2F%2Fgemini.google.com%2F"
+            ),
+            None
+        );
+    }
+
+    /// The single-purpose allow-list must fail CLOSED: anything not vetted is
+    /// treated as shared infrastructure and has to prove its destination.
+    #[test]
+    fn unvetted_auth_hosts_default_to_needing_a_destination() {
+        assert!(is_single_purpose_auth_host("auth.openai.com"));
+        assert!(is_single_purpose_auth_host("auth0.openai.com"));
+        // Shared today...
+        assert!(!is_single_purpose_auth_host("accounts.google.com"));
+        // ...and the hosts a future provider would bring, which must not
+        // silently inherit the host-only rule.
+        assert!(!is_single_purpose_auth_host("login.microsoftonline.com"));
+        assert!(!is_single_purpose_auth_host("login.okta.com"));
+        // Never a look-alike of a vetted host.
+        assert!(!is_single_purpose_auth_host("auth.openai.com.evil.test"));
     }
 
     /// A hostile page only has to *mention* a provider domain to be adopted as
