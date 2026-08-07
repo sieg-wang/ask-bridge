@@ -8300,15 +8300,206 @@ mod tests {
             .expect("the lock should be free once the holder's descriptor closes");
     }
 
-    /// Structural, for the same reason as the live-URL gate above: the failure
-    /// mode is a *missing* call, which no behavioural test of this binary can
-    /// see (the transaction it guards drives `pbcopy`/`pbpaste`).
+    /// The lock is not just *taken* -- it is *held* until the transaction ends.
+    ///
+    /// `flock` locks the open file description, so a second `open` + `flock`
+    /// from inside the transaction conflicts exactly as a second process would
+    /// (`the_clipboard_transaction_is_exclusive_across_processes` above proves
+    /// that equivalence). Probing from inside every injected step is what tells
+    /// a guard that lives for the transaction apart from one that is dropped on
+    /// the line that takes it: `let _ = lock_clipboard_in(..)` releases the
+    /// flock immediately, and leaves the call sitting there for any source-level
+    /// check to find.
+    #[cfg(unix)]
+    #[test]
+    fn the_clipboard_lock_is_held_for_the_whole_transaction() {
+        use std::cell::RefCell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let steps: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let free_at: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let probe = |step: &'static str| {
+            steps.borrow_mut().push(step);
+            if lock_clipboard_in(dir.path(), Duration::from_millis(10)).is_ok() {
+                free_at.borrow_mut().push(step);
+            }
+        };
+
+        let clipboard = RefCell::new(String::from("what the user had copied"));
+        let mut read = || -> Result<String, String> {
+            probe("read");
+            Ok(clipboard.borrow().clone())
+        };
+        let mut write = |content: &str| -> Result<(), String> {
+            probe("write");
+            *clipboard.borrow_mut() = content.to_string();
+            Ok(())
+        };
+        let mut click = || -> Result<(), String> {
+            probe("click");
+            // The browser answering the click is what lands the response on the
+            // clipboard.
+            *clipboard.borrow_mut() = String::from("the provider's answer");
+            Ok(())
+        };
+
+        let content = copy_latest_markdown_via_clipboard_with(
+            &mut read,
+            &mut write,
+            &mut click,
+            dir.path(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("the faked transaction should have run to completion");
+
+        assert_eq!(content, "the provider's answer");
+        let observed = steps.borrow().clone();
+        // capture the original, stamp the sentinel, click, poll, restore.
+        assert_eq!(
+            observed,
+            vec!["read", "write", "click", "read", "write"],
+            "the fake did not drive the whole five-step transaction, so the \
+             probes below prove nothing about its middle"
+        );
+
+        let free_at = free_at.borrow().clone();
+        assert!(
+            free_at.is_empty(),
+            "a second run could have entered the clipboard transaction during \
+             its {free_at:?} step(s). The lock has to outlive the transaction, \
+             not just the line that takes it: while it is loose, two runs trade \
+             sentinels -- B captures A's sentinel as `the original` and restores \
+             it over the user's clipboard, and A's poll accepts B's answer as A's."
+        );
+
+        // ...and it must be gone once the transaction returns, or the next run
+        // queues behind a lock nobody holds.
+        lock_clipboard_in(dir.path(), Duration::from_millis(10))
+            .expect("the transaction must release the clipboard when it returns");
+    }
+
+    /// The gaps *between* the steps, which the probes above cannot see.
+    ///
+    /// Each injected step samples the lock from inside itself, so any
+    /// implementation that holds the lock while a step runs looks identical to
+    /// one that holds it throughout. Per-step locking -- five separate
+    /// `let _g = lock_clipboard_in(..)?` scopes, one per step -- therefore
+    /// passes the test above while re-opening M2 completely: the four gaps
+    /// between the steps are exactly where a second run slips in, captures this
+    /// run's sentinel as "the original", and restores it over the user's
+    /// clipboard. That mutation was measured passing the whole suite.
+    ///
+    /// A concurrent watcher is the only thing that can observe those gaps, so
+    /// this test runs one. It is armed by the first step and disarmed by the
+    /// last, which bounds it to the span where the lock must be continuously
+    /// held and keeps the before/after windows -- where the lock legitimately
+    /// is free -- out of the sample.
+    #[cfg(unix)]
+    #[test]
+    fn the_clipboard_lock_is_held_continuously_not_re_taken_per_step() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let free_samples = Arc::new(AtomicUsize::new(0));
+
+        let watcher = {
+            let (dir_path, armed, finished, free_samples) = (
+                dir.path().to_path_buf(),
+                Arc::clone(&armed),
+                Arc::clone(&finished),
+                Arc::clone(&free_samples),
+            );
+            std::thread::spawn(move || {
+                while !finished.load(Ordering::SeqCst) {
+                    if armed.load(Ordering::SeqCst)
+                        && lock_clipboard_in(&dir_path, Duration::from_millis(0)).is_ok()
+                    {
+                        free_samples.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let clipboard = std::cell::RefCell::new(String::from("the user's own clipboard"));
+        let steps = std::cell::Cell::new(0usize);
+        // Arm on the first step, disarm on the last: the watched span is
+        // step 1 -> step 5, which contains all four gaps and neither end window.
+        let mark = |armed: &AtomicBool| {
+            let n = steps.get() + 1;
+            steps.set(n);
+            if n == 1 {
+                armed.store(true, Ordering::SeqCst);
+            }
+            if n == 5 {
+                armed.store(false, Ordering::SeqCst);
+            }
+            // Give the watcher a real chance to run inside every gap.
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        let mut read = || -> Result<String, String> {
+            mark(&armed);
+            Ok(clipboard.borrow().clone())
+        };
+        let mut write = |content: &str| -> Result<(), String> {
+            mark(&armed);
+            *clipboard.borrow_mut() = content.to_string();
+            Ok(())
+        };
+        let mut click = || -> Result<(), String> {
+            mark(&armed);
+            *clipboard.borrow_mut() = String::from("the provider's answer");
+            Ok(())
+        };
+
+        let content = copy_latest_markdown_via_clipboard_with(
+            &mut read,
+            &mut write,
+            &mut click,
+            dir.path(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("the faked transaction should have run to completion");
+
+        finished.store(true, Ordering::SeqCst);
+        watcher.join().expect("the watcher thread should not panic");
+
+        assert_eq!(content, "the provider's answer");
+        assert_eq!(
+            steps.get(),
+            5,
+            "the fake did not drive all five steps, so the watcher sampled the \
+             wrong span"
+        );
+        assert_eq!(
+            free_samples.load(Ordering::SeqCst),
+            0,
+            "a concurrent run acquired the clipboard lock {} time(s) while this \
+             transaction was mid-flight. The lock has to be held ACROSS the \
+             steps, not re-taken for each one: the invariant is about the \
+             clipboard's contents between steps, which is where the other run \
+             swaps in its own sentinel.",
+            free_samples.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Structural, and now the junior partner of the behavioural test above: a
+    /// lock taken *after* the original clipboard is captured shows up there as a
+    /// free probe on the first `read`. This stays because it is the cheap
+    /// tripwire for a rebase that drops the call altogether, and because it
+    /// names the ordering directly.
     #[cfg(unix)]
     #[test]
     fn the_clipboard_transaction_takes_the_lock_before_reading_the_clipboard() {
         let source = include_str!("main.rs");
         let body = source
-            .split_once(concat!("fn copy_latest_markdown_via_", "clipboard("))
+            .split_once(concat!("fn copy_latest_markdown_via_clipboard_", "with<"))
             .expect("the clipboard transaction should exist")
             .1
             .split_once("\nfn ")
@@ -8706,6 +8897,192 @@ mod tests {
              the sub-domain and sign-in origins resolve_session_target refuses on \
              the command line -- so a redirect hands back exactly what the input \
              check rejected. Arm was:\n{session_arm}"
+        );
+    }
+
+    /// The `--session` preparation is a sequence, and the second step's refusal
+    /// is not advisory: it comes back as an `Err`, after the tab was opened, so
+    /// `main` has something to abort on.
+    #[test]
+    fn a_refused_session_landing_page_is_an_error_not_a_warning() {
+        // The ordinary case: navigate, then check, then let the run continue.
+        let mut opened = 0;
+        let mut verified = 0;
+        {
+            let mut open = || -> Result<(), String> {
+                opened += 1;
+                Ok(())
+            };
+            let mut verify = || -> Result<(), String> {
+                verified += 1;
+                Ok(())
+            };
+            assert_eq!(
+                open_verified_session_tab(Provider::ChatGpt, &mut open, &mut verify),
+                Ok(())
+            );
+        }
+        assert_eq!((opened, verified), (1, 1));
+
+        // The refusal this arm exists for: the browser left the conversation.
+        let mut verify_calls = 0;
+        {
+            let mut open = || -> Result<(), String> { Ok(()) };
+            let mut verify = || -> Result<(), String> {
+                verify_calls += 1;
+                Err("reports https://evil.example/ instead".to_string())
+            };
+            let error = open_verified_session_tab(Provider::ChatGpt, &mut open, &mut verify)
+                .expect_err("a refused landing page must not come back as success");
+            assert!(error.contains("ChatGPT"), "{error}");
+            assert!(
+                error.contains("reports https://evil.example/ instead"),
+                "the refusal has to survive to the user, or the run stops with \
+                 nothing said about why: {error}"
+            );
+        }
+        assert_eq!(verify_calls, 1);
+
+        // A tab that never opened is not verified at all: there is nothing to
+        // verify, and doing it anyway would report the second failure instead of
+        // the first.
+        let mut verify_after_open_failure = 0;
+        {
+            let mut open = || -> Result<(), String> { Err("new_page failed".to_string()) };
+            let mut verify = || -> Result<(), String> {
+                verify_after_open_failure += 1;
+                Ok(())
+            };
+            let error = open_verified_session_tab(Provider::ChatGpt, &mut open, &mut verify)
+                .expect_err("a session tab that would not open must fail the run");
+            assert!(error.contains("new_page failed"), "{error}");
+        }
+        assert_eq!(verify_after_open_failure, 0);
+    }
+
+    /// A `--session` run whose landing page is refused must *stop*.
+    ///
+    /// Lexical, deliberately, and this is the justification. The refusal itself
+    /// is covered behaviourally by the test above; what is not coverable that
+    /// way is what `main` does with it, because the abort is
+    /// `std::process::exit` inside a 700-line `fn main`. The two alternatives
+    /// were both measured and rejected: running the binary end to end cannot
+    /// reach this branch offline (it needs a live chrome-devtools MCP session
+    /// before the gate is ever consulted, and `write_mcp_config` overwrites the
+    /// config on every run), and injecting the abort as a closure only moves the
+    /// untestable line into `main` where this test would no longer be looking
+    /// at it.
+    ///
+    /// The part that is not a compromise is on the production side: the arm's
+    /// two browser steps now go through `open_verified_session_tab`, so the arm
+    /// has exactly one error path, and this test can count paths against aborts
+    /// instead of merely finding *an* `exit` that some other, still-fatal step
+    /// happens to contribute.
+    #[test]
+    fn a_refused_session_aborts_the_run() {
+        // Split literals keep this test from matching its own source text.
+        let source = include_str!("main.rs");
+        let arm = source
+            .split_once(concat!(
+                "if let Some((session_provider, session_url)) = ",
+                "&session_target {"
+            ))
+            .expect("main should route --session through its own arm")
+            .1
+            .split_once(concat!("} else if let Err(e) = ", "ensure_provider_tab("))
+            .expect("the --session arm should be followed by the ensure_provider_tab arm")
+            .0;
+
+        // Comments are stripped before anything is counted. `str::matches` is a
+        // raw substring search, so without this the cheapest possible evasion --
+        // leaving `// ... std::process::exit(1) felt too harsh.` in a branch
+        // that now only warns -- satisfies every count below. Measured passing.
+        let arm: String = arm
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Counting occurrences anywhere in the arm is not enough either: moving
+        // the abort to a *different*, still-fatal branch (an early
+        // `if session_url.is_empty() { exit(1) }`) keeps the totals at (1, 1)
+        // while the gate's own refusal is downgraded to a warning. Also
+        // measured passing. So bind the abort to the gate's error block.
+        let block = {
+            let needle = concat!("if let Err(e) = open_verified_session_", "tab(");
+            let from = arm
+                .find(needle)
+                .expect("the --session arm must route through the verified-session helper");
+            let rest = &arm[from..];
+            // The call's arguments are closures with bodies of their own, so
+            // "the first `{` after the needle" is one of those, not the `if`
+            // body. Let the call's parentheses balance first; the next `{` is
+            // the branch. (Getting this wrong is loud, not silent: the previous
+            // version matched the `open_url_tab` closure and failed.)
+            // Start at the needle's OWN trailing `(`, not at the start of the
+            // slice: `if let Err(e) = ...` has a balanced `(e)` before the call
+            // opens, and scanning from there declared the call closed after
+            // `Err(e)`.
+            let call_start = needle.len() - 1;
+            debug_assert!(rest[call_start..].starts_with('('));
+            let mut parens = 0usize;
+            let mut after_call = None;
+            for (offset, character) in rest[call_start..].char_indices() {
+                match character {
+                    '(' => parens += 1,
+                    ')' => {
+                        parens -= 1;
+                        if parens == 0 {
+                            after_call = Some(call_start + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let after_call = after_call.expect("the gate call must be paren-balanced");
+            let open = after_call
+                + rest[after_call..]
+                    .find('{')
+                    .expect("the gate's error branch must have a block");
+            let mut depth = 0usize;
+            let mut end = None;
+            for (offset, character) in rest[open..].char_indices() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest[open..end.expect("the gate's error branch must be brace-balanced")].to_string()
+        };
+
+        assert!(
+            block.contains(concat!("std::process::", "exit(1)")),
+            "the --session gate's own refusal does not end the run. A refusal \
+             that only warns lets the prompt-bearing flow carry on into the \
+             page the live-URL gate just rejected -- which is the whole reason \
+             the gate is there. Branch was:\n{block}"
+        );
+
+        // And still nothing else in the arm may fall through: a second error
+        // path added without its own abort is the other way back to the bug.
+        let error_paths = arm.matches(concat!("if let ", "Err(e) = ")).count();
+        let aborts = arm.matches(concat!("std::process::", "exit(1)")).count();
+        assert_eq!(
+            (error_paths, aborts),
+            (1, 1),
+            "every error path in the --session arm has to end the run; found \
+             {error_paths} error path(s) and {aborts} abort(s). Arm was:\n{arm}"
         );
     }
 
@@ -9123,6 +9500,11 @@ fn copy_latest_markdown(config_path: &str, provider: Provider) -> Result<String,
 }
 
 /// Name of the file whose `flock` serialises the clipboard transaction.
+///
+/// `cfg(unix)` for the same reason `lock_clipboard_in` is: `flock` is the only
+/// caller, so on any other platform these three items are dead code the
+/// compiler would (rightly) warn about.
+#[cfg(unix)]
 const CLIPBOARD_LOCK_NAME: &str = "ask-bridge-clipboard.lock";
 
 /// How long to wait for another run to finish with the clipboard.
@@ -9131,6 +9513,7 @@ const CLIPBOARD_LOCK_NAME: &str = "ask-bridge-clipboard.lock";
 /// it: ~15s of click retries plus ~3s of clipboard polling, so a healthy holder
 /// is gone well inside this. It is long enough to queue behind one, and short
 /// enough that a wedged holder does not hang a run indefinitely.
+#[cfg(unix)]
 const CLIPBOARD_LOCK_WAIT: Duration = Duration::from_secs(45);
 
 /// Holds the clipboard lock for as long as it is alive.
@@ -9139,6 +9522,7 @@ const CLIPBOARD_LOCK_WAIT: Duration = Duration::from_secs(45);
 /// the descriptor closes, which includes the process being killed, so there is
 /// no stale-lock state to detect, age out, or get wrong. Nothing is written
 /// into the file -- its only job is to be a thing two processes can name.
+#[cfg(unix)]
 #[derive(Debug)]
 struct ClipboardGuard {
     _file: std::fs::File,
@@ -9205,14 +9589,56 @@ fn lock_clipboard_in(dir: &Path, wait: Duration) -> Result<ClipboardGuard, Strin
     }
 }
 
+/// How long to wait before retrying the copy button while a Single Page App is
+/// still rendering the message.
+const CLIPBOARD_CLICK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long to wait between clipboard polls after the copy button was clicked.
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 fn copy_latest_markdown_via_clipboard(
     config_path: &str,
     provider: Provider,
 ) -> Result<String, String> {
+    copy_latest_markdown_via_clipboard_with(
+        &mut || read_clipboard(),
+        &mut |content: &str| write_clipboard(content),
+        &mut || click_latest_copy_button(config_path, provider),
+        &std::env::temp_dir(),
+        CLIPBOARD_CLICK_RETRY_INTERVAL,
+        CLIPBOARD_POLL_INTERVAL,
+    )
+}
+
+/// Test seam for [`copy_latest_markdown_via_clipboard`]: the three things the
+/// transaction does to the world outside this process -- read the clipboard,
+/// write it, click the provider's copy button -- go through injected closures,
+/// and both waits are parameters. A test can therefore drive the whole
+/// transaction against fakes and, from inside one of them, try to take the
+/// clipboard lock the way a second `ask-bridge` process would.
+///
+/// That probe is the only way to see the property the lock exists for. The lock
+/// being *taken* is visible in the source; the lock still being *held* three
+/// steps later is not, and binding the guard to `_` instead of
+/// `_clipboard_guard` releases it on the line that takes it while leaving the
+/// call -- and every source-level check that looks for it -- exactly as it was.
+fn copy_latest_markdown_via_clipboard_with<R, W, C>(
+    read_clipboard: &mut R,
+    write_clipboard: &mut W,
+    click_copy_button: &mut C,
+    temp_dir: &Path,
+    click_retry_interval: Duration,
+    clipboard_poll_interval: Duration,
+) -> Result<String, String>
+where
+    R: FnMut() -> Result<String, String>,
+    W: FnMut(&str) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
+{
     // Held for the whole transaction below; released when this function returns
     // by any path, including the early `return Err` in the click-retry arm.
     #[cfg(unix)]
-    let _clipboard_guard = lock_clipboard_in(&std::env::temp_dir(), CLIPBOARD_LOCK_WAIT)?;
+    let _clipboard_guard = lock_clipboard_in(temp_dir, CLIPBOARD_LOCK_WAIT)?;
 
     let clipboard_before = read_clipboard().unwrap_or_default();
     let sentinel = format!("__ASK_CHATGPT_COPY_PENDING_{}__", std::process::id());
@@ -9221,14 +9647,14 @@ fn copy_latest_markdown_via_clipboard(
     // Click the copy button, retrying if the message or button is not found yet (due to asynchronous rendering of Single Page App)
     let mut click_err = None;
     for _ in 0..30 {
-        match click_latest_copy_button(config_path, provider) {
+        match click_copy_button() {
             Ok(_) => {
                 click_err = None;
                 break;
             }
             Err(e) => {
                 click_err = Some(e);
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(click_retry_interval);
             }
         }
     }
@@ -9241,7 +9667,7 @@ fn copy_latest_markdown_via_clipboard(
 
     let mut copied_content = None;
     for _ in 0..30 {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(clipboard_poll_interval);
         match read_clipboard() {
             Ok(content) if !content.trim().is_empty() && content != sentinel => {
                 copied_content = Some(content);
@@ -9257,7 +9683,7 @@ fn copy_latest_markdown_via_clipboard(
     let content = copied_content
         .ok_or_else(|| "Timed out waiting for clipboard content after clicking copy".to_string())?;
 
-    roundtrip_response_via_temp_file(&std::env::temp_dir(), &content)
+    roundtrip_response_via_temp_file(temp_dir, &content)
 }
 
 /// Create the scratch file the copied response is round-tripped through.
@@ -11364,6 +11790,33 @@ where
     ))
 }
 
+/// Put the browser on the conversation a `--session` run named, and prove it is
+/// still there.
+///
+/// The two steps are one unit because the second is only meaningful about the
+/// first: navigating is what can drift, and reading the live URL afterwards is
+/// what notices. Folding them together also leaves the `--session` arm of
+/// [`main`] with exactly one failure path, so "a refusal ends the run" is a
+/// single `exit` to account for rather than one per step.
+///
+/// Test seam: both browser steps are injected, so the sequencing -- navigate
+/// first, check second, and a check that refuses comes back as `Err` rather
+/// than as something the caller can read as success -- is testable without a
+/// browser. See `a_refused_session_landing_page_is_an_error_not_a_warning`, and
+/// `a_refused_session_aborts_the_run` for the half that lives in [`main`].
+fn open_verified_session_tab<O, V>(
+    provider: Provider,
+    open: &mut O,
+    verify: &mut V,
+) -> Result<(), String>
+where
+    O: FnMut() -> Result<(), String>,
+    V: FnMut() -> Result<(), String>,
+{
+    open().map_err(|e| format!("Error opening {} session: {}", provider.display_name(), e))?;
+    verify().map_err(|e| format!("Error opening {} session: {}", provider.display_name(), e))
+}
+
 /// Test seam for [`ensure_provider_tab`]: every browser interaction goes
 /// through `call` and the readiness poll interval is injectable, so the tab
 /// bookkeeping can be exercised against a fake MCP without ever starting a
@@ -12298,20 +12751,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some((session_provider, session_url)) = &session_target {
-        if let Err(e) = open_url_tab(
-            &config_path,
-            *session_provider,
-            session_url,
-            is_headless,
-            command_verbose,
-        ) {
-            eprintln!(
-                "Error opening {} session: {}",
-                session_provider.display_name(),
-                e
-            );
-            std::process::exit(1);
-        }
         // `open_url_tab` binds the tab by ID, so nothing can *substitute* a tab
         // here -- but nothing on this path ever reads the tab's live URL
         // either. `wait_for_page_load` polls `document.readyState` and
@@ -12328,11 +12767,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the provider's (`Provider::from_url(&url).unwrap_or(provider)`), and
         // neither reaches the composer. Verifying inside would refuse those two
         // commands for a behaviour they never had.
-        if let Err(e) = verify_session_page_is_provider(
-            &mut |tool, args| call_mcp_tool(&config_path, tool, args),
+        //
+        // The refusal ends the run. It is not a warning to proceed through:
+        // everything after this point types the prompt into whatever tab is
+        // selected, so continuing past a rejected landing page is exactly the
+        // hole the check was added to close.
+        if let Err(e) = open_verified_session_tab(
             *session_provider,
+            &mut || {
+                open_url_tab(
+                    &config_path,
+                    *session_provider,
+                    session_url,
+                    is_headless,
+                    command_verbose,
+                )
+            },
+            &mut || {
+                verify_session_page_is_provider(
+                    &mut |tool, args| call_mcp_tool(&config_path, tool, args),
+                    *session_provider,
+                )
+            },
         ) {
-            eprintln!("Error opening {} session: {}", provider.display_name(), e);
+            eprintln!("{}", e);
             std::process::exit(1);
         }
     } else if let Err(e) = ensure_provider_tab(
