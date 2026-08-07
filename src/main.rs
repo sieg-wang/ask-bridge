@@ -203,6 +203,45 @@ impl Provider {
         }
     }
 
+    /// Whether `url`'s origin is *exactly* this provider's conversation origin.
+    ///
+    /// Deliberately stricter than [`owns_url`](Self::owns_url), because the two
+    /// answer different questions. `owns_url` classifies a page **found in the
+    /// browser**: real provider tabs do live on sub-domains, and a lie there is
+    /// caught by a second lock that asks the tab for its own `location.href`.
+    /// This one classifies a URL **handed in on the command line** that the tool
+    /// will navigate to and then type the user's prompt into -- nothing about it
+    /// was observed first, and the live-URL check downstream can only confirm
+    /// the tab stayed where this function already agreed to send it. So the
+    /// dot boundary is wrong here: it accepts `https://evil.chatgpt.com/c/x`,
+    /// which needs a DNS/sub-domain takeover rather than a domain registration,
+    /// but is still not the provider.
+    ///
+    /// Equality, not the boundary, and on `Url`'s parsed host so the comparison
+    /// sees what the browser would resolve: userinfo is not the host
+    /// (`chatgpt.com@evil.test` is `evil.test`), ASCII case and the default port
+    /// are already normalised away, and a trailing root dot is **not** -- so
+    /// `chatgpt.com.` is rejected, which is also the functionally right answer:
+    /// it is a separate cookie origin, so a session pinned there arrives logged
+    /// out.
+    ///
+    /// No provider is exempt: `www.chatgpt.com` (301) and `www.claude.ai` (301)
+    /// redirect to the bare host, `chat.openai.com` (308) redirects to
+    /// `chatgpt.com`, `sora.chatgpt.com` is a different product with no
+    /// conversation path, and `gemini.google.com` is itself the canonical host.
+    /// Checked by HEAD request on 2026-08-07 -- re-check before adding an
+    /// exception rather than adding one on a guess.
+    fn owns_session_origin(self, url: &Url) -> bool {
+        url.scheme() == "https" && url.host_str() == Some(self.primary_host())
+    }
+
+    /// The provider whose conversation origin `url` is exactly, if any.
+    fn from_session_url(url: &Url) -> Option<Self> {
+        SESSION_PROVIDERS
+            .into_iter()
+            .find(|provider| provider.owns_session_origin(url))
+    }
+
     fn owns_conversation_url(self, url: &Url) -> bool {
         if Self::from_url(url.as_str()) != Some(self) {
             return false;
@@ -1431,6 +1470,11 @@ fn unique_new_page_id(before: &[Page], after: &[Page]) -> Result<usize, String> 
     }
 }
 
+/// The providers a `--session` URL may name, in the order the host error lists
+/// them. Shared by the rule and its message so a fourth provider cannot make the
+/// message lie.
+const SESSION_PROVIDERS: [Provider; 3] = [Provider::ChatGpt, Provider::Gemini, Provider::Claude];
+
 fn resolve_session_target(
     selected_provider: Provider,
     provider_was_explicit: bool,
@@ -1442,9 +1486,19 @@ fn resolve_session_target(
     }
 
     if let Ok(url) = Url::parse(session) {
-        let session_provider = Provider::from_url(url.as_str()).ok_or_else(|| {
-            "Session URL must use HTTPS and belong to chatgpt.com, gemini.google.com, or claude.ai"
-                .to_string()
+        // Exact origin, not the sub-domain rule tab identity uses -- see
+        // `Provider::owns_session_origin` for why the two differ.
+        let session_provider = Provider::from_session_url(&url).ok_or_else(|| {
+            let hosts: Vec<&str> = SESSION_PROVIDERS
+                .iter()
+                .map(|provider| provider.primary_host())
+                .collect();
+            format!(
+                "Session URL must use https and its host must be exactly one \
+                 of: {} (a sub-domain, a trailing dot, or a userinfo prefix is \
+                 a different host and is rejected)",
+                hosts.join(", ")
+            )
         })?;
         if !session_provider.owns_conversation_url(&url) {
             return Err(format!(
@@ -4665,6 +4719,142 @@ mod tests {
                 "expected {invalid:?} to be rejected"
             );
         }
+    }
+
+    /// The hosts real `--session` use lands on must keep working, so the
+    /// narrowing cannot be bought by breaking the feature.
+    ///
+    /// Case is normalised, not rejected: DNS is case-insensitive and `Url`
+    /// folds the host before anything here sees it, so `CHATGPT.com` *is* the
+    /// canonical host and resolves to the canonical URL verbatim. Same for the
+    /// default port. Rejecting either would refuse a URL this tool builds
+    /// itself, buying nothing -- what must not survive case folding is a
+    /// *spoof*, which the reject test pins.
+    #[test]
+    fn a_session_url_is_accepted_on_the_providers_exact_conversation_host() {
+        for (url, provider, resolved) in [
+            (
+                "https://chatgpt.com/c/abc",
+                Provider::ChatGpt,
+                "https://chatgpt.com/c/abc",
+            ),
+            (
+                "https://CHATGPT.com/c/abc",
+                Provider::ChatGpt,
+                "https://chatgpt.com/c/abc",
+            ),
+            (
+                "https://chatgpt.com:443/c/abc",
+                Provider::ChatGpt,
+                "https://chatgpt.com/c/abc",
+            ),
+            (
+                "https://gemini.google.com/app/abc",
+                Provider::Gemini,
+                "https://gemini.google.com/app/abc",
+            ),
+            (
+                "https://claude.ai/chat/abc",
+                Provider::Claude,
+                "https://claude.ai/chat/abc",
+            ),
+        ] {
+            assert_eq!(
+                resolve_session_target(Provider::ChatGpt, false, url),
+                Ok((provider, resolved.to_string())),
+                "the canonical conversation host was refused: {url}"
+            );
+        }
+    }
+
+    /// `--session` is the one path where a URL nobody observed in the browser is
+    /// navigated to and then typed into, so its host rule is *equality* -- the
+    /// dot boundary that tab identity uses would hand the prompt to
+    /// `evil.chatgpt.com`, which costs a sub-domain takeover rather than a
+    /// domain registration but is still not the provider.
+    ///
+    /// The last two assertions are the point of the whole change: the two
+    /// boundaries must stay *different*. A future refactor that "unifies" them
+    /// in either direction turns this red.
+    #[test]
+    fn a_session_url_is_refused_on_every_host_that_is_not_exactly_the_providers() {
+        for (url, why) in [
+            ("https://evil.chatgpt.com/c/abc", "sub-domain"),
+            ("https://EVIL.CHATGPT.COM/c/abc", "sub-domain, upper case"),
+            ("https://a.b.c.chatgpt.com/c/abc", "deep sub-domain"),
+            ("https://www.chatgpt.com/c/abc", "www. redirects, is not it"),
+            ("https://sora.chatgpt.com/c/abc", "sibling product"),
+            ("https://chatgpt.com./c/abc", "trailing root dot"),
+            ("https://chatgpt.com.evil.test/c/abc", "suffix look-alike"),
+            ("https://chatgpt.com@evil.test/c/abc", "userinfo, not host"),
+            ("https://evil.gemini.google.com/app/abc", "sub-domain"),
+            ("https://evil.claude.ai/chat/abc", "sub-domain"),
+            (
+                "https://www.claude.ai/chat/abc",
+                "www. redirects, is not it",
+            ),
+        ] {
+            let error = resolve_session_target(Provider::ChatGpt, false, url)
+                .expect_err(&format!("accepted a non-provider host ({why}): {url}"));
+            assert!(
+                error.contains("host must be exactly one of:"),
+                "{url} was refused, but not by the host rule: {error}"
+            );
+        }
+
+        // Rejected before this change and still rejected -- the narrowing must
+        // not have moved which error explains them.
+        for url in ["http://chatgpt.com/c/abc", "http://evil.chatgpt.com/c/abc"] {
+            let error = resolve_session_target(Provider::ChatGpt, false, url)
+                .expect_err(&format!("accepted a plain-http session URL: {url}"));
+            assert!(
+                error.contains("must use https"),
+                "{url} was refused, but not for its scheme: {error}"
+            );
+        }
+        // A provider-owned host is still not a conversation without the
+        // conversation-shaped path, and that stays a *different* error.
+        let error =
+            resolve_session_target(Provider::ChatGpt, false, "https://chatgpt.com/settings")
+                .expect_err("accepted a non-conversation path on the provider host");
+        assert!(
+            error.contains("not a supported ChatGPT conversation URL"),
+            "a provider host with a non-conversation path gave: {error}"
+        );
+
+        // Tab identity is a different question and keeps its own, looser
+        // answer: a sub-domain tab found in the browser is still the provider's
+        // (and is re-checked against its own `location.href`).
+        assert!(Provider::ChatGpt.owns_url("https://sora.chatgpt.com/c/abc"));
+        assert!(!Provider::ChatGpt.owns_session_origin(
+            &Url::parse("https://sora.chatgpt.com/c/abc").expect("valid URL")
+        ));
+    }
+
+    /// Upstream's message named the rule it wished it had ("belong to
+    /// chatgpt.com…"), which reads as if a sub-domain belongs. The message has
+    /// to state the rule that actually runs, and name the hosts by asking the
+    /// providers rather than by repeating them.
+    #[test]
+    fn the_session_host_error_states_the_exact_rule_it_enforces() {
+        let error =
+            resolve_session_target(Provider::ChatGpt, false, "https://evil.chatgpt.com/c/a")
+                .expect_err("sub-domain accepted");
+
+        assert!(error.contains("must use https"), "{error}");
+        assert!(error.contains("host must be exactly one of:"), "{error}");
+        assert!(error.contains("sub-domain"), "{error}");
+        assert!(error.contains("trailing dot"), "{error}");
+        assert!(error.contains("userinfo"), "{error}");
+        for provider in SESSION_PROVIDERS {
+            assert!(
+                error.contains(provider.primary_host()),
+                "{} is accepted but unnamed: {error}",
+                provider.primary_host()
+            );
+        }
+        // "belong to" is the wording that made a sub-domain sound allowed.
+        assert!(!error.contains("belong to"), "{error}");
     }
 
     /// Realistic ChatGPT tab titles, each rendered the way the server would
@@ -10489,9 +10679,11 @@ const LIVE_URL_PROBE_JS: &str = "() => location.href";
 ///
 /// 3. **`--session`.** [`open_url_tab`] pins the tab by ID-set difference
 ///    ([`unique_new_page_id`], which reads only `Page::id`), and
-///    [`resolve_session_target`] has already restricted the URL to https, a
-///    canonical provider host and a conversation-shaped path -- so nothing can
-///    be substituted for that tab. What is unverified is where the tab *went*
+///    [`resolve_session_target`] has already restricted the URL to https, the
+///    provider's *exact* canonical host ([`Provider::owns_session_origin`], not
+///    the sub-domain rule tab identity uses) and a conversation-shaped path --
+///    so nothing can be substituted for that tab. What is unverified is where
+///    the tab *went*
 ///    after being handed that URL: nothing between `new_page` and
 ///    [`submit_regular_prompt`] reads the live URL, so the check is applied at
 ///    the `--session` call site in [`main`]. It is not applied inside
