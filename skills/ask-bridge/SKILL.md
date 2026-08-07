@@ -179,7 +179,7 @@ prompt + "\n\n" + stdin
 | `[PROMPT]` | 要送給 provider 的文字 prompt | 可省略；若 stdin 有內容則使用 stdin；若兩者都有，會以兩個換行串接 |
 | `-p`, `--provider <PROVIDER>` | 選擇 provider | 可用 `chatgpt`、`gemini` 或 `claude`；此為 global option，可放在子命令前後；優先權高於全域設定檔 |
 | `--headless[=<HEADLESS>]` | 控制 Chrome 是否 headless | 預設 `true`；要顯示瀏覽器請用 `--headless=false`；不要寫成 `--headless false` |
-| `--new` | 開啟全新 provider 對話 | 會開啟並綁定新的唯一分頁，同時保留所有既有頁籤；用於隔離上下文 |
+| `--new` | 開啟全新 provider 對話 | 會開啟並綁定新的唯一分頁，並關閉同一 provider 的既有分頁、空白分頁與停在該 provider 登入網域的分頁；其他 provider 與其他網站的分頁一律保留；用於隔離上下文 |
 | `--session <URL_OR_ID>` | 接續既有 provider 對話 | 可傳完整對話 URL 或對話 ID；`--session-id`、`--session-url` 為別名；不能與 `--new` 同時使用 |
 | `-v`, `-V`, `--version` | 顯示版本 | `-V` 是原始碼中定義的短別名；文件與一般操作優先用 `-v` 或 `--version` |
 | `--verbose` | 顯示瀏覽器自動化流程 | 用於診斷 provider UI、登入、上傳、模型切換或等待回覆問題 |

@@ -723,7 +723,7 @@ struct Cli {
     #[arg(long, require_equals = true, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     headless: bool,
 
-    /// Create a brand new provider session in a new tab while preserving existing tabs.
+    /// Create a brand new provider session in a new tab, closing this provider's previous tabs, blank tabs and tabs left on its sign-in host. Other providers' tabs and unrelated sites' tabs are preserved.
     #[arg(long, default_value_t = false)]
     new: bool,
 
@@ -6004,9 +6004,16 @@ mod tests {
         }
     }
 
-    /// `--new` promises (README.md:194 / README.en.md:195) to clean up *this*
-    /// provider's old tabs. Closing every other tab takes the user's Gemini,
-    /// Claude and unrelated tabs with it.
+    /// `--new` promises to clean up *this* provider's old tabs. Closing every
+    /// other tab takes the user's Gemini, Claude and unrelated tabs with it.
+    ///
+    /// The promise lives in README.md "### 3. 開啟全新對話" and README.en.md
+    /// "### 3. Open a Brand New Session (`--new`)". Cited by heading, not by
+    /// line number: an upstream rewrite reflows those files and every line
+    /// citation here silently starts pointing at unrelated prose, which is
+    /// exactly how the docs came to claim the opposite of this code.
+    /// [`the_new_flag_docs_still_describe_the_disposal_this_code_performs`] is
+    /// the machine-checked half of the same contract.
     #[test]
     fn new_session_leaves_other_providers_tabs_open() {
         let mut fake = FakeMcp::new(&[
@@ -6170,9 +6177,10 @@ mod tests {
     /// session leaves the previous tab parked on the provider's auth host.
     /// Those tabs are neither provider-owned nor blank, so a
     /// same-provider-only filter never closes them and the tab count grows
-    /// linearly -- against README.en.md:197 ("avoid cluttering your browser
-    /// with too many tabs"). The census, not just the final state, is the
-    /// assertion: it is what distinguishes "bounded" from "leaking".
+    /// linearly -- against README.en.md's "avoid cluttering your browser with
+    /// too many tabs" (section "### 3. Open a Brand New Session (`--new`)").
+    /// The census, not just the final state, is the assertion: it is what
+    /// distinguishes "bounded" from "leaking".
     #[test]
     fn new_session_does_not_leak_tabs_that_drifted_to_the_auth_host() {
         let mut fake = FakeMcp::new(&[(1, "https://chatgpt.com/")]);
@@ -6239,6 +6247,155 @@ mod tests {
             fake.open_ids().contains(&1),
             "Google account tab was closed"
         );
+    }
+
+    /// Every user-visible description of `--new` must still describe the
+    /// disposal the code above actually performs.
+    ///
+    /// This exists because the inversion already happened: an upstream rewrite
+    /// replaced "closes previous tabs for the same provider" with "all tabs
+    /// will be preserved" on all four surfaces at once, the local disposal code
+    /// was kept, and nothing went red -- docs are not compiled and no test read
+    /// them. Every behavioural test in this file passed while the documentation
+    /// promised the opposite of the behaviour they pinned.
+    ///
+    /// Two halves, and neither is redundant:
+    ///
+    /// 1. **Code -> claim.** Re-derive each disposal category from the real
+    ///    predicate, so that if `owns_auth_url` or `is_blank_tab_url` ever drops
+    ///    out of the filter, the prose below becomes false and this fails here
+    ///    rather than in the docs.
+    /// 2. **Claim -> docs.** Require each surface to still carry the specific
+    ///    vocabulary of what is closed *and* what is spared. A rewrite that
+    ///    reduces the section to "existing tabs are preserved" cannot satisfy
+    ///    it, and neither can one that deletes the section.
+    ///
+    /// What it cannot do: judge prose. A surface could keep every required word
+    /// and still read badly. It fails on *absence*, which is the failure mode an
+    /// upstream rewrite produces.
+    #[test]
+    fn the_new_flag_docs_still_describe_the_disposal_this_code_performs() {
+        // Half 1: the categories, straight from `ensure_provider_tab_with`'s
+        // `disposable_ids` filter.
+        let provider = Provider::ChatGpt;
+        let disposable = |url: &str| {
+            provider.owns_url(url) || provider.owns_auth_url(url) || is_blank_tab_url(url)
+        };
+        for url in [
+            "https://chatgpt.com/c/old",         // this provider's own tab
+            "about:blank",                       // blank tab
+            "https://auth.openai.com/authorize", // stale sign-in tab
+        ] {
+            assert!(
+                disposable(url),
+                "the docs pinned below promise {url} is disposed of by --new"
+            );
+        }
+        for url in [
+            "https://gemini.google.com/app", // another provider
+            "https://example.com/notes",     // an unrelated site
+        ] {
+            assert!(
+                !disposable(url),
+                "the docs pinned below promise {url} is spared by --new"
+            );
+        }
+
+        // Half 2: each surface, by the words that only a disposal description
+        // has. `include_str!` also makes cargo rebuild this test when a doc
+        // file changes, so editing a README alone is enough to run the check.
+        let surfaces: [(&str, &str, &[&str]); 3] = [
+            (
+                "README.md",
+                include_str!("../README.md"),
+                &[
+                    "清理先前同一 provider 的分頁",
+                    "會關閉",
+                    "空白分頁",
+                    "登入網域",
+                    "會保留",
+                    "其他 provider 的分頁",
+                ],
+            ),
+            (
+                "README.en.md",
+                include_str!("../README.en.md"),
+                &[
+                    "dispose of this\n  provider's previous tabs",
+                    "**Closed**",
+                    "blank tabs",
+                    "sign-in host",
+                    "**Preserved**",
+                    "other providers' tabs",
+                ],
+            ),
+            (
+                "skills/ask-bridge/SKILL.md",
+                include_str!("../skills/ask-bridge/SKILL.md"),
+                &[
+                    "並關閉同一 provider 的既有分頁、空白分頁與停在該 provider 登入網域的分頁",
+                    "其他 provider 與其他網站的分頁一律保留",
+                ],
+            ),
+        ];
+        for (name, text, required) in surfaces {
+            for needle in required {
+                assert!(
+                    text.contains(needle),
+                    "{name} no longer says {needle:?}; --new still disposes of this \
+                     provider's tabs, so this surface now describes behaviour the \
+                     code does not have"
+                );
+            }
+        }
+
+        // The fourth surface is `--new`'s clap doc comment, which lives in this
+        // very file -- so the needles are split, or this test would find its own
+        // source text and pass with the help string deleted.
+        let source = include_str!("main.rs");
+        for needle in [
+            concat!(
+                "closing this provider's previous tabs, ",
+                "blank tabs and tabs left on its sign-in host"
+            ),
+            concat!(
+                "Other providers' tabs and unrelated ",
+                "sites' tabs are preserved"
+            ),
+        ] {
+            assert!(
+                source.contains(needle),
+                "the clap --help text for --new no longer says {needle:?}; \
+                 `ask-bridge --help` is the surface a user reads first"
+            );
+        }
+
+        // The exact sentences the upstream rewrite installed. Requiring absence
+        // is weaker than requiring presence above -- a differently worded
+        // inversion slips past it -- but this one has already shipped once.
+        let inversions: [(&str, &str, &str); 3] = [
+            (
+                "README.md",
+                include_str!("../README.md"),
+                "分頁與其他網站分頁都會保留",
+            ),
+            (
+                "README.en.md",
+                include_str!("../README.en.md"),
+                "All provider and non-provider tabs that existed before the command will be preserved",
+            ),
+            (
+                "skills/ask-bridge/SKILL.md",
+                include_str!("../skills/ask-bridge/SKILL.md"),
+                "同時保留所有既有頁籤",
+            ),
+        ];
+        for (name, text, inverted) in inversions {
+            assert!(
+                !text.contains(inverted),
+                "{name} has been re-inverted to {inverted:?}"
+            );
+        }
     }
 
     /// M13: a close failure must escape the close loop instead of being
@@ -10355,10 +10512,13 @@ where
 
     if force_new {
         let before_ids: Vec<usize> = pages.iter().map(|p| p.id).collect();
-        // `--new` is documented (README.md:194 / README.en.md:195) to clean up
-        // the *same provider's* previous tabs. Other providers' tabs and the
-        // user's unrelated tabs are not ours to close. Blank tabs and tabs
-        // parked on this provider's auth host carry no user content and were
+        // `--new` is documented -- README.md "### 3. 開啟全新對話" and
+        // README.en.md "### 3. Open a Brand New Session (`--new`)", pinned by
+        // `the_new_flag_docs_still_describe_the_disposal_this_code_performs` --
+        // to clean up the *same provider's* previous tabs. Other providers'
+        // tabs and the user's unrelated tabs are not ours to close. Blank tabs
+        // and tabs parked on this provider's auth host carry no user content
+        // and were
         // both disposed of by the pre-fix "close everything" behaviour, so they
         // stay on the list -- dropping them would make tabs accumulate one per
         // run (blank: once per browser session; auth: every run, once the

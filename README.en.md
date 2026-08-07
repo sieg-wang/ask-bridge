@@ -207,10 +207,16 @@ If you want to start a **completely fresh conversation session** (equivalent to 
 ask-bridge "誰是保哥？" --new
 ```
 
-- This will open a **brand new selected-provider tab**.
-- All provider and non-provider tabs that existed before the command will be preserved.
-- If the new tab cannot be identified unambiguously, the command stops instead of
-  reusing or closing an existing tab.
+- This will open a **brand new selected-provider tab**, and then **dispose of this
+  provider's previous tabs**.
+- **Closed**: this provider's own tabs whose URL reads back, blank tabs, and tabs
+  parked on this provider's sign-in host (debris `--new` itself leaves behind once
+  a session expires). Sparing those three would grow the tab count once per run.
+- **Preserved**: other providers' tabs, tabs on unrelated sites, and any tab whose
+  URL could not be read back — a tab that cannot be named has not been shown to be
+  ours.
+- If the newly opened tab cannot be identified unambiguously, the command stops
+  instead of reusing or closing an existing tab.
 
 ### 4. Resume an Existing Conversation
 
