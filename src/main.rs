@@ -8094,6 +8094,61 @@ mod tests {
         );
     }
 
+    /// Every path that ends in a prompt being typed must first read the
+    /// selected tab's live URL.
+    ///
+    /// The `--session` path used to be the exception, and not for a reason that
+    /// shows up in a behavioural test: `open_url_tab` binds the tab by
+    /// `unique_new_page_id` (an ID-set difference that reads only `Page::id`)
+    /// and `resolve_session_target` has already restricted the URL, so nothing
+    /// can be *substituted* for that tab. What was missing is a check on where
+    /// the tab went afterwards -- `wait_for_page_load` polls `readyState` and a
+    /// DOM-shape probe, `submit_regular_prompt` checks no origin, so a redirect
+    /// off the provider's origin was never noticed.
+    ///
+    /// Lexical, like the two tests below it, and for the same reason: the gap it
+    /// guards is a *missing* call, which no type and no behavioural test can
+    /// see. It also keeps the `# Call sites` block on
+    /// `verify_selected_page_is_provider` honest -- that block enumerates three
+    /// sites in prose, and prose cannot count.
+    #[test]
+    fn every_prompt_bearing_path_verifies_the_live_url() {
+        // Split literals keep this test from matching its own source text.
+        let source = include_str!("main.rs");
+        let gate = concat!("verify_selected_page_is_", "provider(");
+        let call_sites =
+            source.matches(gate).count() - source.matches(&format!("fn {gate}")).count();
+
+        assert_eq!(
+            call_sites, 3,
+            "the `# Call sites` doc block on the gate enumerates 3 call sites \
+             (adoption, unpinned run, --session); the source has {call_sites}. \
+             Update both together -- a doc block that claims completeness it \
+             does not have is how the --session path went unchecked."
+        );
+
+        // The one that a rebase onto upstream actually drops: upstream has no
+        // gate on this path at all, so a conflict resolution that takes their
+        // side removes the call and leaves the other two intact.
+        let session_arm = source
+            .split_once(concat!(
+                "if let Some((session_provider, session_url)) = ",
+                "&session_target {"
+            ))
+            .expect("main should route --session through its own arm")
+            .1
+            .split_once(concat!("} else if let Err(e) = ", "ensure_provider_tab("))
+            .expect("the --session arm should be followed by the ensure_provider_tab arm")
+            .0;
+
+        assert!(
+            session_arm.contains(gate),
+            "the --session arm reaches submit_regular_prompt without ever reading \
+             the tab's live URL; a redirect off the provider's origin would be \
+             typed into. Arm was:\n{session_arm}"
+        );
+    }
+
     #[test]
     fn every_image_download_goes_through_the_exit_code_wrapper() {
         // Tripwire for a rebase. The --image-output contract lives in three
@@ -10420,8 +10475,9 @@ const LIVE_URL_PROBE_JS: &str = "() => location.href";
 ///
 /// # Call sites
 ///
-/// Both places where a tab can reach the composer without this run having
-/// chosen and identified it:
+/// Every path on which a prompt can reach a composer, and what each one is
+/// guarding against. The first two are about *identity* -- a tab this run did
+/// not choose:
 ///
 /// 1. **Adoption.** A tab inherited from a previous run, identified by reading
 ///    the listing -- that reading is what is being checked.
@@ -10429,10 +10485,28 @@ const LIVE_URL_PROBE_JS: &str = "() => location.href";
 ///    ID, so nothing was ever committed to and the readiness probe runs against
 ///    whichever tab happens to be selected.
 ///
-/// A run that pinned a tab it navigated itself is not checked -- both the
-/// freshly opened tab and the reused blank tab, which this run navigates to
+/// The third is about *drift* -- the right tab, at the wrong URL:
+///
+/// 3. **`--session`.** [`open_url_tab`] pins the tab by ID-set difference
+///    ([`unique_new_page_id`], which reads only `Page::id`), and
+///    [`resolve_session_target`] has already restricted the URL to https, a
+///    canonical provider host and a conversation-shaped path -- so nothing can
+///    be substituted for that tab. What is unverified is where the tab *went*
+///    after being handed that URL: nothing between `new_page` and
+///    [`submit_regular_prompt`] reads the live URL, so the check is applied at
+///    the `--session` call site in [`main`]. It is not applied inside
+///    [`open_url_tab`], which `open <url>` and `get <url>` also use with URLs
+///    that need not be the provider's and that never reach a composer.
+///
+/// A `--new` run that pinned a tab it navigated itself is not checked -- both
+/// the freshly opened tab and the reused blank tab, which that run navigates to
 /// [`Provider::home_url`] before pinning. Neither identity came from the
-/// listing, so neither was ever in question.
+/// listing, and unlike case 3 the URL is [`Provider::home_url`] itself, a
+/// constant rather than user input.
+///
+/// This enumeration is lexical prose and cannot notice a fourth path being
+/// added; `every_prompt_bearing_path_verifies_the_live_url` is the half that
+/// can, and it fails if the count here stops matching the source.
 ///
 /// # Why a sign-in origin passes
 ///
@@ -11428,6 +11502,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session_provider.display_name(),
                 e
             );
+            std::process::exit(1);
+        }
+        // `open_url_tab` binds the tab by ID, so nothing can *substitute* a tab
+        // here -- but nothing on this path ever reads the tab's live URL
+        // either. `wait_for_page_load` polls `document.readyState` and
+        // `Provider::ready_check_js`, a DOM-shape probe any page can satisfy,
+        // and `submit_regular_prompt` checks no origin at all. So between
+        // `new_page(session_url)` and the prompt being typed, the only thing
+        // tying the composer to the provider is the browser having honoured the
+        // URL we handed it -- which a redirect off the provider's origin
+        // breaks. This is the same script-eval the reuse and unpinned paths
+        // already pay.
+        //
+        // Deliberately at the call site, not inside `open_url_tab`: `open <url>`
+        // and `get <url>` share that function and pass a URL that need not be
+        // the provider's (`Provider::from_url(&url).unwrap_or(provider)`), and
+        // neither reaches the composer. Verifying inside would refuse those two
+        // commands for a behaviour they never had.
+        if let Err(e) = verify_selected_page_is_provider(
+            &mut |tool, args| call_mcp_tool(&config_path, tool, args),
+            *session_provider,
+        ) {
+            eprintln!("Error opening {} session: {}", provider.display_name(), e);
             std::process::exit(1);
         }
     } else if let Err(e) = ensure_provider_tab(
