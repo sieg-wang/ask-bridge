@@ -66,8 +66,14 @@ test('the checksum fixture never outlives its test', () => {
   );
 });
 
-test('verifies native binary formats before installation', () => {
+// Same bookkeeping as `checksumFixtureDir` above, for the format fixture.
+let formatFixtureDir;
+
+test('verifies native binary formats before installation', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'ask-bridge-format-'));
+  formatFixtureDir = dir;
+  // Runs even when the assertions below throw, so a failing run leaks nothing.
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const windowsBinary = join(dir, 'ask-bridge.exe');
   const linuxBinary = join(dir, 'ask-bridge-linux');
   const macBinary = join(dir, 'ask-bridge-macos');
@@ -87,6 +93,23 @@ test('verifies native binary formats before installation', () => {
   assert.throws(
     () => verifyBinaryFormat(windowsBinary, 'darwin'),
     /binary format does not match darwin/,
+  );
+});
+
+test('the binary-format fixture never outlives its test', () => {
+  // The twin of the checksum-fixture guard. This directory had no cleanup at
+  // all until now: an upstream change reintroduced the bare `mkdtempSync` that
+  // a local commit had already fixed, and because a leaked temp directory
+  // breaks nothing, every test above stayed green while `npm test` -- which
+  // runs on every install and in CI -- left one directory behind per run.
+  assert.ok(
+    formatFixtureDir,
+    'the binary-format test must run first and record its fixture directory'
+  );
+  assert.equal(
+    existsSync(formatFixtureDir),
+    false,
+    `binary-format fixture ${formatFixtureDir} survived the test run`
   );
 });
 
