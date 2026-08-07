@@ -129,25 +129,107 @@ function verifyInstalledBinary(filePath, platform = process.platform) {
   }
 }
 
-function download(url, destination, redirectsRemaining = 5) {
+// Bounds on a download this script performs unattended, during `npm install`,
+// with the whole response held in memory until `end`.
+//
+// Node's global HTTPS agent contributes a 5s *socket* timeout, which only fires
+// on a connection that goes quiet. It says nothing about a response that keeps
+// dripping bytes, or one that is simply enormous: either runs until the machine
+// is out of memory, with no deadline to stop it. These two constants are that
+// missing bound. The ceiling is far above any real release artifact (a Rust
+// binary in a compressed archive, single-digit MB) so it is not a size limit in
+// practice -- it is the point past which "this is the artifact" stops being a
+// plausible reading of what is arriving.
+const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
+const DOWNLOAD_DEADLINE_MS = 120_000;
+
+// The deadline covers the whole chain, redirects included: a per-hop deadline
+// with five redirects available is five times the bound it claims to be.
+//
+// `httpGet` is a seam, not configuration. These bounds are exactly the
+// behaviour a test cannot observe without controlling the response -- a real
+// server that drips forever or sends 200MB is not something a unit test can
+// arrange -- and the tests are the only caller that ever passes it.
+function download(url, destination, options = {}) {
+  const {
+    redirectsRemaining = 5,
+    deadlineAt = Date.now() + DOWNLOAD_DEADLINE_MS,
+    httpGet = get,
+  } = options;
   return new Promise((resolve, reject) => {
-    get(url, (res) => {
+    const budgetMs = deadlineAt - Date.now();
+    if (budgetMs <= 0) {
+      reject(new Error(`Download exceeded the ${DOWNLOAD_DEADLINE_MS}ms deadline: ${url}`));
+      return;
+    }
+
+    let settled = false;
+    let timer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(value);
+    };
+
+    const req = httpGet(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsRemaining > 0) {
         const nextUrl = new URL(res.headers.location, url).toString();
-        download(nextUrl, destination, redirectsRemaining - 1).then(resolve, reject);
+        res.resume();
+        if (timer) clearTimeout(timer);
+        timer = null;
+        settled = true;
+        download(nextUrl, destination, {
+          redirectsRemaining: redirectsRemaining - 1,
+          deadlineAt,
+          httpGet,
+        }).then(resolve, reject);
         return;
       }
       if (res.statusCode !== 200) {
-        reject(new Error(`Download failed ${res.statusCode}: ${url}`));
+        res.resume();
+        finish(reject, new Error(`Download failed ${res.statusCode}: ${url}`));
         return;
       }
+
+      // Refuse on the advertised size before spending memory on it. A server
+      // that lies here is still caught by the running total below.
+      const advertised = Number(res.headers['content-length']);
+      if (Number.isFinite(advertised) && advertised > MAX_DOWNLOAD_BYTES) {
+        res.destroy();
+        finish(reject, new Error(
+          `Download advertises ${advertised} bytes, over the ${MAX_DOWNLOAD_BYTES}-byte ceiling: ${url}`,
+        ));
+        return;
+      }
+
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => {
-        writeFileSync(destination, Buffer.concat(chunks));
-        resolve();
+      let received = 0;
+      res.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > MAX_DOWNLOAD_BYTES) {
+          chunks.length = 0;
+          res.destroy();
+          finish(reject, new Error(
+            `Download exceeded the ${MAX_DOWNLOAD_BYTES}-byte ceiling: ${url}`,
+          ));
+          return;
+        }
+        chunks.push(chunk);
       });
-    }).on('error', reject);
+      res.on('error', (err) => finish(reject, err));
+      res.on('end', () => {
+        if (settled) return;
+        writeFileSync(destination, Buffer.concat(chunks));
+        finish(resolve, undefined);
+      });
+    });
+
+    timer = setTimeout(() => {
+      req.destroy(new Error(`Download exceeded the ${DOWNLOAD_DEADLINE_MS}ms deadline: ${url}`));
+    }, budgetMs);
+
+    req.on('error', (err) => finish(reject, err));
   });
 }
 
@@ -248,10 +330,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+  DOWNLOAD_DEADLINE_MS,
+  MAX_DOWNLOAD_BYTES,
   TARGETS,
   artifactName,
   cargoTarget,
   checkChrome,
+  download,
   findExtractedBinary,
   platformKey,
   releaseBaseUrl,
