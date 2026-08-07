@@ -8173,6 +8173,148 @@ mod tests {
         assert!(saved.contains(&"shot_2.png".to_string()), "{saved:?}");
     }
 
+    /// An explicit `--image-output` that produces zero files must not exit 0.
+    ///
+    /// Every one of these shapes used to return `Ok(())` after writing nothing:
+    /// an entry without `dataUrl`, a `dataUrl` that is not `<header>,<payload>`,
+    /// and a batch where all of them are like that. The caller then read a
+    /// missing file, or -- the case that makes this more than cosmetic -- the
+    /// file the *previous* run left at the same path, while the exit status said
+    /// the artifact was there.
+    #[test]
+    fn explicit_image_output_with_nothing_to_write_is_a_failure() {
+        for (images, why) in [
+            (vec![], "an empty batch"),
+            (
+                vec![serde_json::json!({"index": 0, "src": "x"})],
+                "no dataUrl",
+            ),
+            (
+                vec![serde_json::json!({"index": 0, "dataUrl": "data:image/png;base64"})],
+                "no comma, so no payload",
+            ),
+            (
+                vec![
+                    serde_json::json!({"index": 0, "dataUrl": "data:image/png;base64"}),
+                    serde_json::json!({"index": 1, "src": "y"}),
+                ],
+                "every entry unusable",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let requested = dir.path().join("shot.png");
+            // The stale artifact a caller would otherwise read back as this
+            // run's answer.
+            std::fs::write(&requested, b"stale from the previous run").unwrap();
+
+            let error = save_generated_images(&images, requested.to_str())
+                .expect_err(&format!("reported success having written nothing ({why})"));
+            assert!(
+                error.contains("shot.png"),
+                "the failure must name the promised path ({why}): {error}"
+            );
+            assert_eq!(
+                std::fs::read(&requested).unwrap(),
+                b"stale from the previous run",
+                "({why}) the stale file was rewritten rather than left for the \
+                 nonzero exit to disown"
+            );
+        }
+    }
+
+    /// Under an explicit destination the batch is all-or-nothing: one unusable
+    /// entry must not leave a partial, gap-numbered set at the path.
+    #[test]
+    fn explicit_image_output_writes_the_whole_batch_or_none_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = dir.path().join("out").join("shot.png");
+        let mut images = stub_generated_images(3);
+        images[1] = serde_json::json!({"index": 1, "src": "no data url here"});
+
+        let error = save_generated_images(&images, requested.to_str())
+            .expect_err("a partially decodable batch reported success");
+
+        assert!(
+            error.contains("2 of 3"),
+            "the failure must say which: {error}"
+        );
+        assert!(
+            !dir.path().join("out").exists(),
+            "a rejected batch must not leave files at the promised path"
+        );
+    }
+
+    /// Anti-tautology, and the upstream behaviour this must not change: with no
+    /// `--image-output` the download is a best-effort extra into `target/`, so
+    /// an unusable entry is skipped and the run still succeeds.
+    ///
+    /// Every entry is unusable on purpose. That is the shape the fix could most
+    /// easily have broken (it is the one that now fails under an explicit
+    /// destination), and it is also the only shape that touches no filesystem at
+    /// all — this must not write into the crate's `target/`, and it must not
+    /// change the process-wide cwd to avoid doing so, because the test harness
+    /// runs these in parallel threads.
+    #[test]
+    fn best_effort_image_download_still_skips_unusable_entries() {
+        let images = vec![
+            serde_json::json!({"index": 0, "src": "no data url here"}),
+            serde_json::json!({"index": 1, "dataUrl": "data:image/png;base64"}),
+        ];
+
+        assert_eq!(
+            save_generated_images(&images, None),
+            Ok(()),
+            "best-effort mode must not fail the run"
+        );
+    }
+
+    /// A scan that produced nothing at all is the same promise broken one step
+    /// earlier, and it used to return `Ok(())` unconditionally.
+    #[test]
+    fn a_scan_that_produced_no_images_fails_only_under_an_explicit_destination() {
+        let error = zero_images_error(Some("out/shot.png"), "found no generated images")
+            .expect("an explicit destination with no images must be a failure");
+        assert!(error.contains("out/shot.png"), "{error}");
+        assert!(error.contains("found no generated images"), "{error}");
+
+        // Best-effort mode is upstream behaviour and stays a non-event.
+        assert_eq!(zero_images_error(None, "found no generated images"), None);
+        assert_eq!(zero_images_error(None, "did not return a list"), None);
+    }
+
+    /// The skip/fail decision is the caller's, so the decoder has to report the
+    /// three cases apart rather than folding them together.
+    #[test]
+    fn decode_generated_image_separates_unusable_from_corrupt() {
+        // Nothing to write: the two shapes a working browser never produces,
+        // because the scan JS only pushes entries whose dataUrl already starts
+        // with `data:image/`.
+        assert_eq!(
+            decode_generated_image(&serde_json::json!({"src": "x"})),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_generated_image(&serde_json::json!({"dataUrl": "data:image/png;base64"})),
+            Ok(None)
+        );
+
+        // Present but corrupt is a different answer: it is never skipped, under
+        // either destination mode.
+        let error = decode_generated_image(
+            &serde_json::json!({"dataUrl": "data:image/png;base64,not valid base64!!"}),
+        )
+        .expect_err("undecodable base64 must not read as 'nothing to write'");
+        assert!(error.contains("decode base64"), "{error}");
+
+        // And the ordinary case still decodes, with the extension taken from
+        // the header.
+        let (ext, bytes) = decode_generated_image(&stub_generated_images(1)[0])
+            .expect("a valid data URL should decode")
+            .expect("a valid data URL is not 'nothing to write'");
+        assert_eq!(ext, "png");
+        assert!(!bytes.is_empty());
+    }
+
     #[test]
     fn a_fatal_image_failure_still_writes_the_requested_output_file() {
         // Regression: the default prompt path used to exit on the image
@@ -9300,12 +9442,23 @@ fn download_images_from_latest_message(
     )?;
 
     let parsed = parse_script_result(&get_res)?;
+    // Zero artifacts is a *failure* when `--image-output` named a path, and a
+    // non-event otherwise. See `save_generated_images` for the contract; these
+    // two branches are the same rule applied before there is a list to hand it.
     let images = match parsed.as_array() {
         Some(arr) => arr,
-        None => return Ok(()),
+        None => {
+            if let Some(error) = zero_images_error(image_output, "did not return a list") {
+                return Err(error);
+            }
+            return Ok(());
+        }
     };
 
     if images.is_empty() {
+        if let Some(error) = zero_images_error(image_output, "found no generated images") {
+            return Err(error);
+        }
         if verbose {
             println!("No generated images found in the latest response.");
         }
@@ -9313,6 +9466,25 @@ fn download_images_from_latest_message(
     }
 
     save_generated_images(images, image_output)
+}
+
+/// What "the scan produced no images at all" means, or `None` to carry on.
+///
+/// Same rule as [`image_download_failure_exit_code`], one step earlier: an
+/// explicit `--image-output` is a path the caller will read back, so producing
+/// nothing there is a failure, while without the flag it is a non-event.
+///
+/// A function rather than the two inline branches it replaces, because those
+/// branches sit behind `call_mcp_tool` and no test can reach them; this way the
+/// decision itself is checkable and both call sites share one answer.
+fn zero_images_error(image_output: Option<&str>, what_happened: &str) -> Option<String> {
+    image_output.map(|destination| {
+        format!(
+            "The image scan {}, so nothing was written to the --image-output \
+             path {}",
+            what_happened, destination
+        )
+    })
 }
 
 /// Exit code a command must terminate with after an image download failed, or
@@ -9384,10 +9556,67 @@ fn finish_prompt_artifacts(
     markdown_output::write_if_requested(output, markdown, verbose).or(image_exit_code)
 }
 
+/// Decode one scanned image into `(extension, bytes)`.
+///
+/// `Ok(None)` is "this entry carries nothing to write" — no `dataUrl`, or one
+/// that is not `<header>,<payload>`. The scan JS only pushes entries whose
+/// `dataUrl` already starts with `data:image/`, so neither shape comes from a
+/// working browser; they are the defensive cases, and what to do about them is
+/// the caller's decision, not this function's.
+fn decode_generated_image(img: &Value) -> Result<Option<(&'static str, Vec<u8>)>, String> {
+    let Some(data_url) = img["dataUrl"].as_str() else {
+        return Ok(None);
+    };
+
+    let parts: Vec<&str> = data_url.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Ok(None);
+    }
+
+    let header = parts[0];
+    let base64_data = parts[1];
+
+    let ext = if header.contains("image/png") {
+        "png"
+    } else if header.contains("image/jpeg") || header.contains("image/jpg") {
+        "jpg"
+    } else if header.contains("image/webp") {
+        "webp"
+    } else {
+        "png"
+    };
+
+    let decoded = general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
+
+    Ok(Some((ext, decoded)))
+}
+
 /// Decode the scanned images and write them out, honouring an explicit
 /// `--image-output` destination. Split out of the browser-driven scan above so
 /// the destination handling — the part a caller's automation depends on — is
 /// reachable without a browser.
+///
+/// # The `--image-output` contract
+///
+/// An explicit destination is a promise the caller's automation will read back,
+/// exactly as `--output` is for the Markdown (see
+/// [`image_download_failure_exit_code`]). So under an explicit destination this
+/// either writes **every** scanned image or writes **none** and returns `Err`:
+///
+/// * an entry with no usable `dataUrl` fails the batch rather than being
+///   skipped — previously every entry could be skipped and the function still
+///   returned `Ok(())`, so a caller got exit 0 and then read a missing file, or
+///   worse, the previous run's file;
+/// * decoding happens for the whole batch before the first byte is written, so
+///   a failure partway through can no longer leave a half-written set at the
+///   path the caller is about to read.
+///
+/// Without a destination the download is a best-effort extra into `target/`
+/// (upstream's behaviour): unusable entries are skipped, and the surviving ones
+/// keep their original index in the file name so what does get written is named
+/// exactly as before.
 fn save_generated_images(images: &[Value], image_output: Option<&str>) -> Result<(), String> {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -9395,34 +9624,36 @@ fn save_generated_images(images: &[Value], image_output: Option<&str>) -> Result
         .as_secs();
 
     let total = images.len();
+    let mut decoded_images: Vec<(usize, &'static str, Vec<u8>)> = Vec::new();
     for (idx, img) in images.iter().enumerate() {
-        let data_url = match img["dataUrl"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let parts: Vec<&str> = data_url.splitn(2, ',').collect();
-        if parts.len() != 2 {
-            continue;
+        match decode_generated_image(img)? {
+            Some((ext, decoded)) => decoded_images.push((idx, ext, decoded)),
+            None => {
+                if let Some(destination) = image_output {
+                    return Err(format!(
+                        "Generated image {} of {} carries no usable data: URL, so \
+                         the set promised at the --image-output path {} cannot be \
+                         written; nothing was written",
+                        idx + 1,
+                        total,
+                        destination
+                    ));
+                }
+            }
         }
+    }
 
-        let header = parts[0];
-        let base64_data = parts[1];
+    if decoded_images.is_empty()
+        && let Some(destination) = image_output
+    {
+        return Err(format!(
+            "None of the {} scanned images could be decoded, so nothing was \
+             written to the --image-output path {}",
+            total, destination
+        ));
+    }
 
-        let ext = if header.contains("image/png") {
-            "png"
-        } else if header.contains("image/jpeg") || header.contains("image/jpg") {
-            "jpg"
-        } else if header.contains("image/webp") {
-            "webp"
-        } else {
-            "png"
-        };
-
-        let decoded = general_purpose::STANDARD
-            .decode(base64_data)
-            .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
-
+    for (idx, ext, decoded) in decoded_images {
         let file_path = match image_output {
             Some(output_str) => {
                 let path = std::path::Path::new(output_str);
