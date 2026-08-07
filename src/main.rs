@@ -219,11 +219,18 @@ impl Provider {
     ///
     /// Equality, not the boundary, and on `Url`'s parsed host so the comparison
     /// sees what the browser would resolve: userinfo is not the host
-    /// (`chatgpt.com@evil.test` is `evil.test`), ASCII case and the default port
-    /// are already normalised away, and a trailing root dot is **not** -- so
-    /// `chatgpt.com.` is rejected, which is also the functionally right answer:
-    /// it is a separate cookie origin, so a session pinned there arrives logged
-    /// out.
+    /// (`chatgpt.com@evil.test` is `evil.test`), ASCII case is already
+    /// normalised away, and a trailing root dot is **not** -- so `chatgpt.com.`
+    /// is rejected, which is also the functionally right answer: it is a
+    /// separate cookie origin, so a session pinned there arrives logged out.
+    ///
+    /// The port is part of the origin and is therefore checked too. `Url` folds
+    /// an explicitly written `:443` away, so `port()` returning `None` *is*
+    /// "the effective port is https's default" -- `https://chatgpt.com:443/c/x`
+    /// still passes, while `https://chatgpt.com:8443/c/x` is a different origin
+    /// with different cookies and is refused. Without this the doc comment and
+    /// the error message both said "exact origin" while the code compared only
+    /// scheme and host.
     ///
     /// No provider is exempt: `www.chatgpt.com` (301) and `www.claude.ai` (301)
     /// redirect to the bare host, `chat.openai.com` (308) redirects to
@@ -232,7 +239,9 @@ impl Provider {
     /// Checked by HEAD request on 2026-08-07 -- re-check before adding an
     /// exception rather than adding one on a guess.
     fn owns_session_origin(self, url: &Url) -> bool {
-        url.scheme() == "https" && url.host_str() == Some(self.primary_host())
+        url.scheme() == "https"
+            && url.host_str() == Some(self.primary_host())
+            && url.port().is_none()
     }
 
     /// The provider whose conversation origin `url` is exactly, if any.
@@ -1494,9 +1503,10 @@ fn resolve_session_target(
                 .map(|provider| provider.primary_host())
                 .collect();
             format!(
-                "Session URL must use https and its host must be exactly one \
-                 of: {} (a sub-domain, a trailing dot, or a userinfo prefix is \
-                 a different host and is rejected)",
+                "Session URL must use https on the default port and its host \
+                 must be exactly one of: {} (a sub-domain, a trailing dot, a \
+                 userinfo prefix, or a non-default port is a different origin \
+                 and is rejected)",
                 hosts.join(", ")
             )
         })?;
@@ -4855,6 +4865,145 @@ mod tests {
         }
         // "belong to" is the wording that made a sub-domain sound allowed.
         assert!(!error.contains("belong to"), "{error}");
+        assert!(error.contains("non-default port"), "{error}");
+    }
+
+    /// The port is part of the origin, and the rule said "exact origin" while
+    /// comparing only scheme and host.
+    ///
+    /// `https://chatgpt.com:8443/c/abc` is a different origin with different
+    /// cookies -- reachable by anyone who can answer on that port for that host
+    /// (a proxy, a compromised CDN edge, a machine on a network doing TLS
+    /// interception) without owning `chatgpt.com`'s DNS. The accept half is not
+    /// decoration: `Url` folds an explicitly written `:443` away, and a fix
+    /// written as "reject any URL with a port in the text" would refuse a URL
+    /// this tool's own tests build.
+    #[test]
+    fn a_session_url_is_refused_on_a_non_default_port() {
+        for (url, provider) in [
+            ("https://chatgpt.com:8443/c/abc", Provider::ChatGpt),
+            ("https://chatgpt.com:80/c/abc", Provider::ChatGpt),
+            ("https://chatgpt.com:1/c/abc", Provider::ChatGpt),
+            ("https://gemini.google.com:8443/app/abc", Provider::Gemini),
+            ("https://claude.ai:8443/chat/abc", Provider::Claude),
+        ] {
+            let error = resolve_session_target(Provider::ChatGpt, false, url)
+                .expect_err(&format!("accepted a non-default port: {url}"));
+            assert!(
+                error.contains("host must be exactly one of:"),
+                "{url} was refused, but not by the origin rule: {error}"
+            );
+            assert!(
+                !provider.owns_session_origin(&Url::parse(url).expect("valid URL")),
+                "{url} still passes owns_session_origin"
+            );
+        }
+
+        // The default port, written out or omitted, is the same origin and must
+        // stay accepted.
+        for url in ["https://chatgpt.com:443/c/abc", "https://chatgpt.com/c/abc"] {
+            assert_eq!(
+                resolve_session_target(Provider::ChatGpt, false, url),
+                Ok((Provider::ChatGpt, "https://chatgpt.com/c/abc".to_string())),
+                "the default port was refused: {url}"
+            );
+        }
+    }
+
+    /// Drive [`verify_session_page_is_provider`] against a tab that reports
+    /// `href` as its live URL.
+    fn session_verdict_for(href: &str, provider: Provider) -> Result<(), String> {
+        let mut fake = FakeMcp::new(&[(1, "about:blank")]).on_live_url(1, href);
+        verify_session_page_is_provider(&mut |tool, args| fake.call(tool, args), provider)
+    }
+
+    /// What `--session` refuses on the command line, a redirect must not hand
+    /// back.
+    ///
+    /// [`resolve_session_target`] restricts the URL to the provider's exact
+    /// conversation origin, but the landing page used to be checked with the
+    /// *generic* gate, whose predicate is [`Provider::owns_url`] (the sub-domain
+    /// rule) or [`Provider::owns_auth_url`]. Every host in this list is one
+    /// `resolve_session_target` rejects and the generic gate accepts, so before
+    /// the split the input restriction was decorative: land there after
+    /// navigation and the prompt is typed in -- [`main`] proceeds through
+    /// [`check_login_status`] on both `Ok(Unknown)` and `Err(_)`, so a
+    /// composer-shaped DOM on such a page is all it takes.
+    #[test]
+    fn a_session_tab_that_redirects_off_the_exact_origin_is_refused() {
+        for (href, why) in [
+            ("https://evil.chatgpt.com/c/abc", "sub-domain"),
+            ("https://sora.chatgpt.com/c/abc", "sibling product"),
+            ("https://www.chatgpt.com/c/abc", "www."),
+            ("https://chatgpt.com./c/abc", "trailing root dot"),
+            ("https://chatgpt.com:8443/c/abc", "non-default port"),
+            ("http://chatgpt.com/c/abc", "plain http"),
+            ("https://chatgpt.com/settings", "not a conversation path"),
+            ("https://chatgpt.com/", "root, i.e. a fresh chat"),
+            ("https://evil.test/c/abc", "unrelated origin"),
+            ("about:blank", "not a URL with a host at all"),
+        ] {
+            let error = session_verdict_for(href, Provider::ChatGpt)
+                .expect_err(&format!("the session tab was driven at {why}: {href}"));
+            assert!(
+                error.contains(href),
+                "the refusal must name what it saw ({why}): {error}"
+            );
+        }
+
+        // The generic gate is the one that accepts these; that is the whole
+        // reason --session may not use it. If this stops holding the two gates
+        // have been unified and the split is pointless.
+        for href in [
+            "https://evil.chatgpt.com/c/abc",
+            "https://sora.chatgpt.com/c/abc",
+        ] {
+            assert!(
+                Provider::ChatGpt.owns_url(href),
+                "{href} is no longer accepted by the generic predicate"
+            );
+        }
+    }
+
+    /// A session that lands on the provider's own sign-in page is the ordinary
+    /// expired-session case: it must stop the run, and it must say what to do.
+    ///
+    /// This is the one arm where the generic gate's behaviour was defensible --
+    /// it returns `Ok` so [`check_login_status`] can print the actionable
+    /// message. That is not safe on this path, because `Ok` also means the
+    /// prompt gets typed if the page happens to present a composer. Refusing
+    /// with the same instructions keeps the help and drops the risk.
+    #[test]
+    fn a_session_tab_that_lands_on_the_sign_in_page_says_so_and_still_refuses() {
+        let error = session_verdict_for("https://auth.openai.com/authorize", Provider::ChatGpt)
+            .expect_err("a sign-in landing was accepted as a conversation");
+
+        assert!(error.contains("sign-in"), "{error}");
+        assert!(error.contains("expired"), "{error}");
+        assert!(
+            error.contains("ask-bridge --provider chatgpt login"),
+            "{error}"
+        );
+    }
+
+    /// Anti-tautology: the gate must still pass the page it was aimed at, for
+    /// every provider, including the query and fragment a real provider adds.
+    #[test]
+    fn a_session_tab_still_on_its_conversation_is_accepted() {
+        for (href, provider) in [
+            ("https://chatgpt.com/c/abc", Provider::ChatGpt),
+            ("https://chatgpt.com/c/abc?model=gpt-5", Provider::ChatGpt),
+            ("https://chatgpt.com/c/abc#top", Provider::ChatGpt),
+            ("https://chatgpt.com:443/c/abc", Provider::ChatGpt),
+            ("https://gemini.google.com/app/abc", Provider::Gemini),
+            ("https://claude.ai/chat/abc", Provider::Claude),
+        ] {
+            assert_eq!(
+                session_verdict_for(href, provider),
+                Ok(()),
+                "the conversation the run was opened at was refused: {href}"
+            );
+        }
     }
 
     /// Realistic ChatGPT tab titles, each rendered the way the server would
@@ -8299,23 +8448,34 @@ mod tests {
     /// Lexical, like the two tests below it, and for the same reason: the gap it
     /// guards is a *missing* call, which no type and no behavioural test can
     /// see. It also keeps the `# Call sites` block on
-    /// `verify_selected_page_is_provider` honest -- that block enumerates three
+    /// `verify_selected_page_is_provider` honest -- that block enumerates its
     /// sites in prose, and prose cannot count.
+    ///
+    /// It pins *which* gate each path uses, not just that some gate is called.
+    /// The two are not interchangeable: the generic one accepts the sub-domain
+    /// rule and a sign-in origin, so putting it back on the `--session` arm
+    /// would re-open the hole while leaving this test green if it only counted.
     #[test]
     fn every_prompt_bearing_path_verifies_the_live_url() {
         // Split literals keep this test from matching its own source text.
         let source = include_str!("main.rs");
         let gate = concat!("verify_selected_page_is_", "provider(");
+        let session_gate = concat!("verify_session_page_is_", "provider(");
         let call_sites =
             source.matches(gate).count() - source.matches(&format!("fn {gate}")).count();
 
         assert_eq!(
-            call_sites, 3,
-            "the `# Call sites` doc block on the gate enumerates 3 call sites \
-             (adoption, unpinned run, --session); the source has {call_sites}. \
+            call_sites, 2,
+            "the `# Call sites` doc block on the generic gate enumerates 2 call \
+             sites (adoption, unpinned run); the source has {call_sites}. \
              Update both together -- a doc block that claims completeness it \
              does not have is how the --session path went unchecked."
         );
+        // The session gate deliberately gets no count of its own: it is called
+        // from the tests below as well as from `main`, and a count that had to
+        // be revised every time a test was added would be revised without
+        // thought. What matters about it is *which* arm calls it, which the two
+        // assertions below pin directly.
 
         // The one that a rebase onto upstream actually drops: upstream has no
         // gate on this path at all, so a conflict resolution that takes their
@@ -8332,10 +8492,17 @@ mod tests {
             .0;
 
         assert!(
-            session_arm.contains(gate),
+            session_arm.contains(session_gate),
             "the --session arm reaches submit_regular_prompt without ever reading \
              the tab's live URL; a redirect off the provider's origin would be \
              typed into. Arm was:\n{session_arm}"
+        );
+        assert!(
+            !session_arm.contains(gate),
+            "the --session arm is using the generic gate, whose predicate accepts \
+             the sub-domain and sign-in origins resolve_session_target refuses on \
+             the command line -- so a redirect hands back exactly what the input \
+             check rejected. Arm was:\n{session_arm}"
         );
     }
 
@@ -10675,20 +10842,12 @@ const LIVE_URL_PROBE_JS: &str = "() => location.href";
 ///    ID, so nothing was ever committed to and the readiness probe runs against
 ///    whichever tab happens to be selected.
 ///
-/// The third is about *drift* -- the right tab, at the wrong URL:
-///
-/// 3. **`--session`.** [`open_url_tab`] pins the tab by ID-set difference
-///    ([`unique_new_page_id`], which reads only `Page::id`), and
-///    [`resolve_session_target`] has already restricted the URL to https, the
-///    provider's *exact* canonical host ([`Provider::owns_session_origin`], not
-///    the sub-domain rule tab identity uses) and a conversation-shaped path --
-///    so nothing can be substituted for that tab. What is unverified is where
-///    the tab *went*
-///    after being handed that URL: nothing between `new_page` and
-///    [`submit_regular_prompt`] reads the live URL, so the check is applied at
-///    the `--session` call site in [`main`]. It is not applied inside
-///    [`open_url_tab`], which `open <url>` and `get <url>` also use with URLs
-///    that need not be the provider's and that never reach a composer.
+/// The third prompt-bearing path, `--session`, is about *drift* -- the right
+/// tab, at the wrong URL -- and it does **not** use this gate. It has its own,
+/// [`verify_session_page_is_provider`], because this one's predicate is wider
+/// than the contract [`resolve_session_target`] enforced on the input: it would
+/// accept back, after a redirect, the sub-domain and sign-in origins that were
+/// refused on the command line. See that function for the argument.
 ///
 /// A `--new` run that pinned a tab it navigated itself is not checked -- both
 /// the freshly opened tab and the reused blank tab, which that run navigates to
@@ -10743,6 +10902,83 @@ where
     }
     Err(format!(
         "The tab listed as {}'s reports {} instead; refusing to drive it",
+        provider.display_name(),
+        href
+    ))
+}
+
+/// The `--session` variant of [`verify_selected_page_is_provider`]: after
+/// navigation, require the *same* contract the URL had to satisfy on the
+/// command line.
+///
+/// # Why the generic gate is the wrong one here
+///
+/// The two gates answer different questions, exactly as
+/// [`Provider::owns_url`] and [`Provider::owns_session_origin`] do.
+///
+/// The generic gate asks "is this tab the provider's?", so it uses the
+/// sub-domain rule and additionally accepts a sign-in origin -- both correct
+/// for a tab *found* in the browser, and the sign-in arm is load-bearing (see
+/// that function's `Why a sign-in origin passes`).
+///
+/// `--session` asks something narrower: "did the browser stay on the exact
+/// conversation this run was told to continue?". [`resolve_session_target`]
+/// refuses `https://evil.chatgpt.com/c/x`, `https://chatgpt.com:8443/c/x` and
+/// `https://auth.openai.com/...` on the command line. Verifying the landing
+/// page with the *generic* predicate accepted all three back again the moment
+/// a redirect produced one, which made the input restriction decorative: the
+/// prompt is typed into whatever page this call blesses, and [`main`] proceeds
+/// through [`check_login_status`] on both `Ok(Unknown)` and `Err(_)`, so a
+/// composer-shaped DOM on such a page would be typed into.
+///
+/// So this gate re-applies [`Provider::from_session_url`] and
+/// [`Provider::owns_conversation_url`] -- literally the input contract -- to
+/// the live `location.href`.
+///
+/// # The sign-in landing is reported, not accepted
+///
+/// A session URL that redirects to this provider's own sign-in origin is the
+/// ordinary expired-session case, and it deserves the actionable message
+/// [`check_login_status`] would have given rather than a bare refusal. It gets
+/// one -- but as an error that stops the run, not as a pass. The prompt is
+/// never typed either way; only the wording differs.
+fn verify_session_page_is_provider<F>(call: &mut F, provider: Provider) -> Result<(), String>
+where
+    F: FnMut(&str, Value) -> Result<Value, String>,
+{
+    let res = call(
+        "evaluate_script",
+        serde_json::json!({ "function": LIVE_URL_PROBE_JS }),
+    )?;
+    let href = parse_script_result(&res)?;
+    let href = href.as_str().ok_or_else(|| {
+        format!(
+            "Could not read the URL of the {} session tab; refusing to drive it",
+            provider.display_name()
+        )
+    })?;
+
+    if let Ok(url) = Url::parse(href)
+        && Provider::from_session_url(&url) == Some(provider)
+        && provider.owns_conversation_url(&url)
+    {
+        return Ok(());
+    }
+
+    if provider.owns_auth_url(href) {
+        return Err(format!(
+            "The {} session redirected to the sign-in page ({}); the session has \
+             most likely expired. Run `ask-bridge --provider {} login`, then run \
+             your query again.",
+            provider.display_name(),
+            href,
+            provider
+        ));
+    }
+
+    Err(format!(
+        "The {} session tab left the conversation it was opened at and reports \
+         {} instead; refusing to type the prompt into it",
         provider.display_name(),
         href
     ))
@@ -11712,7 +11948,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the provider's (`Provider::from_url(&url).unwrap_or(provider)`), and
         // neither reaches the composer. Verifying inside would refuse those two
         // commands for a behaviour they never had.
-        if let Err(e) = verify_selected_page_is_provider(
+        if let Err(e) = verify_session_page_is_provider(
             &mut |tool, args| call_mcp_tool(&config_path, tool, args),
             *session_provider,
         ) {
