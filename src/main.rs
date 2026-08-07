@@ -8268,6 +8268,67 @@ mod tests {
         );
     }
 
+    /// Two runs must not interleave inside the clipboard transaction.
+    ///
+    /// `flock` locks the *open file description*, not the process, so a second
+    /// `open` in this process conflicts with the first exactly as another
+    /// process would. That makes the property testable without spawning
+    /// anything, and it is the property that matters: before this, two runs
+    /// traded sentinels -- B captured A's sentinel as "the original" and
+    /// restored it over the user's clipboard, while A's poll accepted B's
+    /// content as its own answer.
+    #[cfg(unix)]
+    #[test]
+    fn the_clipboard_transaction_is_exclusive_across_processes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let held = lock_clipboard_in(dir.path(), Duration::from_millis(50))
+            .expect("an uncontended clipboard lock should be available");
+
+        let contended = lock_clipboard_in(dir.path(), Duration::from_millis(100))
+            .expect_err("a second holder was let into the clipboard transaction");
+        assert!(
+            contended.contains("held the clipboard"),
+            "the refusal should say what it waited for: {contended}"
+        );
+
+        // The kernel drops it when the descriptor closes -- that is the whole
+        // reason this is flock and not a PID file, so prove it rather than
+        // assert it in a comment.
+        drop(held);
+        lock_clipboard_in(dir.path(), Duration::from_millis(50))
+            .expect("the lock should be free once the holder's descriptor closes");
+    }
+
+    /// Structural, for the same reason as the live-URL gate above: the failure
+    /// mode is a *missing* call, which no behavioural test of this binary can
+    /// see (the transaction it guards drives `pbcopy`/`pbpaste`).
+    #[cfg(unix)]
+    #[test]
+    fn the_clipboard_transaction_takes_the_lock_before_reading_the_clipboard() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once(concat!("fn copy_latest_markdown_via_", "clipboard("))
+            .expect("the clipboard transaction should exist")
+            .1
+            .split_once("\nfn ")
+            .expect("the transaction should be followed by another item")
+            .0;
+
+        let lock_at = body
+            .find(concat!("lock_clipboard_", "in("))
+            .expect("the clipboard transaction reaches pbpaste without taking the lock");
+        let first_read = body
+            .find("read_clipboard()")
+            .expect("the transaction should still read the clipboard");
+        assert!(
+            lock_at < first_read,
+            "the lock must be taken before the original clipboard is captured; \
+             capturing first is what let one run record another run's sentinel \
+             as the content to restore"
+        );
+    }
+
     /// A scan that produced nothing at all is the same promise broken one step
     /// earlier, and it used to return `Ok(())` unconditionally.
     #[test]
@@ -9061,10 +9122,98 @@ fn copy_latest_markdown(config_path: &str, provider: Provider) -> Result<String,
     }
 }
 
+/// Name of the file whose `flock` serialises the clipboard transaction.
+const CLIPBOARD_LOCK_NAME: &str = "ask-bridge-clipboard.lock";
+
+/// How long to wait for another run to finish with the clipboard.
+///
+/// The transaction it guards is bounded by the two 30-iteration polls inside
+/// it: ~15s of click retries plus ~3s of clipboard polling, so a healthy holder
+/// is gone well inside this. It is long enough to queue behind one, and short
+/// enough that a wedged holder does not hang a run indefinitely.
+const CLIPBOARD_LOCK_WAIT: Duration = Duration::from_secs(45);
+
+/// Holds the clipboard lock for as long as it is alive.
+///
+/// `flock` rather than a PID file on purpose: the kernel drops the lock when
+/// the descriptor closes, which includes the process being killed, so there is
+/// no stale-lock state to detect, age out, or get wrong. Nothing is written
+/// into the file -- its only job is to be a thing two processes can name.
+#[derive(Debug)]
+struct ClipboardGuard {
+    _file: std::fs::File,
+}
+
+/// Take the clipboard lock in `dir`, waiting up to `wait` for a holder to
+/// finish.
+///
+/// # Why the clipboard needs a lock
+///
+/// [`copy_latest_markdown_via_clipboard`] is a five-step transaction on a
+/// single machine-wide resource: read what is there, replace it with a
+/// PID-stamped sentinel, click, poll until the clipboard changes, put the
+/// original back. Two runs overlapping on it -- which is what happens the
+/// moment a user asks two questions at once, or a script fans out -- break it
+/// in two distinct ways, and the PID in the sentinel does not prevent either:
+///
+/// * B's "original" is captured after A has already written A's sentinel, so
+///   when B restores it the user's clipboard is left holding
+///   `__ASK_CHATGPT_COPY_PENDING_<A>__`; A's own restore may already have
+///   happened, so nothing puts the real content back;
+/// * A's poll accepts any content that is non-empty and not A's *own*
+///   sentinel, so B's sentinel, or the response B copied, satisfies it. A then
+///   returns B's answer as A's.
+///
+/// The lock covers the whole transaction rather than each step, because the
+/// invariant is about the resource's *contents across* steps.
+#[cfg(unix)]
+fn lock_clipboard_in(dir: &Path, wait: Duration) -> Result<ClipboardGuard, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let path = dir.join(CLIPBOARD_LOCK_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        // The same reason `create_response_scratch_file` refuses to follow a
+        // link: TMPDIR can be shared, and a lock on a file someone else chose
+        // is not a lock on this one.
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("Failed to open the clipboard lock {:?}: {}", path, e))?;
+
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: `file` owns the descriptor and outlives this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(ClipboardGuard { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(format!("Failed to lock {:?}: {}", path, error));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Another ask-bridge process has held the clipboard for more than \
+                 {}s; refusing to interleave with it rather than trade sentinels",
+                wait.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn copy_latest_markdown_via_clipboard(
     config_path: &str,
     provider: Provider,
 ) -> Result<String, String> {
+    // Held for the whole transaction below; released when this function returns
+    // by any path, including the early `return Err` in the click-retry arm.
+    #[cfg(unix)]
+    let _clipboard_guard = lock_clipboard_in(&std::env::temp_dir(), CLIPBOARD_LOCK_WAIT)?;
+
     let clipboard_before = read_clipboard().unwrap_or_default();
     let sentinel = format!("__ASK_CHATGPT_COPY_PENDING_{}__", std::process::id());
     write_clipboard(&sentinel)?;
