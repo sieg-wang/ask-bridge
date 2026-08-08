@@ -25,9 +25,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - run: cargo test --locked
       - run: npm test
       - name: Validate PowerShell installer syntax
         shell: pwsh

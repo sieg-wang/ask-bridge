@@ -64,6 +64,20 @@ enum Provider {
     Claude,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConversationIdentity {
+    provider: Provider,
+    route: ConversationRoute,
+    id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConversationRoute {
+    Root,
+    /// ChatGPT's documented custom-GPT route: `/g/<gpt-id>/c/<conversation-id>`.
+    ChatGptCustomGpt(String),
+}
+
 impl Provider {
     fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -251,24 +265,45 @@ impl Provider {
             .find(|provider| provider.owns_session_origin(url))
     }
 
-    fn owns_conversation_url(self, url: &Url) -> bool {
-        if Self::from_url(url.as_str()) != Some(self) {
-            return false;
+    fn conversation_identity(self, url: &Url) -> Option<ConversationIdentity> {
+        if Self::from_session_url(url) != Some(self) {
+            return None;
         }
 
-        let path_segments: Vec<&str> = url
-            .path_segments()
-            .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
-            .unwrap_or_default();
+        let mut path_segments = url.path_segments()?;
         let marker = match self {
             Provider::ChatGpt => "c",
             Provider::Gemini => "app",
             Provider::Claude => "chat",
         };
+        let first = path_segments.next()?;
+        let (route, id) = if first == marker {
+            (ConversationRoute::Root, path_segments.next()?)
+        } else if self == Provider::ChatGpt && first == "g" {
+            let gpt_id = path_segments.next()?;
+            if gpt_id.is_empty() || path_segments.next() != Some("c") {
+                return None;
+            }
+            (
+                ConversationRoute::ChatGptCustomGpt(gpt_id.to_string()),
+                path_segments.next()?,
+            )
+        } else {
+            return None;
+        };
+        if id.is_empty() || path_segments.next().is_some() {
+            return None;
+        }
 
-        path_segments
-            .windows(2)
-            .any(|segments| segments[0] == marker && !segments[1].is_empty())
+        Some(ConversationIdentity {
+            provider: self,
+            route,
+            id: id.to_string(),
+        })
+    }
+
+    fn owns_conversation_url(self, url: &Url) -> bool {
+        self.conversation_identity(url).is_some()
     }
 
     fn ready_check_js(self) -> &'static str {
@@ -4731,6 +4766,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_a_conversation_marker_nested_beneath_another_route() {
+        for (provider, nested) in [
+            (Provider::ChatGpt, "https://chatgpt.com/settings/c/chat-123"),
+            (
+                Provider::Gemini,
+                "https://gemini.google.com/settings/app/gemini-123",
+            ),
+            (
+                Provider::Claude,
+                "https://claude.ai/settings/chat/claude-123",
+            ),
+        ] {
+            assert!(
+                resolve_session_target(provider, false, nested).is_err(),
+                "accepted a conversation marker nested below an unrelated route: {nested}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chatgpt_custom_gpt_conversation_url_is_accepted() {
+        let url = "https://chatgpt.com/g/g-p-project/c/conversation-123";
+
+        assert_eq!(
+            resolve_session_target(Provider::ChatGpt, false, url),
+            Ok((Provider::ChatGpt, url.to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_segments_around_the_conversation_route() {
+        for (provider, malformed) in [
+            (Provider::ChatGpt, "https://chatgpt.com//c/chat-123"),
+            (Provider::ChatGpt, "https://chatgpt.com/c//chat-123"),
+            (Provider::ChatGpt, "https://chatgpt.com/c/chat-123/"),
+            (
+                Provider::Gemini,
+                "https://gemini.google.com//app/gemini-123",
+            ),
+            (
+                Provider::Gemini,
+                "https://gemini.google.com/app//gemini-123",
+            ),
+            (
+                Provider::Gemini,
+                "https://gemini.google.com/app/gemini-123/",
+            ),
+            (Provider::Claude, "https://claude.ai//chat/claude-123"),
+            (Provider::Claude, "https://claude.ai/chat//claude-123"),
+            (Provider::Claude, "https://claude.ai/chat/claude-123/"),
+        ] {
+            assert!(
+                resolve_session_target(provider, false, malformed).is_err(),
+                "accepted an empty segment in a conversation route: {malformed}"
+            );
+        }
+    }
+
     /// The hosts real `--session` use lands on must keep working, so the
     /// narrowing cannot be bought by breaking the feature.
     ///
@@ -4757,6 +4851,11 @@ mod tests {
                 "https://chatgpt.com:443/c/abc",
                 Provider::ChatGpt,
                 "https://chatgpt.com/c/abc",
+            ),
+            (
+                "https://chatgpt.com/c/abc?model=gpt-5#top",
+                Provider::ChatGpt,
+                "https://chatgpt.com/c/abc?model=gpt-5#top",
             ),
             (
                 "https://gemini.google.com/app/abc",
@@ -4911,10 +5010,18 @@ mod tests {
     }
 
     /// Drive [`verify_session_page_is_provider`] against a tab that reports
-    /// `href` as its live URL.
-    fn session_verdict_for(href: &str, provider: Provider) -> Result<(), String> {
-        let mut fake = FakeMcp::new(&[(1, "about:blank")]).on_live_url(1, href);
-        verify_session_page_is_provider(&mut |tool, args| fake.call(tool, args), provider)
+    /// `live_href`, after the run was asked to open `expected_href`.
+    fn session_verdict_for(
+        expected_href: &str,
+        live_href: &str,
+        provider: Provider,
+    ) -> Result<(), String> {
+        let mut fake = FakeMcp::new(&[(1, "about:blank")]).on_live_url(1, live_href);
+        verify_session_page_is_provider(
+            &mut |tool, args| fake.call(tool, args),
+            provider,
+            expected_href,
+        )
     }
 
     /// What `--session` refuses on the command line, a redirect must not hand
@@ -4943,7 +5050,7 @@ mod tests {
             ("https://evil.test/c/abc", "unrelated origin"),
             ("about:blank", "not a URL with a host at all"),
         ] {
-            let error = session_verdict_for(href, Provider::ChatGpt)
+            let error = session_verdict_for("https://chatgpt.com/c/abc", href, Provider::ChatGpt)
                 .expect_err(&format!("the session tab was driven at {why}: {href}"));
             assert!(
                 error.contains(href),
@@ -4975,8 +5082,12 @@ mod tests {
     /// with the same instructions keeps the help and drops the risk.
     #[test]
     fn a_session_tab_that_lands_on_the_sign_in_page_says_so_and_still_refuses() {
-        let error = session_verdict_for("https://auth.openai.com/authorize", Provider::ChatGpt)
-            .expect_err("a sign-in landing was accepted as a conversation");
+        let error = session_verdict_for(
+            "https://chatgpt.com/c/abc",
+            "https://auth.openai.com/authorize",
+            Provider::ChatGpt,
+        )
+        .expect_err("a sign-in landing was accepted as a conversation");
 
         assert!(error.contains("sign-in"), "{error}");
         assert!(error.contains("expired"), "{error}");
@@ -4990,7 +5101,7 @@ mod tests {
     /// every provider, including the query and fragment a real provider adds.
     #[test]
     fn a_session_tab_still_on_its_conversation_is_accepted() {
-        for (href, provider) in [
+        for (live_href, provider) in [
             ("https://chatgpt.com/c/abc", Provider::ChatGpt),
             ("https://chatgpt.com/c/abc?model=gpt-5", Provider::ChatGpt),
             ("https://chatgpt.com/c/abc#top", Provider::ChatGpt),
@@ -4998,12 +5109,57 @@ mod tests {
             ("https://gemini.google.com/app/abc", Provider::Gemini),
             ("https://claude.ai/chat/abc", Provider::Claude),
         ] {
+            let expected_href = provider.conversation_url_from_id("abc");
             assert_eq!(
-                session_verdict_for(href, provider),
+                session_verdict_for(&expected_href, live_href, provider),
                 Ok(()),
-                "the conversation the run was opened at was refused: {href}"
+                "the conversation the run was opened at was refused: {live_href}"
             );
         }
+
+        assert_eq!(
+            session_verdict_for(
+                "https://chatgpt.com:443/c/abc?model=gpt-5#top",
+                "https://chatgpt.com/c/abc",
+                Provider::ChatGpt,
+            ),
+            Ok(()),
+            "decorations on the original URL must not change its conversation identity"
+        );
+    }
+
+    #[test]
+    fn a_session_tab_that_redirects_to_a_different_conversation_is_refused() {
+        for provider in SESSION_PROVIDERS {
+            let expected_href = provider.conversation_url_from_id("original");
+            let live_href = provider.conversation_url_from_id("different");
+            let error = session_verdict_for(&expected_href, &live_href, provider)
+                .expect_err("accepted a different conversation on the same provider origin");
+            assert!(error.contains(&live_href), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_session_tab_that_redirects_to_a_different_custom_gpt_is_refused() {
+        let expected_href = "https://chatgpt.com/g/g-p-one/c/shared-conversation";
+        let live_href = "https://chatgpt.com/g/g-p-two/c/shared-conversation";
+
+        let error = session_verdict_for(expected_href, live_href, Provider::ChatGpt)
+            .expect_err("accepted the same conversation ID under a different custom GPT");
+
+        assert!(error.contains(live_href), "{error}");
+    }
+
+    #[test]
+    fn a_session_tab_still_on_its_custom_gpt_conversation_is_accepted() {
+        let expected_href = "https://chatgpt.com/g/g-p-one/c/shared-conversation";
+        let live_href = "https://chatgpt.com/g/g-p-one/c/shared-conversation?model=gpt-5#response";
+
+        assert_eq!(
+            session_verdict_for(expected_href, live_href, Provider::ChatGpt),
+            Ok(()),
+            "the same custom-GPT conversation was refused after harmless URL decorations"
+        );
     }
 
     /// Realistic ChatGPT tab titles, each rendered the way the server would
@@ -8270,14 +8426,13 @@ mod tests {
 
     /// Two runs must not interleave inside the clipboard transaction.
     ///
-    /// `flock` locks the *open file description*, not the process, so a second
-    /// `open` in this process conflicts with the first exactly as another
-    /// process would. That makes the property testable without spawning
-    /// anything, and it is the property that matters: before this, two runs
+    /// The OS lock belongs to the open file handle, so a second `open` in this
+    /// process conflicts with the first exactly as another process would. That
+    /// makes the property testable without spawning anything on either Unix or
+    /// Windows, and it is the property that matters: before this, two runs
     /// traded sentinels -- B captured A's sentinel as "the original" and
     /// restored it over the user's clipboard, while A's poll accepted B's
     /// content as its own answer.
-    #[cfg(unix)]
     #[test]
     fn the_clipboard_transaction_is_exclusive_across_processes() {
         let dir = tempfile::tempdir().unwrap();
@@ -8292,25 +8447,81 @@ mod tests {
             "the refusal should say what it waited for: {contended}"
         );
 
-        // The kernel drops it when the descriptor closes -- that is the whole
-        // reason this is flock and not a PID file, so prove it rather than
-        // assert it in a comment.
+        // The OS drops it when the file handle closes -- that is the whole
+        // reason this is a file lock and not a PID file, so prove it rather
+        // than assert it in a comment.
         drop(held);
         lock_clipboard_in(dir.path(), Duration::from_millis(50))
             .expect("the lock should be free once the holder's descriptor closes");
     }
 
+    fn symlink_swap_was_rejected_at_expected_stage(error: &str, windows: bool) -> bool {
+        if windows {
+            error.contains("not a regular file")
+        } else {
+            error.contains("Failed to open") || error.contains("not a regular file")
+        }
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    #[test]
+    fn clipboard_lock_rejects_a_leaf_symlink_swapped_in_after_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(CLIPBOARD_LOCK_NAME);
+        let target = dir.path().join("outside-lock-target");
+        std::fs::write(&lock_path, b"ordinary lock file").unwrap();
+        std::fs::write(&target, b"must not become the lock").unwrap();
+
+        let error = lock_clipboard_in_with_before_open(
+            dir.path(),
+            Duration::from_millis(0),
+            |inspected_path| {
+                std::fs::remove_file(inspected_path)
+                    .map_err(|error| format!("failed to swap inspected lock: {error}"))?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, inspected_path)
+                    .map_err(|error| format!("failed to install test symlink: {error}"))?;
+                #[cfg(target_os = "windows")]
+                std::os::windows::fs::symlink_file(&target, inspected_path)
+                    .map_err(|error| format!("failed to install test symlink: {error}"))?;
+                Ok(())
+            },
+        )
+        .expect_err("the post-inspection leaf symlink was followed and locked");
+
+        assert!(
+            symlink_swap_was_rejected_at_expected_stage(&error, cfg!(target_os = "windows")),
+            "the swapped leaf was refused for an unrelated reason: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not become the lock",
+            "the rejected symlink target was modified"
+        );
+    }
+
+    #[test]
+    fn windows_symlink_race_contract_requires_handle_metadata_rejection() {
+        assert!(symlink_swap_was_rejected_at_expected_stage(
+            "Clipboard lock is not a regular file",
+            true
+        ));
+        assert!(
+            !symlink_swap_was_rejected_at_expected_stage("Failed to open clipboard lock", true),
+            "a Windows open failure does not prove the opened reparse-point handle was inspected"
+        );
+    }
+
     /// The lock is not just *taken* -- it is *held* until the transaction ends.
     ///
-    /// `flock` locks the open file description, so a second `open` + `flock`
+    /// The OS lock belongs to the open file handle, so a second `open` + lock
     /// from inside the transaction conflicts exactly as a second process would
     /// (`the_clipboard_transaction_is_exclusive_across_processes` above proves
     /// that equivalence). Probing from inside every injected step is what tells
     /// a guard that lives for the transaction apart from one that is dropped on
-    /// the line that takes it: `let _ = lock_clipboard_in(..)` releases the
-    /// flock immediately, and leaves the call sitting there for any source-level
-    /// check to find.
-    #[cfg(unix)]
+    /// the line that takes it: `let _ = lock_clipboard_in(..)` releases the lock
+    /// immediately, and leaves the call sitting there for any source-level check
+    /// to find.
     #[test]
     fn the_clipboard_lock_is_held_for_the_whole_transaction() {
         use std::cell::RefCell;
@@ -8395,7 +8606,6 @@ mod tests {
     /// last, which bounds it to the span where the lock must be continuously
     /// held and keeps the before/after windows -- where the lock legitimately
     /// is free -- out of the sample.
-    #[cfg(unix)]
     #[test]
     fn the_clipboard_lock_is_held_continuously_not_re_taken_per_step() {
         use std::sync::Arc;
@@ -8494,7 +8704,6 @@ mod tests {
     /// free probe on the first `read`. This stays because it is the cheap
     /// tripwire for a rebase that drops the call altogether, and because it
     /// names the ordering directly.
-    #[cfg(unix)]
     #[test]
     fn the_clipboard_transaction_takes_the_lock_before_reading_the_clipboard() {
         let source = include_str!("main.rs");
@@ -9499,13 +9708,13 @@ fn copy_latest_markdown(config_path: &str, provider: Provider) -> Result<String,
     }
 }
 
-/// Name of the file whose `flock` serialises the clipboard transaction.
-///
-/// `cfg(unix)` for the same reason `lock_clipboard_in` is: `flock` is the only
-/// caller, so on any other platform these three items are dead code the
-/// compiler would (rightly) warn about.
-#[cfg(unix)]
+/// Name of the file whose OS lock serialises the clipboard transaction.
 const CLIPBOARD_LOCK_NAME: &str = "ask-bridge-clipboard.lock";
+
+/// Win32 `FILE_FLAG_OPEN_REPARSE_POINT`: open a leaf reparse point itself
+/// instead of following it to its target.
+#[cfg(target_os = "windows")]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// How long to wait for another run to finish with the clipboard.
 ///
@@ -9513,16 +9722,15 @@ const CLIPBOARD_LOCK_NAME: &str = "ask-bridge-clipboard.lock";
 /// it: ~15s of click retries plus ~3s of clipboard polling, so a healthy holder
 /// is gone well inside this. It is long enough to queue behind one, and short
 /// enough that a wedged holder does not hang a run indefinitely.
-#[cfg(unix)]
 const CLIPBOARD_LOCK_WAIT: Duration = Duration::from_secs(45);
 
 /// Holds the clipboard lock for as long as it is alive.
 ///
-/// `flock` rather than a PID file on purpose: the kernel drops the lock when
-/// the descriptor closes, which includes the process being killed, so there is
-/// no stale-lock state to detect, age out, or get wrong. Nothing is written
-/// into the file -- its only job is to be a thing two processes can name.
-#[cfg(unix)]
+/// An OS file lock rather than a PID file on purpose: the OS drops the lock when
+/// the file handle closes, which includes the process being killed, so there is
+/// no stale-lock state to detect, age out, or get wrong. Rust maps this to
+/// `flock` on Unix and `LockFileEx` on Windows. Nothing is written into the file
+/// -- its only job is to be a thing two processes can name.
 #[derive(Debug)]
 struct ClipboardGuard {
     _file: std::fs::File,
@@ -9550,33 +9758,86 @@ struct ClipboardGuard {
 ///
 /// The lock covers the whole transaction rather than each step, because the
 /// invariant is about the resource's *contents across* steps.
-#[cfg(unix)]
 fn lock_clipboard_in(dir: &Path, wait: Duration) -> Result<ClipboardGuard, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+    lock_clipboard_in_with_before_open(dir, wait, |_| Ok(()))
+}
 
+/// Deterministic race seam for [`lock_clipboard_in`]. Production passes a
+/// no-op; the regression test swaps the already-inspected leaf immediately
+/// before open, which is the interleaving the platform no-follow flags close.
+fn lock_clipboard_in_with_before_open<F>(
+    dir: &Path,
+    wait: Duration,
+    before_open: F,
+) -> Result<ClipboardGuard, String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
     let path = dir.join(CLIPBOARD_LOCK_NAME);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        // The same reason `create_response_scratch_file` refuses to follow a
-        // link: TMPDIR can be shared, and a lock on a file someone else chose
-        // is not a lock on this one.
-        .custom_flags(libc::O_NOFOLLOW)
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Refusing to use the clipboard lock through a symbolic link: {:?}",
+                path
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect the clipboard lock {:?}: {}",
+                path, error
+            ));
+        }
+    }
+    before_open(&path)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            // TMPDIR can be shared, and a lock on a file someone else chose is
+            // not a lock on this one. Windows rejects a pre-existing symlink
+            // above; Unix additionally closes the inspect/open race here.
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The pre-open inspection above gives a useful error for a stable
+        // symlink. This flag closes the check/open race: if the leaf is swapped
+        // for any name-surrogate reparse point, the handle names that reparse
+        // point and the handle-metadata check below rejects it as non-regular.
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
         .open(&path)
         .map_err(|e| format!("Failed to open the clipboard lock {:?}: {}", path, e))?;
+    if !file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "Failed to inspect opened clipboard lock {:?}: {}",
+                path, error
+            )
+        })?
+        .file_type()
+        .is_file()
+    {
+        return Err(format!("Clipboard lock is not a regular file: {:?}", path));
+    }
 
     let deadline = Instant::now() + wait;
     loop {
-        // SAFETY: `file` owns the descriptor and outlives this call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(ClipboardGuard { _file: file });
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(format!("Failed to lock {:?}: {}", path, error));
+        match file.try_lock() {
+            Ok(()) => return Ok(ClipboardGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("Failed to lock {:?}: {}", path, error));
+            }
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -9637,7 +9898,6 @@ where
 {
     // Held for the whole transaction below; released when this function returns
     // by any path, including the early `return Err` in the click-retry arm.
-    #[cfg(unix)]
     let _clipboard_guard = lock_clipboard_in(temp_dir, CLIPBOARD_LOCK_WAIT)?;
 
     let clipboard_before = read_clipboard().unwrap_or_default();
@@ -11714,8 +11974,8 @@ where
 }
 
 /// The `--session` variant of [`verify_selected_page_is_provider`]: after
-/// navigation, require the *same* contract the URL had to satisfy on the
-/// command line.
+/// navigation, require the same canonical conversation identity the command
+/// line selected.
 ///
 /// # Why the generic gate is the wrong one here
 ///
@@ -11737,9 +11997,11 @@ where
 /// through [`check_login_status`] on both `Ok(Unknown)` and `Err(_)`, so a
 /// composer-shaped DOM on such a page would be typed into.
 ///
-/// So this gate re-applies [`Provider::from_session_url`] and
-/// [`Provider::owns_conversation_url`] -- literally the input contract -- to
-/// the live `location.href`.
+/// So this gate derives a [`ConversationIdentity`] from both the original
+/// target and the live `location.href`, then requires equality. Query strings
+/// and fragments are not part of that identity, and `Url` normalises an
+/// explicitly written default port; the provider, route context (including a
+/// custom GPT ID), and conversation ID must remain identical.
 ///
 /// # The sign-in landing is reported, not accepted
 ///
@@ -11748,10 +12010,31 @@ where
 /// [`check_login_status`] would have given rather than a bare refusal. It gets
 /// one -- but as an error that stops the run, not as a pass. The prompt is
 /// never typed either way; only the wording differs.
-fn verify_session_page_is_provider<F>(call: &mut F, provider: Provider) -> Result<(), String>
+fn verify_session_page_is_provider<F>(
+    call: &mut F,
+    provider: Provider,
+    expected_href: &str,
+) -> Result<(), String>
 where
     F: FnMut(&str, Value) -> Result<Value, String>,
 {
+    let expected_url = Url::parse(expected_href).map_err(|_| {
+        format!(
+            "Could not identify the requested {} conversation from {}; refusing to drive it",
+            provider.display_name(),
+            expected_href
+        )
+    })?;
+    let expected_identity = provider
+        .conversation_identity(&expected_url)
+        .ok_or_else(|| {
+            format!(
+                "Could not identify the requested {} conversation from {}; refusing to drive it",
+                provider.display_name(),
+                expected_href
+            )
+        })?;
+
     let res = call(
         "evaluate_script",
         serde_json::json!({ "function": LIVE_URL_PROBE_JS }),
@@ -11765,8 +12048,7 @@ where
     })?;
 
     if let Ok(url) = Url::parse(href)
-        && Provider::from_session_url(&url) == Some(provider)
-        && provider.owns_conversation_url(&url)
+        && provider.conversation_identity(&url).as_ref() == Some(&expected_identity)
     {
         return Ok(());
     }
@@ -12787,6 +13069,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verify_session_page_is_provider(
                     &mut |tool, args| call_mcp_tool(&config_path, tool, args),
                     *session_provider,
+                    session_url,
                 )
             },
         ) {
