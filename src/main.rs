@@ -4025,7 +4025,7 @@ mod tests {
 
         let app_path = dir.join("Brave Test.app");
         let resolved = resolve_browser_binary(app_path.to_str().unwrap()).unwrap();
-        assert_eq!(resolved, exec.to_string_lossy().to_string());
+        assert_eq!(Path::new(&resolved), exec.as_path());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4242,7 +4242,7 @@ mod tests {
         mark_test_file_executable(&exec);
         let app = dir.join("Foo.APP");
         let resolved = resolve_browser_binary(app.to_str().unwrap()).unwrap();
-        assert_eq!(resolved, exec.to_string_lossy().to_string());
+        assert_eq!(Path::new(&resolved), exec.as_path());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4256,7 +4256,7 @@ mod tests {
         mark_test_file_executable(&exec);
         let app_with_slash = format!("{}/", dir.join("Brave Test.app").to_str().unwrap());
         let resolved = resolve_browser_binary(&app_with_slash).unwrap();
-        assert_eq!(resolved, exec.to_string_lossy().to_string());
+        assert_eq!(Path::new(&resolved), exec.as_path());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6834,6 +6834,7 @@ mod tests {
             ),
         ];
         for (name, text, required) in surfaces {
+            let text = text.replace("\r\n", "\n");
             for needle in required {
                 assert!(
                     text.contains(needle),
@@ -9423,7 +9424,7 @@ mod tests {
         // rather than failing. Pin the implementation instead — a hand-rolled
         // `File::create` / `OpenOptions::create(true)` passes every behavioural
         // test above while silently reintroducing follow-and-truncate.
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let body = source
             .split_once(concat!("fn create_response_", "scratch_file("))
             .expect("the scratch-file constructor should exist")

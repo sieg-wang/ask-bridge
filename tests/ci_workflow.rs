@@ -141,7 +141,7 @@ fn windows_rust_tests_exercise_the_clipboard_lock_contract() {
 
 #[test]
 fn clipboard_contract_guard_rejects_a_multiline_cfg_that_excludes_windows() {
-    let source = include_str!("../src/main.rs");
+    let source = include_str!("../src/main.rs").replace("\r\n", "\n");
     let item = CLIPBOARD_CONTRACT_ITEMS[0];
     let anchor = format!("    #[test]\n    {item}");
     let replacement = format!(
@@ -160,7 +160,7 @@ fn clipboard_contract_guard_rejects_a_multiline_cfg_that_excludes_windows() {
 
 #[test]
 fn clipboard_contract_guard_rejects_a_unix_only_race_test() {
-    let source = include_str!("../src/main.rs");
+    let source = include_str!("../src/main.rs").replace("\r\n", "\n");
     let item = CLIPBOARD_CONTRACT_ITEMS[1];
     let anchor = format!("    #[cfg(any(unix, target_os = \"windows\"))]\n    #[test]\n    {item}");
     let replacement = format!("    #[cfg(unix)]\n    #[test]\n    {item}");
