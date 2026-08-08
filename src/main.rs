@@ -73,9 +73,31 @@ struct ConversationIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConversationRoute {
+    /// The provider's standard conversation route.
     Root,
     /// ChatGPT's documented custom-GPT route: `/g/<gpt-id>/c/<conversation-id>`.
     ChatGptCustomGpt(String),
+    /// Gemini's numeric multi-account selector: `/u/<account-index>/app/<id>`.
+    /// An explicitly requested selector is part of the safety boundary: the
+    /// landing page must not silently drift to another signed-in account.
+    GeminiAccount(String),
+}
+
+impl ConversationIdentity {
+    fn matches_live(&self, live: &Self) -> bool {
+        if self.provider != live.provider || self.id != live.id {
+            return false;
+        }
+
+        match (&self.route, &live.route) {
+            (ConversationRoute::Root, ConversationRoute::GeminiAccount(_))
+                if self.provider == Provider::Gemini =>
+            {
+                true
+            }
+            (expected, actual) => expected == actual,
+        }
+    }
 }
 
 impl Provider {
@@ -286,6 +308,18 @@ impl Provider {
             }
             (
                 ConversationRoute::ChatGptCustomGpt(gpt_id.to_string()),
+                path_segments.next()?,
+            )
+        } else if self == Provider::Gemini && first == "u" {
+            let account_index = path_segments.next()?;
+            if account_index.is_empty()
+                || !account_index.bytes().all(|byte| byte.is_ascii_digit())
+                || path_segments.next() != Some(marker)
+            {
+                return None;
+            }
+            (
+                ConversationRoute::GeminiAccount(account_index.to_string()),
                 path_segments.next()?,
             )
         } else {
@@ -4797,6 +4831,21 @@ mod tests {
     }
 
     #[test]
+    fn gemini_account_prefixed_conversation_urls_are_accepted() {
+        for url in [
+            "https://gemini.google.com/u/0/app/conversation-123",
+            "https://gemini.google.com/u/1/app/conversation-123?pageId=none",
+            "https://gemini.google.com/u/12/app/conversation-123",
+        ] {
+            assert_eq!(
+                resolve_session_target(Provider::Gemini, true, url),
+                Ok((Provider::Gemini, url.to_string())),
+                "refused a Gemini multi-account conversation URL: {url}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_empty_segments_around_the_conversation_route() {
         for (provider, malformed) in [
             (Provider::ChatGpt, "https://chatgpt.com//c/chat-123"),
@@ -4821,6 +4870,24 @@ mod tests {
             assert!(
                 resolve_session_target(provider, false, malformed).is_err(),
                 "accepted an empty segment in a conversation route: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_gemini_account_prefixes() {
+        for malformed in [
+            "https://gemini.google.com/u/app/conversation-123",
+            "https://gemini.google.com/u//app/conversation-123",
+            "https://gemini.google.com/u/account/app/conversation-123",
+            "https://gemini.google.com/u/-1/app/conversation-123",
+            "https://gemini.google.com/u/1/settings/app/conversation-123",
+            "https://gemini.google.com/u/1/app/",
+            "https://gemini.google.com/u/1/app/conversation-123/extra",
+        ] {
+            assert!(
+                resolve_session_target(Provider::Gemini, true, malformed).is_err(),
+                "accepted a malformed Gemini account-prefixed route: {malformed}"
             );
         }
     }
@@ -5126,6 +5193,57 @@ mod tests {
             Ok(()),
             "decorations on the original URL must not change its conversation identity"
         );
+    }
+
+    #[test]
+    fn a_bare_gemini_session_can_land_on_an_account_prefixed_route() {
+        assert_eq!(
+            session_verdict_for(
+                "https://gemini.google.com/app/abc",
+                "https://gemini.google.com/u/12/app/abc?pageId=none#response",
+                Provider::Gemini,
+            ),
+            Ok(()),
+            "a Gemini account selector changed the spelling, not the conversation"
+        );
+    }
+
+    #[test]
+    fn an_explicit_gemini_account_prefix_must_not_drift() {
+        let expected_href = "https://gemini.google.com/u/1/app/abc";
+
+        assert_eq!(
+            session_verdict_for(
+                expected_href,
+                "https://gemini.google.com/u/1/app/abc?pageId=none",
+                Provider::Gemini,
+            ),
+            Ok(()),
+            "the explicitly selected Gemini account was refused"
+        );
+
+        for live_href in [
+            "https://gemini.google.com/u/0/app/abc",
+            "https://gemini.google.com/app/abc",
+        ] {
+            let error = session_verdict_for(expected_href, live_href, Provider::Gemini).expect_err(
+                "accepted a Gemini session after its explicit account selector drifted",
+            );
+            assert!(error.contains(live_href), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn a_prefixed_gemini_route_still_rejects_a_different_conversation() {
+        let live_href = "https://gemini.google.com/u/1/app/different";
+        let error = session_verdict_for(
+            "https://gemini.google.com/app/original",
+            live_href,
+            Provider::Gemini,
+        )
+        .expect_err("accepted a different Gemini conversation behind an account prefix");
+
+        assert!(error.contains(live_href), "unexpected error: {error}");
     }
 
     #[test]
@@ -11999,10 +12117,13 @@ where
 /// composer-shaped DOM on such a page would be typed into.
 ///
 /// So this gate derives a [`ConversationIdentity`] from both the original
-/// target and the live `location.href`, then requires equality. Query strings
-/// and fragments are not part of that identity, and `Url` normalises an
-/// explicitly written default port; the provider, route context (including a
-/// custom GPT ID), and conversation ID must remain identical.
+/// target and the live `location.href`, then requires them to match. Query
+/// strings and fragments are not part of that identity, and `Url` normalises
+/// an explicitly written default port. The provider, conversation ID and
+/// explicit route context (including a custom GPT ID or Gemini account index)
+/// must remain identical. A bare Gemini `/app/<id>` target may acquire a
+/// numeric `/u/N/` selector during navigation because the caller did not choose
+/// an account index; the reverse and cross-account cases remain fail-closed.
 ///
 /// # The sign-in landing is reported, not accepted
 ///
@@ -12049,7 +12170,8 @@ where
     })?;
 
     if let Ok(url) = Url::parse(href)
-        && provider.conversation_identity(&url).as_ref() == Some(&expected_identity)
+        && let Some(live_identity) = provider.conversation_identity(&url)
+        && expected_identity.matches_live(&live_identity)
     {
         return Ok(());
     }
