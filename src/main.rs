@@ -5164,6 +5164,92 @@ mod tests {
         );
     }
 
+    /// Differential probe: the landing gate must never accept an href that
+    /// `--session` itself would refuse on the command line.
+    ///
+    /// The two checks exist for the same reason and are enforced by different
+    /// code — [`resolve_session_target`] restricts what may be *asked for*,
+    /// [`verify_session_page_is_provider`] restricts what may be *typed into*.
+    /// Any href the second accepts and the first rejects is a way to reach the
+    /// composer at a URL the tool was built to refuse: the session is opened at
+    /// a legitimate conversation, the page navigates, and the gate waves it
+    /// through. So the expected target here is held fixed and legitimate, and
+    /// only the live href varies — that is the real shape of the escape.
+    ///
+    /// The candidate list is a host- and path-spoofing census: case and scheme
+    /// variants, an explicit default port and a non-default one, a trailing
+    /// root dot, userinfo, backslash-vs-at confusions, percent-encoded and
+    /// full-width (U+3002) dots, a punycode lookalike, doubled and traversing
+    /// path segments, `blob:`/`javascript:` wrappers, whitespace and newline
+    /// padding, a leading-zero port, loopback literals, sibling products, the
+    /// auth origin, and the other two providers' conversation URLs.
+    ///
+    /// Adapted from a 2026-08-07 review probe that predates the current
+    /// three-argument `session_verdict_for`; the original passed one href and
+    /// could not distinguish "refused because the target was malformed" from
+    /// "refused because the landing was". Holding the target fixed removes that
+    /// ambiguity.
+    #[test]
+    fn the_landing_gate_never_accepts_what_the_command_line_refuses() {
+        const EXPECTED: &str = "https://chatgpt.com/c/abc";
+        let candidates = [
+            "https://chatgpt.com/c/abc",
+            "https://chatgpt.com:443/c/abc",
+            "https://CHATGPT.COM/c/abc",
+            "HTTPS://chatgpt.com/c/abc",
+            "https://chatgpt.com./c/abc",
+            "https://chatgpt.com:8443/c/abc",
+            "https://user:pw@chatgpt.com/c/abc",
+            "https://chatgpt.com@evil.test/c/abc",
+            "https://evil.test\\@chatgpt.com/c/abc",
+            "https://chatgpt.com\\@evil.test/c/abc",
+            "https://chatgpt.com\\.evil.test/c/abc",
+            "https://chatgpt%2ecom/c/abc",
+            "https://chatgpt\u{3002}com/c/abc",
+            "https://xn--chatgpt-.com/c/abc",
+            "https://chatgpt.com:/c/abc",
+            "https://chatgpt.com//c/abc",
+            "https:/\\chatgpt.com/c/abc",
+            "https:\\\\chatgpt.com/c/abc",
+            "https://chatgpt.com/%2e%2e/c/abc",
+            "https://chatgpt.com/x/../c/abc",
+            "https://chatgpt.com/c/abc/../../settings",
+            "https://chatgpt.com/settings/c/abc",
+            "https://chatgpt.com/c/abc?next=https://evil.test",
+            "https://chatgpt.com/c/",
+            "https://chatgpt.com/c",
+            "https://chatgpt.com/#/c/abc",
+            "https://[::ffff:127.0.0.1]/c/abc",
+            "https://127.0.0.1/c/abc",
+            "https://chatgpt.com.evil.test/c/abc",
+            "https://sora.chatgpt.com/c/abc",
+            "https://auth.openai.com/authorize",
+            "https://gemini.google.com/app/abc",
+            "https://claude.ai/chat/abc",
+            "  https://chatgpt.com/c/abc  ",
+            "https://chatgpt.com/c/abc\n",
+            "https://chatgpt.com/c/%61bc",
+            "https://chatgpt.com/c/a%2Fb",
+            "blob:https://chatgpt.com/c/abc",
+            "javascript:location='https://chatgpt.com/c/abc'",
+            "https://chatgpt.com:0443/c/abc",
+        ];
+
+        let escapes: Vec<&str> = candidates
+            .into_iter()
+            .filter(|href| {
+                let gate = session_verdict_for(EXPECTED, href, Provider::ChatGpt).is_ok();
+                let cli = resolve_session_target(Provider::ChatGpt, false, href).is_ok();
+                gate && !cli
+            })
+            .collect();
+
+        assert!(
+            escapes.is_empty(),
+            "the landing gate accepts hrefs the command line refuses: {escapes:?}"
+        );
+    }
+
     /// Anti-tautology: the gate must still pass the page it was aimed at, for
     /// every provider, including the query and fragment a real provider adds.
     #[test]
