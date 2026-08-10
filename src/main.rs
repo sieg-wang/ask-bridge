@@ -9500,6 +9500,159 @@ mod tests {
         );
     }
 
+    /// Return the rest of the branch a reported failure sits in, together with
+    /// whether that branch itself ends the run.
+    ///
+    /// Brace depth, not indentation: the walk stops at the `}` closing the block
+    /// the report is in, so it can never run on into the next step's arm and
+    /// count *its* abort.
+    fn reported_failure_branch(source: &str, report: &str) -> Result<(String, bool), String> {
+        let fatal = concat!("std::process::", "exit(1);");
+        let after = source
+            .split_once(report)
+            .ok_or_else(|| format!("main no longer reports the failure `{report}`"))?
+            .1;
+
+        let mut depth = 0usize;
+        let mut branch = None;
+        for (offset, character) in after.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' if depth == 0 => {
+                    branch = Some(&after[..offset]);
+                    break;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let branch = branch
+            .ok_or_else(|| format!("the branch reporting `{report}` is not brace-balanced"))?;
+
+        // Comments are stripped before the abort is looked for. `str::starts_with`
+        // is a raw substring search, so without this the cheapest possible
+        // evasion -- leaving `// std::process::exit(1); felt too harsh.` in a
+        // branch that now only warns -- satisfies the check. Measured passing
+        // before this was added.
+        let branch: String = branch
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Only a depth-0 abort counts: `if command_verbose { exit(1) }` contains
+        // the needle while leaving the failure survivable on the ordinary path.
+        let mut depth = 0usize;
+        let mut aborts = false;
+        for (offset, character) in branch.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {
+                    if depth == 0 && branch[offset..].starts_with(fatal) {
+                        aborts = true;
+                    }
+                }
+            }
+        }
+
+        Ok((branch, aborts))
+    }
+
+    fn validate_trusted_steps_abort(source: &str) -> Result<(), String> {
+        for (step, report) in [
+            ("model", concat!("Error switching ", "model: {}")),
+            ("reasoning", concat!("Error switching ", "reasoning: {}")),
+            (
+                "attachment",
+                concat!("Error attaching ", "images/files: {}"),
+            ),
+        ] {
+            let (branch, aborts) = reported_failure_branch(source, report)?;
+            if !aborts {
+                return Err(format!(
+                    "the {step} step prints its error and carries on: the prompt is \
+                     then typed with the wrong selection, or without the attachment, \
+                     and the run still exits 0. Branch was:\n{branch}"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A run that was told *which model*, *which reasoning effort* or *which
+    /// files* to use must not go on to type the prompt once that step has
+    /// failed.
+    ///
+    /// Lexical, for the same reason as `a_refused_session_aborts_the_run`: the
+    /// abort is a `std::process::exit` inside `fn main`, downstream of a live
+    /// chrome-devtools MCP session and a login check, so no offline behavioural
+    /// test can reach it, and injecting the abort as a closure would only move
+    /// the untested line somewhere this test no longer looks.
+    ///
+    /// `switch_model`, `switch_reasoning` and `upload_attachments_to_provider`
+    /// already return `Err` -- the fail-loud machinery underneath is not the
+    /// gap. The compiler is equally happy whether `main` dies on that `Err` or
+    /// prints it and carries on. Drop one abort and the whole suite stays green
+    /// while `--model gpt-5-pro` answers from whatever model the tab already had
+    /// selected, and `--file report.pdf` answers about a file the page never
+    /// received -- both with exit code 0, the only thing a calling script
+    /// (scripts/ask.sh, the Agent Skill, any agent shelling out) ever reads.
+    #[test]
+    fn a_failed_selection_or_upload_still_aborts_the_run() {
+        // Split literals keep this test from matching its own source text.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        validate_trusted_steps_abort(&source)
+            .expect("a failed model / reasoning / attachment step must end the run");
+    }
+
+    /// Anti-tautology for the guard above: it has to be able to fail, and it has
+    /// to fail on the two ways of *looking* like it still aborts. Mutating the
+    /// real source in memory proves all three without touching production.
+    #[test]
+    fn the_trusted_step_guard_rejects_a_step_that_only_warns() {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        let report = concat!("Error switching ", "model: {}");
+        let fatal = concat!("std::process::", "exit(1);");
+
+        // Locate the model step's own abort: the first one after its report.
+        let at = source
+            .find(report)
+            .expect("main should still report a failed model step");
+        let abort_at = at
+            + source[at..]
+                .find(fatal)
+                .expect("fixture drift: the model step no longer aborts");
+        let (before, after) = (&source[..abort_at], &source[abort_at + fatal.len()..]);
+
+        for (evasion, replacement) in [
+            ("the abort deleted outright", "".to_string()),
+            (
+                "the abort left behind as a comment",
+                format!("// {fatal} felt too harsh."),
+            ),
+            (
+                "the abort demoted to a verbose-only branch",
+                format!("if command_verbose {{ {fatal} }}"),
+            ),
+        ] {
+            let mutant = format!("{before}{replacement}{after}");
+            assert_ne!(mutant, source, "{evasion}: the mutation changed nothing");
+
+            match validate_trusted_steps_abort(&mutant) {
+                Ok(()) => panic!("a model step with {evasion} was accepted as fatal"),
+                Err(error) => assert!(
+                    error.contains("the model step"),
+                    "unexpected error for {evasion}: {error}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn every_image_download_goes_through_the_exit_code_wrapper() {
         // Tripwire for a rebase. The --image-output contract lives in three
