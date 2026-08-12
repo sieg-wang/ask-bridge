@@ -6521,6 +6521,11 @@ mod tests {
         /// A second tab that appears alongside the one `new_page` opened (a
         /// provider popup, a restored session).
         new_page_also_opens: Option<String>,
+        /// A tab that is in the page list `new_page` echoes and already gone by
+        /// the time anyone asks again -- a popup that closed itself. It never
+        /// enters the fake's state, which is the whole point: it is what makes
+        /// the echo and a fresh `list_pages` disagree.
+        new_page_echoes_transiently: Option<String>,
     }
 
     impl FakeMcp {
@@ -6541,6 +6546,7 @@ mod tests {
                 new_page_opens_nothing: false,
                 new_page_lands_on: None,
                 new_page_also_opens: None,
+                new_page_echoes_transiently: None,
             }
         }
 
@@ -6615,7 +6621,13 @@ mod tests {
                             self.pages.push((extra_id, extra));
                         }
                     }
-                    Ok(Self::text_result(self.page_list_text()))
+                    let mut echo = self.page_list_text();
+                    if let Some(transient) = self.new_page_echoes_transiently.clone() {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        echo.push_str(&format!("{}: {}\n", id, transient));
+                    }
+                    Ok(Self::text_result(echo))
                 }
                 "navigate_page" => {
                     let url = args
@@ -7334,6 +7346,93 @@ mod tests {
         assert_eq!(
             fresh_page_ids(&[1], &two_owned, Provider::ChatGpt),
             vec![2, 3]
+        );
+    }
+
+    /// Two ask-bridge runs against the same Chrome each get their own
+    /// chrome-devtools-mcp child, but the browser's page-ID space is shared. So
+    /// a run that opens its tab while the other run is opening one sees *two*
+    /// fresh provider tabs and [`fresh_page_ids`] cannot name either as its
+    /// own.
+    ///
+    /// Continuing unpinned from there is not "only losing the pinning": every
+    /// fallback left picks by origin alone. The readiness re-focus takes the
+    /// *first* provider-owned tab in the listing, and the final gate
+    /// (`verify_selected_page_is_provider`) checks the origin and never the tab
+    /// identity -- so the run types its prompt into the other run's
+    /// conversation, both prompts interleave in one tab, and each run copies
+    /// whichever assistant message happened to be last. Two silently wrong
+    /// artifacts, both exit 0.
+    #[test]
+    fn two_fresh_provider_tabs_are_refused_rather_than_driven_unpinned() {
+        let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+        // The other run's tab, landing between this run's snapshot and the
+        // page list its own `new_page` echoes back.
+        fake.new_page_also_opens = Some("https://chatgpt.com/".to_string());
+        let err = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .expect_err("expected a refusal, got Ok");
+
+        assert!(
+            err.contains("refusing") && err.contains("[2, 3]"),
+            "the error must refuse and name the tabs it could not tell apart: {err}"
+        );
+
+        // Positive control, and the reason the refusal keys on *provider-owned*
+        // ambiguity rather than on "more than one fresh ID": a second tab that
+        // is not the provider's leaves fresh_page_ids able to name the one that
+        // is, so the run still pins and proceeds.
+        let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+        fake.new_page_also_opens = Some("https://example.com/popup".to_string());
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        assert_eq!(
+            fake.page_ids_for("select_page"),
+            Vec::<usize>::new(),
+            "the pinned tab is the one new_page already selected"
+        );
+    }
+
+    /// The refusal above ends the run, so it must not rest on a single
+    /// snapshot. The list `new_page` echoes can still name a tab that has
+    /// already gone -- a popup that closed itself -- and that is not a second
+    /// run. Ask once more before refusing, which is the same second look the
+    /// `--new` branch takes at the same ambiguity.
+    #[test]
+    fn a_tab_that_is_gone_on_the_second_look_is_not_a_second_run() {
+        let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+        fake.new_page_echoes_transiently = Some("https://chatgpt.com/c/other".to_string());
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a tab that no longer exists must not end the run: {result:?}"
+        );
+        assert_eq!(
+            fake.selected,
+            Some(2),
+            "the run must still pin the tab it opened"
         );
     }
 
@@ -12823,13 +12922,46 @@ where
                         }),
                     )?;
                     // Nothing stale can be re-selected here (the tab was just
-                    // created), so an unidentifiable ID only costs the pinning,
-                    // not correctness.
-                    let opened_id = match pages_from_tool_result(&opened, "new_page")
-                        .map(|after| fresh_page_ids(&before_ids, &after, provider))
-                        .unwrap_or_default()
-                        .as_slice()
-                    {
+                    // created), so an unidentifiable ID usually only costs the
+                    // pinning -- with one exception that costs correctness, and
+                    // it is the one below.
+                    let mut after = pages_from_tool_result(&opened, "new_page").unwrap_or_default();
+                    let mut fresh = fresh_page_ids(&before_ids, &after, provider);
+                    if fresh.len() != 1 {
+                        // Ask again before deciding, exactly as the `--new`
+                        // branch does: the list `new_page` echoes is a snapshot,
+                        // and a tab that was still settling in it may have
+                        // resolved by now.
+                        let listed = call("list_pages", serde_json::json!({}))?;
+                        after = pages_from_tool_result(&listed, "list_pages")?;
+                        fresh = fresh_page_ids(&before_ids, &after, provider);
+                    }
+                    // Two fresh tabs that are *both* this provider's is the
+                    // shape a second ask-bridge run makes: each run has its own
+                    // chrome-devtools-mcp child, but they share the browser's
+                    // page-ID space. Nothing downstream can tell them apart --
+                    // the readiness re-focus falls back to the first
+                    // provider-owned tab and the final gate checks the origin,
+                    // never the identity -- so an unpinned run here types its
+                    // prompt into the other run's conversation and copies back
+                    // whichever message was latest. Refuse instead, like `--new`
+                    // already does with the same ambiguity.
+                    let owned_fresh: Vec<usize> = after
+                        .iter()
+                        .filter(|p| {
+                            fresh.contains(&p.id)
+                                && p.url.as_deref().is_some_and(|url| provider.owns_url(url))
+                        })
+                        .map(|p| p.id)
+                        .collect();
+                    if owned_fresh.len() > 1 {
+                        return Err(format!(
+                            "Could not tell which of these fresh {} tabs this run opened (candidate IDs: {:?}); another ask-bridge run is most likely driving the same browser, so refusing to type the prompt into a tab that may be its conversation",
+                            provider.display_name(),
+                            owned_fresh
+                        ));
+                    }
+                    let opened_id = match fresh.as_slice() {
                         [id] => Some(*id),
                         _ => None,
                     };
