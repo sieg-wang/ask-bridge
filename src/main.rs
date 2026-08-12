@@ -8995,6 +8995,7 @@ mod tests {
             "the assistant answer",
             Some(&markdown_output_at(&output)),
             Some(1), // --image-output failed and the run must die
+            true,
             false,
         );
 
@@ -9015,6 +9016,7 @@ mod tests {
             "the assistant answer",
             Some(&markdown_output_at(&output)),
             None,
+            true,
             false,
         );
 
@@ -9043,6 +9045,7 @@ mod tests {
             "the assistant answer",
             Some(&markdown_output_at(&blocked)),
             None,
+            true,
             false,
         );
 
@@ -9060,7 +9063,7 @@ mod tests {
         // fires on the None case would turn every plain `ask '...'` into a
         // failure.
         assert_eq!(
-            finish_prompt_artifacts("the assistant answer", None, None, false),
+            finish_prompt_artifacts("the assistant answer", None, None, true, false),
             None
         );
     }
@@ -9081,7 +9084,13 @@ mod tests {
                     .unwrap();
 
             assert_eq!(
-                finish_prompt_artifacts("the assistant answer", cli.output.as_ref(), None, false),
+                finish_prompt_artifacts(
+                    "the assistant answer",
+                    cli.output.as_ref(),
+                    None,
+                    true,
+                    false
+                ),
                 None,
                 "{flag} must parse into a writable destination"
             );
@@ -9113,6 +9122,7 @@ mod tests {
             "the assistant answer",
             Some(&markdown_output_at(&blocked)),
             Some(99),
+            true,
             false,
         );
 
@@ -9141,6 +9151,7 @@ mod tests {
                 "the assistant answer",
                 Some(&markdown_output_at(&blocked)),
                 None,
+                true,
                 false
             ),
             Some(1),
@@ -9150,6 +9161,116 @@ mod tests {
             image_download_failure_exit_code(Some("shot.png")),
             Some(1),
             "a failed --image-output download is exit 1"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_run_still_writes_output_but_fails_the_command() {
+        // The wait loop gives up at --timeout with the provider still
+        // generating, so the toolbar is never read and the markdown stays
+        // empty. The epilogue then wrote that emptiness to the promised file
+        // and exited 0 — and the caller's contract is "check the status, then
+        // read the file back", so exit 0 over an empty file reads as "the
+        // model answered with nothing", not "the run never got an answer".
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("answer.md");
+
+        let (markdown, answer_arrived) = harvest_prompt_answer(Provider::ChatGpt, false, || {
+            panic!("a run that timed out must not read the toolbar")
+        });
+        assert!(!answer_arrived, "a timed-out run delivered no answer");
+
+        let code = finish_prompt_artifacts(
+            &markdown,
+            Some(&markdown_output_at(&output)),
+            None,
+            answer_arrived,
+            false,
+        );
+
+        assert_eq!(code, Some(1), "a run with no answer must not exit 0");
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "",
+            "--output was promised and must still be produced, empty or not"
+        );
+    }
+
+    #[test]
+    fn a_failed_toolbar_copy_still_writes_output_but_fails_the_command() {
+        // Same silent success by the other route: the stream did finish, but
+        // copying it out of the toolbar failed, which only printed a line to
+        // stderr and left the markdown empty.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("answer.md");
+
+        let (markdown, answer_arrived) = harvest_prompt_answer(Provider::ChatGpt, true, || {
+            Err("clipboard read timed out".to_string())
+        });
+        assert!(!answer_arrived, "a failed copy delivered no answer");
+
+        let code = finish_prompt_artifacts(
+            &markdown,
+            Some(&markdown_output_at(&output)),
+            None,
+            answer_arrived,
+            false,
+        );
+
+        assert_eq!(code, Some(1), "a run with no answer must not exit 0");
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "",
+            "--output was promised and must still be produced, empty or not"
+        );
+    }
+
+    #[test]
+    fn a_copied_answer_is_still_a_successful_run() {
+        // Positive control for the two above: a guard that fired on the happy
+        // path would turn every run into a failure.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("answer.md");
+
+        let (markdown, answer_arrived) = harvest_prompt_answer(Provider::ChatGpt, true, || {
+            Ok("the assistant answer".to_string())
+        });
+        assert!(answer_arrived);
+
+        assert_eq!(
+            finish_prompt_artifacts(
+                &markdown,
+                Some(&markdown_output_at(&output)),
+                None,
+                answer_arrived,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "the assistant answer"
+        );
+    }
+
+    #[test]
+    fn a_missing_answer_outranks_an_image_failure_in_the_exit_code() {
+        // Third artifact, same one exit status, so the precedence is a
+        // decision: the answer is what the command is for, images are
+        // attachments, so a run that produced no answer reports its own code
+        // and the image code is dropped. Both still print their own stderr
+        // line. 99 is not a code this CLI produces; it is here so the
+        // assertion can see which side won.
+        assert_eq!(
+            finish_prompt_artifacts("", None, Some(99), false, false),
+            Some(1),
+            "the missing answer must outrank the image failure"
+        );
+        // And with an answer in hand the image failure is still fatal, so the
+        // new arm cannot be masking it.
+        assert_eq!(
+            finish_prompt_artifacts("the assistant answer", None, Some(99), true, false),
+            Some(99)
         );
     }
 
@@ -10719,6 +10840,39 @@ fn download_images_and_exit_code(
     }
 }
 
+/// Collect the answer a prompt run waited for, and say whether one arrived.
+///
+/// Two shapes of run end with nothing in hand: the stream was still generating
+/// when `--timeout` expired, and the toolbar copy failed. Both used to print a
+/// line to stderr and fall through, leaving the epilogue to write an empty
+/// `--output` file and exit 0 — and the caller's contract is to check the exit
+/// status and then read that file back, so a zero over an empty file reads as
+/// "the answer was empty", not "there was no answer". The empty string is still
+/// returned, because the file was promised and must still be produced; the flag
+/// is what the epilogue turns into a non-zero exit.
+///
+/// Test seam: the toolbar copy is injected, so both failure shapes are testable
+/// without a browser.
+fn harvest_prompt_answer<C>(provider: Provider, finished: bool, copy: C) -> (String, bool)
+where
+    C: FnOnce() -> Result<String, String>,
+{
+    if !finished {
+        return (String::new(), false);
+    }
+    match copy() {
+        Ok(content) => (content, true),
+        Err(e) => {
+            eprintln!(
+                "Error copying response from {} toolbar: {}",
+                provider.display_name(),
+                e
+            );
+            (String::new(), false)
+        }
+    }
+}
+
 /// Write the Markdown artifacts a prompt run promised, then hand back whichever
 /// failure must end the run.
 ///
@@ -10740,13 +10894,24 @@ fn download_images_and_exit_code(
 /// are pinned to that by `both_fatal_artifact_paths_still_use_exit_code_one`.
 /// If either ever gains a distinctive code, that test fails and this precedence
 /// must be re-decided rather than inherited.
+///
+/// `answer_arrived` is the third claimant on that one exit status, and it slots
+/// between the other two: a `--output` write that failed is the more specific
+/// fact about the same artifact (the file the caller is about to read is not
+/// there at all), while an answer that never arrived still leaves a readable —
+/// if empty — file, and images remain attachments. Its own code is 1 for the
+/// same reason as the other two.
 fn finish_prompt_artifacts(
     markdown: &str,
     output: Option<&MarkdownOutput>,
     image_exit_code: Option<i32>,
+    answer_arrived: bool,
     verbose: bool,
 ) -> Option<i32> {
-    markdown_output::write_if_requested(output, markdown, verbose).or(image_exit_code)
+    let missing_answer = (!answer_arrived).then_some(1);
+    markdown_output::write_if_requested(output, markdown, verbose)
+        .or(missing_answer)
+        .or(image_exit_code)
 }
 
 /// Decode one scanned image into `(extension, bytes)`.
@@ -13542,7 +13707,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Waiting for {} response...", provider.display_name());
     }
 
-    let mut last_markdown = String::new();
     let mut finished = false;
     let mut wait_cycles = 0;
     let mut stable_done_checks = 0;
@@ -13647,26 +13811,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if finished {
-        if command_verbose {
-            println!(
-                "Copying final response from {} toolbar...",
-                provider.display_name()
-            );
-        }
-        match copy_latest_markdown(&config_path, provider) {
-            Ok(content) => {
-                last_markdown = content;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Error copying response from {} toolbar: {}",
-                    provider.display_name(),
-                    e
-                );
-            }
-        }
+    if finished && command_verbose {
+        println!(
+            "Copying final response from {} toolbar...",
+            provider.display_name()
+        );
     }
+    let (last_markdown, answer_arrived) = harvest_prompt_answer(provider, finished, || {
+        copy_latest_markdown(&config_path, provider)
+    });
 
     if let Err(e) = render_markdown(&last_markdown, use_glow) {
         eprintln!("Error rendering Markdown: {}", e);
@@ -13708,6 +13861,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &last_markdown,
         cli.output.as_ref(),
         image_exit_code,
+        answer_arrived,
         command_verbose,
     ) {
         std::process::exit(code);
