@@ -9146,6 +9146,11 @@ exit "${CURL_EXIT:-1}"
     /// offline end-to-end run can reach (the arm needs a live chrome-devtools
     /// MCP session first). Swallowing it -- `unwrap_or_default()`, or the
     /// original `if !saved { eprintln!(..) }` -- puts exit 0 straight back.
+    ///
+    /// The decode is only half the promise. The command exists to leave a file
+    /// behind, so a swallowed *write* -- `let _ = std::fs::write(..)` -- exits 0
+    /// over a missing or stale `target/screenshot.png` just as squarely, and the
+    /// caller cannot tell the two apart.
     #[test]
     fn the_screenshot_arm_propagates_the_failure_instead_of_printing_it() {
         // Split literals keep this test from matching its own source text.
@@ -9168,10 +9173,28 @@ exit "${CURL_EXIT:-1}"
             }
         }
         let arm = &arm[..end.expect("the screenshot arm must be brace-balanced")];
+        // Whole comment lines are dropped, exactly as
+        // `no_updater_path_pipes_a_download_into_a_shell` does it and for the
+        // same reason: the arm has to be allowed to *describe* what it does,
+        // and a comment quoting the `?` would otherwise satisfy every
+        // assertion below while the line beside it swallows the error.
+        let arm: String = arm
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(
             arm.contains(concat!("screenshot_png_bytes(&res)", "?")),
             "the screenshot arm no longer lets a missing image end the run:\n{arm}"
+        );
+        assert!(
+            arm.contains(concat!(
+                "std::fs::write(\"target/screenshot.png\", bytes)",
+                "?"
+            )),
+            "the screenshot arm no longer lets a failed write end the run, so it \
+             can exit 0 over the file the previous run left:\n{arm}"
         );
         // The one print the arm may still make is the tab-preparation failure,
         // which aborts. What it may not do is format the tool response: that is
