@@ -72,11 +72,23 @@ fn run_update_command() -> Result<(), String> {
         .status()
         .map_err(|e| format!("Failed to run Windows update command: {}", e))?;
 
+    // Same shell as `UNIX_UPDATE_SHELL_COMMAND` in src/main.rs, and for the same
+    // reason: download the installer to a file and run the file, so a body that
+    // stops half way through cannot be executed as far as it got and still
+    // report the shell's success. Kept in step by
+    // `no_updater_path_pipes_a_download_into_a_shell`.
     #[cfg(not(target_os = "windows"))]
     let status = Command::new("sh")
         .args([
             "-c",
-            "curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh | bash",
+            concat!(
+                "set -e\n",
+                "tmp=$(mktemp -d)\n",
+                "trap 'rm -rf \"$tmp\"' EXIT\n",
+                "curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh",
+                " -o \"$tmp/install.sh\"\n",
+                "bash \"$tmp/install.sh\"\n",
+            ),
         ])
         .status()
         .map_err(|e| format!("Failed to run macOS/Linux update command: {}", e))?;

@@ -1457,6 +1457,28 @@ fn run_config_command(
     Ok(())
 }
 
+/// The shell `ask-bridge update` runs on macOS/Linux.
+///
+/// The installer is downloaded to a file and *then* executed, never piped.
+/// `curl ... | bash` hands the shell whatever arrived: a connection that drops
+/// half way through is executed as far as it got, and the pipeline's exit status
+/// is bash's, not curl's -- so a half-installed binary reports success. With
+/// `set -e` and a file, the failed download is the failure.
+///
+/// What the installer then downloads is verified against the SHA-256 the release
+/// workflow publishes beside it (`verify_release_checksum` in install.sh). The
+/// installer script itself is still fetched from a mutable branch over TLS
+/// alone; see `tests/installer_integrity.rs` for what is and is not covered.
+#[cfg(not(target_os = "windows"))]
+const UNIX_UPDATE_SHELL_COMMAND: &str = concat!(
+    "set -e\n",
+    "tmp=$(mktemp -d)\n",
+    "trap 'rm -rf \"$tmp\"' EXIT\n",
+    "curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh",
+    " -o \"$tmp/install.sh\"\n",
+    "bash \"$tmp/install.sh\"\n",
+);
+
 fn run_update_command() -> Result<(), String> {
     println!("Running ask-bridge update via official installer...");
     println!("Progress: downloading installer and updating binary.");
@@ -1498,10 +1520,7 @@ fn run_update_command() -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     let status = Command::new("sh")
-        .args([
-            "-c",
-            "curl -fsSL https://raw.githubusercontent.com/doggy8088/ask-bridge/main/install.sh | bash",
-        ])
+        .args(["-c", UNIX_UPDATE_SHELL_COMMAND])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -3526,6 +3545,49 @@ fn parse_script_result(val: &Value) -> Result<Value, String> {
     Err("Could not find JSON fencing in script result".to_string())
 }
 
+/// The image bytes in a `take_screenshot` response, or why there are none.
+///
+/// `Err` is the point. `ask-bridge screenshot` exists to leave a file behind,
+/// and its caller is a script that checks the exit status and then reads
+/// `target/screenshot.png` back. Printing "no image" and exiting 0 makes that
+/// script read whatever the *previous* run left there -- or nothing at all --
+/// and call it this run's screenshot.
+///
+/// The error says what was wrong with the response and never quotes the
+/// response: a screenshot reply is the base64 of a logged-in page, and it is
+/// the last thing that should be echoed into a CI log.
+fn screenshot_png_bytes(res: &Value) -> Result<Vec<u8>, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let mut images = 0usize;
+    let mut last_error: Option<String> = None;
+    if let Some(arr) = res.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            let Some(data) = item
+                .get("type")
+                .filter(|t| t.as_str() == Some("image"))
+                .and_then(|_| item.get("data"))
+                .and_then(|d| d.as_str())
+            else {
+                continue;
+            };
+            images += 1;
+            match STANDARD.decode(data.trim()) {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => last_error = Some(e.to_string()),
+            }
+        }
+    }
+
+    Err(match last_error {
+        Some(e) => format!(
+            "take_screenshot returned {} image item(s) and none of them decoded as base64: {}",
+            images, e
+        ),
+        None => "take_screenshot returned no image content".to_string(),
+    })
+}
+
 fn tool_text(val: &Value) -> Result<String, String> {
     val.get("content")
         .and_then(|c| c.as_array())
@@ -4456,6 +4518,90 @@ mod tests {
                 "--flag-a",
                 "--flag-b"
             ]
+        );
+    }
+
+    /// `ask-bridge update` overwrites the binary the user runs, so what the
+    /// download does when it goes wrong is the whole story.
+    ///
+    /// `curl -fsSL ... | bash` starts the shell before the body has finished
+    /// arriving. A connection that dies half way through therefore executes
+    /// half an installer -- far enough to have deleted or replaced things --
+    /// and the pipeline's exit status is bash's, so the command reports
+    /// success and the caller never learns the update was partial. The stub
+    /// `curl` below is exactly that: it emits an installer prefix and exits
+    /// non-zero.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_download_that_dies_half_way_through_is_never_executed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub_dir = dir.path().join("stub-bin");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let marker = dir.path().join("installer-ran");
+
+        // Writes to the `-o` destination when asked for one, to stdout when
+        // not -- i.e. it plays along with either shape of update command, so
+        // this test cannot pass merely because the flags changed.
+        let stub = r#"#!/bin/sh
+dest=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then dest="$a"; fi
+  prev="$a"
+done
+payload="touch '__MARKER__'"
+if [ -n "$dest" ]; then
+  printf '%s\n' "$payload" > "$dest"
+else
+  printf '%s\n' "$payload"
+fi
+exit "${CURL_EXIT:-1}"
+"#
+        .replace("__MARKER__", marker.to_str().unwrap());
+        let curl = stub_dir.join("curl");
+        std::fs::write(&curl, stub).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |curl_exit: &str| -> bool {
+            let _ = std::fs::remove_file(&marker);
+            std::process::Command::new("sh")
+                .args(["-c", UNIX_UPDATE_SHELL_COMMAND])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        stub_dir.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("CURL_EXIT", curl_exit)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("sh should be available")
+                .success()
+        };
+
+        assert!(
+            !run("1"),
+            "a download that failed reported the update as successful"
+        );
+        assert!(
+            !marker.exists(),
+            "the truncated installer body was executed"
+        );
+
+        // Positive control: a download that completes still installs, so the
+        // guard is not satisfied by refusing to run anything.
+        assert!(
+            run("0"),
+            "a successful download must still run the installer"
+        );
+        assert!(
+            marker.exists(),
+            "the downloaded installer was never executed"
         );
     }
 
@@ -7349,6 +7495,42 @@ mod tests {
         );
     }
 
+    /// [`created_page_id`] answers a different question from [`fresh_page_ids`]
+    /// -- "which of these did *this* client's `new_page` open" -- and each of
+    /// its three answers is a decision the caller acts on.
+    #[test]
+    fn created_page_id_reads_the_selection_new_page_moved() {
+        // The fresh tab this client selected, even though the *other* fresh tab
+        // is the one that reads back as the provider's.
+        let after = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: https://auth.openai.com/authorize?x=1 [selected]\n",
+            "3: https://chatgpt.com/c/other\n",
+        ));
+        assert_eq!(created_page_id(&[1], &after), Some(2));
+
+        // A tab that was already there is not one this run created, however
+        // firmly the listing says it is selected.
+        let stale = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://chatgpt.com/c/old [selected]\n",
+            "2: https://chatgpt.com/\n",
+        ));
+        assert_eq!(created_page_id(&[1], &stale), None);
+
+        // `[selected]` is prose, and an untitled `data:` URL can end in it, so
+        // a page can forge a second claim. Two claimants is "cannot identify",
+        // never "take the first" -- the forged one sorts first here.
+        let forged = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: data:text/html,x [selected]\n",
+            "3: https://chatgpt.com/ [selected]\n",
+        ));
+        assert_eq!(created_page_id(&[1], &forged), None);
+    }
+
     /// Two ask-bridge runs against the same Chrome each get their own
     /// chrome-devtools-mcp child, but the browser's page-ID space is shared. So
     /// a run that opens its tab while the other run is opening one sees *two*
@@ -7434,6 +7616,91 @@ mod tests {
             Some(2),
             "the run must still pin the tab it opened"
         );
+    }
+
+    /// The ambiguity guard above only fires when *both* fresh tabs read back as
+    /// the provider's. Two concurrent runs do not have to be in step, and the
+    /// asymmetric interleaving is the common one:
+    ///
+    /// 1. this run's own tab is created but is still blank / mid-redirect / on
+    ///    the auth host when the listing is taken;
+    /// 2. the other run's tab, opened a moment earlier, has already settled on
+    ///    the provider;
+    /// 3. so exactly *one* fresh ID is provider-owned -- the other run's.
+    ///
+    /// `owned_fresh.len() > 1` never fires, [`fresh_page_ids`] hands back that
+    /// single "owned" ID as if it were an answer, and the run pins the other
+    /// run's conversation. Pinning is not a hint either: it is what the
+    /// readiness re-focus goes back to, and it *suppresses* the origin check at
+    /// the return, so every prompt, copy and artifact from there on lands in
+    /// the other run's tab with nothing left to notice.
+    ///
+    /// Provider-URL matching cannot tell "this run opened it" from "it happens
+    /// to be on the provider". Only the listing `new_page` echoed back to
+    /// *this* client can, because that client's own selection is what
+    /// `new_page` moved -- see [`created_page_id`].
+    #[test]
+    fn a_fresh_provider_tab_this_run_did_not_open_is_never_pinned() {
+        for force_new in [false, true] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            // This run's tab: created, selected, still on the sign-in host.
+            fake.new_page_lands_on = Some("https://auth.openai.com/authorize?x=1".to_string());
+            // The other run's tab: already loaded, never selected here.
+            fake.new_page_also_opens = Some("https://chatgpt.com/c/other".to_string());
+            // Reach the attempt-10 re-focus, so that a run which did pin the
+            // wrong tab is caught driving it rather than merely naming it.
+            fake.not_ready_probes = 10;
+
+            let err = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                force_new,
+                true,
+                false,
+                Duration::ZERO,
+            )
+            .expect_err(&format!(
+                "expected a refusal, got Ok (force_new={force_new})"
+            ));
+
+            assert!(
+                err.contains("refusing") && err.contains("(ID: 3)"),
+                "the error must refuse and name the tab it would have driven (force_new={force_new}): {err}"
+            );
+            assert!(
+                !fake.page_ids_for("select_page").contains(&3),
+                "the tab this run did not open was driven (force_new={force_new}): {:?}",
+                fake.page_ids_for("select_page")
+            );
+        }
+
+        // Positive control: the same sign-in landing with no second run in the
+        // browser still pins this run's own tab and proceeds, so the refusal
+        // above is keyed on the collision and not on the redirect.
+        for force_new in [false, true] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_lands_on = Some("https://auth.openai.com/authorize?x=1".to_string());
+            fake.not_ready_probes = 10;
+
+            let result = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                force_new,
+                true,
+                false,
+                Duration::ZERO,
+            );
+
+            assert!(
+                result.is_ok(),
+                "a sign-in redirect must still reach the login check (force_new={force_new}): {result:?}"
+            );
+            assert_eq!(
+                fake.selected,
+                Some(2),
+                "the run must stay on the tab it opened (force_new={force_new})"
+            );
+        }
     }
 
     /// While waiting for the page to load, the periodic re-focus must go back
@@ -8680,6 +8947,107 @@ mod tests {
                  nonzero exit to disown"
             );
         }
+    }
+
+    /// `ask-bridge screenshot` has the same contract as `--image-output` above,
+    /// and used to break it the same way: a response with no image item, or
+    /// with image items that are not decodable base64, printed a line to stderr
+    /// and returned `Ok`. The caller checks the status and reads
+    /// `target/screenshot.png`, so exit 0 hands it the file the *previous* run
+    /// left there.
+    ///
+    /// The stderr line was its own problem: it dumped the whole tool response,
+    /// which for `take_screenshot` is the base64 of a logged-in page.
+    #[test]
+    fn a_screenshot_response_with_no_usable_image_is_a_failure() {
+        // Stands in for the page contents a real response carries.
+        let secret = "session-cookie-abc123";
+
+        for (res, why) in [
+            (
+                serde_json::json!({"content": [{"type": "text", "text": secret}]}),
+                "no image item at all",
+            ),
+            (
+                serde_json::json!({"content": [
+                    {"type": "image", "data": "not base64 %%%", "mimeType": "image/png"},
+                    {"type": "text", "text": secret},
+                ]}),
+                "the only image item is not base64",
+            ),
+            (serde_json::json!({}), "no content array"),
+        ] {
+            let error = screenshot_png_bytes(&res)
+                .expect_err(&format!("reported success with no image ({why})"));
+            assert!(
+                error.contains("take_screenshot"),
+                "the failure must name the step that produced nothing ({why}): {error}"
+            );
+            assert!(
+                !error.contains(secret),
+                "the tool response was echoed back out ({why}): {error}"
+            );
+        }
+    }
+
+    /// Positive control for the above, and the shape the fix could most easily
+    /// have broken: the first decodable image is still what gets written, even
+    /// when an undecodable item comes first.
+    #[test]
+    fn a_decodable_screenshot_is_still_returned() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let png = b"\x89PNG\r\n\x1a\nnot really a png";
+        let res = serde_json::json!({"content": [
+            {"type": "text", "text": "Took a screenshot."},
+            {"type": "image", "data": "%%%", "mimeType": "image/png"},
+            {"type": "image", "data": STANDARD.encode(png), "mimeType": "image/png"},
+        ]});
+
+        assert_eq!(screenshot_png_bytes(&res).unwrap(), png);
+    }
+
+    /// Lexical, for the same reason as `a_refused_session_aborts_the_run`: the
+    /// behaviour above is covered by the two tests before it, but what `main`
+    /// does with the `Err` is a single `?` inside a 700-line `fn main` that no
+    /// offline end-to-end run can reach (the arm needs a live chrome-devtools
+    /// MCP session first). Swallowing it -- `unwrap_or_default()`, or the
+    /// original `if !saved { eprintln!(..) }` -- puts exit 0 straight back.
+    #[test]
+    fn the_screenshot_arm_propagates_the_failure_instead_of_printing_it() {
+        // Split literals keep this test from matching its own source text.
+        let source = include_str!("main.rs");
+        let arm = source
+            .split_once(concat!("Commands::", "Screenshot => {"))
+            .expect("main should route `screenshot` through its own arm")
+            .1;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, character) in arm.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' if depth == 0 => {
+                    end = Some(offset);
+                    break;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let arm = &arm[..end.expect("the screenshot arm must be brace-balanced")];
+
+        assert!(
+            arm.contains(concat!("screenshot_png_bytes(&res)", "?")),
+            "the screenshot arm no longer lets a missing image end the run:\n{arm}"
+        );
+        // The one print the arm may still make is the tab-preparation failure,
+        // which aborts. What it may not do is format the tool response: that is
+        // how the base64 of a logged-in page got into stderr, and both spellings
+        // of the dump go through a debug placeholder.
+        assert!(
+            !arm.contains("{:?}") && !arm.contains("{res"),
+            "the screenshot arm formats the tool response back out instead of \
+             failing on it:\n{arm}"
+        );
     }
 
     /// Under an explicit destination the batch is all-or-nothing: one unusable
@@ -12422,6 +12790,42 @@ fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> V
     fresh
 }
 
+/// The fresh tab **this** run's `new_page` created, named causally rather than
+/// by what its URL looks like.
+///
+/// [`fresh_page_ids`] answers "which new tab is on the provider", and that is
+/// not the same question. Two ask-bridge runs share the browser's page-ID
+/// space, so when the other run's tab has already settled on the provider and
+/// this run's is still blank, mid-redirect or on the auth host, the only
+/// provider-owned fresh ID is the *other* run's -- an answer that reads
+/// unambiguous and is wrong in the one way that matters.
+///
+/// The causal fact is in the listing this client got back. In
+/// chrome-devtools-mcp 1.5.0 -- the version [`MCP_PACKAGE_SPEC`] pins -- the
+/// `new_page` handler calls `context.newPage()` (tools/pages.js), which ends
+/// `this.selectPage(this.#getMcpPage(page))` (McpContext.js:210), and the
+/// response it echoes marks that page `[selected]` (McpResponse.js:666, via
+/// `isPageSelected`, McpContext.js:387). `#selectedPage` lives on the
+/// `McpContext` and is compared by page identity, so it is per-connection and
+/// index-free: each ask-bridge run drives its own chrome-devtools-mcp child, and
+/// a tab another child opened is never `[selected]` in this one's listing.
+///
+/// A page whose line ends in a forged `[selected]` (an untitled `data:` URL can
+/// carry one, see `parse_pages`) does not turn this into a guess either: two
+/// claimants is `None`, which the caller must treat as "cannot identify", not as
+/// "pick one".
+fn created_page_id(before_ids: &[usize], after: &[Page]) -> Option<usize> {
+    let claimants: Vec<usize> = after
+        .iter()
+        .filter(|p| p.selected && !before_ids.contains(&p.id))
+        .map(|p| p.id)
+        .collect();
+    match claimants.as_slice() {
+        [id] => Some(*id),
+        _ => None,
+    }
+}
+
 /// Close `ids`, returning `(id, error)` for each tab that refused to close.
 ///
 /// Closing is best effort -- a tab that will not close is no longer a hazard
@@ -12797,14 +13201,18 @@ where
         // never reuses them, so "the ID that was not there before" identifies
         // the tab just opened exactly. `new_page` echoes the page list; if a
         // build ever stops doing that, ask again before anything is closed.
-        let mut fresh = pages_from_tool_result(&new_page_res, "new_page")
-            .map(|after| fresh_page_ids(&before_ids, &after, provider))
-            .unwrap_or_default();
+        let mut after = pages_from_tool_result(&new_page_res, "new_page").unwrap_or_default();
+        let mut fresh = fresh_page_ids(&before_ids, &after, provider);
         if fresh.len() != 1 {
             let listed = call("list_pages", serde_json::json!({}))?;
-            let after = pages_from_tool_result(&listed, "list_pages")?;
+            after = pages_from_tool_result(&listed, "list_pages")?;
             fresh = fresh_page_ids(&before_ids, &after, provider);
         }
+        // Which of those IDs this run actually opened, read off the same
+        // listing the IDs came from -- `new_page` moved *this* client's
+        // selection onto the tab it created, and nothing between here and there
+        // moves it back.
+        let created = created_page_id(&before_ids, &after);
         let new_page_id = match fresh.as_slice() {
             [id] => *id,
             _ => {
@@ -12815,6 +13223,19 @@ where
                 ));
             }
         };
+        // ...and the ID that survived that must be the ID this run was told it
+        // created. `--new` closes tabs around the one it pins, so the
+        // asymmetric two-run interleaving (this run's tab still blank, the
+        // other run's already on the provider) would otherwise pin the other
+        // run's conversation *and* dispose of this run's own tab as debris.
+        if created != Some(new_page_id) {
+            return Err(format!(
+                "The new {} tab (ID: {}) is not the tab this run opened (opened: {:?}); another ask-bridge run is most likely driving the same browser, so refusing to drive a tab that may be its conversation",
+                provider.display_name(),
+                new_page_id,
+                created
+            ));
+        }
 
         let doomed: Vec<usize> = disposable_ids
             .into_iter()
@@ -12936,6 +13357,9 @@ where
                         after = pages_from_tool_result(&listed, "list_pages")?;
                         fresh = fresh_page_ids(&before_ids, &after, provider);
                     }
+                    // See [`created_page_id`]: which of those IDs this run
+                    // opened, read off the same listing the IDs came from.
+                    let created = created_page_id(&before_ids, &after);
                     // Two fresh tabs that are *both* this provider's is the
                     // shape a second ask-bridge run makes: each run has its own
                     // chrome-devtools-mcp child, but they share the browser's
@@ -12965,6 +13389,25 @@ where
                         [id] => Some(*id),
                         _ => None,
                     };
+                    // The asymmetric shape of the same collision, which the
+                    // guard above cannot see because one is not "more than
+                    // one": this run's own tab is still blank, mid-redirect or
+                    // on the auth host while the other run's has already
+                    // settled on the provider, so the single provider-owned
+                    // fresh ID *is* the other run's. Pinning is a commitment to
+                    // drive that tab from here on -- it even suppresses the
+                    // origin check at the return -- so it may only ever name
+                    // the tab this run was told it created.
+                    if let Some(id) = opened_id
+                        && created != Some(id)
+                    {
+                        return Err(format!(
+                            "The only fresh {} tab (ID: {}) is not the tab this run opened (opened: {:?}); another ask-bridge run is most likely driving the same browser, so refusing to type the prompt into a tab that may be its conversation",
+                            provider.display_name(),
+                            id,
+                            created
+                        ));
+                    }
 
                     // Reaching here means no provider tab was found, which is
                     // also what happens when the previous run's tab drifted to
@@ -13620,37 +14063,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let res = call_mcp_tool(&config_path, "take_screenshot", serde_json::json!({}))?;
 
-                let mut saved = false;
-                if let Some(arr) = res.get("content").and_then(|c| c.as_array()) {
-                    for item in arr {
-                        if let Some(data) = item
-                            .get("type")
-                            .filter(|t| t.as_str() == Some("image"))
-                            .and_then(|_| item.get("data"))
-                            .and_then(|d| d.as_str())
-                        {
-                            use base64::{Engine as _, engine::general_purpose::STANDARD};
-                            match STANDARD.decode(data.trim()) {
-                                Ok(bytes) => {
-                                    std::fs::create_dir_all("target").unwrap();
-                                    std::fs::write("target/screenshot.png", bytes)?;
-                                    println!("Saved screenshot to target/screenshot.png");
-                                    saved = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to decode base64 image data: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-                if !saved {
-                    eprintln!(
-                        "Could not find any image item in the tool response content. Full response: {:?}",
-                        res
-                    );
-                }
+                let bytes = screenshot_png_bytes(&res)?;
+                std::fs::create_dir_all("target")?;
+                std::fs::write("target/screenshot.png", bytes)?;
+                println!("Saved screenshot to target/screenshot.png");
                 return Ok(());
             }
         }

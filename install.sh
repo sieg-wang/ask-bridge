@@ -79,13 +79,53 @@ mkdir -p "$INSTALL_DIR"
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
+# Fetch <url> to <dest> with whichever downloader is present. `-f` matters: a
+# 404 or a proxy error page must not be written out as if it were the archive.
+download_file() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget "$1" -O "$2"
+    else
+        echo -e "${RED}Error: Neither curl nor wget was found. Please install one of them to proceed.${NC}"
+        exit 1
+    fi
+}
+
+# Compare the downloaded archive against the SHA-256 the release workflow
+# published beside it (release.yml, "Package binary" -> "$archive.sha256").
+#
+# This installer overwrites the binary the user runs, and `ask-bridge update`
+# runs it unattended, so "whatever the download produced" is not good enough: a
+# mirror, a caching proxy or a truncated body would be installed and reported as
+# a success. npm/postinstall.cjs already verifies the same checksum for the same
+# archive; this is that check, on the path the update command actually takes.
+#
+# Fails closed by construction: anything that does not produce the archive's
+# real digest -- a missing hashing tool, an unreadable file, an error page saved
+# where the checksum should be -- fails the comparison rather than skipping it.
+verify_release_checksum() {
+    archive="$1"
+    checksum_file="$2"
+    expected=$(awk 'NR==1{print tolower($1)}' "$checksum_file")
+    # A checksum file that says nothing must not agree with an archive that
+    # could not be hashed: "" = "" is the one way two unknowns compare equal.
+    [ -n "$expected" ] || return 1
+    if command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$archive" | awk '{print tolower($1)}')
+    else
+        actual=$(sha256sum "$archive" | awk '{print tolower($1)}')
+    fi
+    [ "$actual" = "$expected" ]
+}
+
 echo -e "${CYAN}Downloading ${ARTIFACT_NAME}...${NC}"
-if command -v curl >/dev/null 2>&1; then
-    curl -L "$RELEASE_URL" -o "$TEMP_DIR/$ARTIFACT_NAME"
-elif command -v wget >/dev/null 2>&1; then
-    wget "$RELEASE_URL" -O "$TEMP_DIR/$ARTIFACT_NAME"
-else
-    echo -e "${RED}Error: Neither curl nor wget was found. Please install one of them to proceed.${NC}"
+download_file "$RELEASE_URL" "$TEMP_DIR/$ARTIFACT_NAME"
+download_file "${RELEASE_URL}.sha256" "$TEMP_DIR/${ARTIFACT_NAME}.sha256"
+
+echo -e "${CYAN}Verifying SHA-256 checksum...${NC}"
+if ! verify_release_checksum "$TEMP_DIR/$ARTIFACT_NAME" "$TEMP_DIR/${ARTIFACT_NAME}.sha256"; then
+    echo -e "${RED}Error: SHA-256 verification failed for ${ARTIFACT_NAME}. Refusing to install.${NC}"
     exit 1
 fi
 
