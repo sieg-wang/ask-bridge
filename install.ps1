@@ -140,6 +140,69 @@ function Assert-WindowsExecutable {
     }
 }
 
+# Compare the downloaded archive against the SHA-256 the release workflow
+# published beside it (release.yml, "Package binary" -> "$archive.sha256" --
+# that step runs for every target, so the Windows .zip has one too).
+#
+# This is the Windows half of the guarantee `verify_release_checksum` in
+# install.sh gives on macOS/Linux. `ask-bridge update` runs one installer or the
+# other unattended and both overwrite the binary the user then runs, so neither
+# path may install "whatever the download produced": a mirror, a caching proxy
+# or a truncated body would land and be reported as a success. Until 2026-08-14
+# this script had no checksum check of any kind while install.sh did, so the
+# security claim covered exactly one of the two supported platforms.
+#
+# Fails closed by construction: the expected digest must be 64 hex characters
+# *before* it is compared to anything, so an empty checksum file, a truncated
+# digest, or a "404: Not Found" page saved where the checksum should be throws
+# rather than being read as agreement. ("" -eq "" is the one way two unknowns
+# compare equal, which is the bug the format guard exists to prevent.)
+#
+# What it is NOT -- stated here so the Windows path does not inherit a
+# stronger-sounding claim than it has, the same limitation install.sh states:
+# the checksum comes from the same host, over the same connection, as the
+# archive it describes. It catches a body that changed on the way here --
+# corruption, truncation, a stale mirror, a caching proxy -- and nothing more.
+# Anyone who can serve the archive can serve a matching .sha256, so this is not
+# a defence against a compromised release host or a broken TLS path; that needs
+# a signature checkable against a key the installer did not just download, which
+# upstream does not publish. It also says nothing about *this script*, which
+# `ask-bridge update` still fetches with `irm ... | iex`; see
+# `known_gap_the_windows_updater_pipes_the_installer_into_powershell` in
+# tests/installer_integrity.rs.
+#
+# What TESTS this, and what they cannot see: `install_ps1_verifies_the_
+# published_checksum_before_it_extracts` and `install_ps1_checksum_gate_refuses_
+# instead_of_warning` (tests/installer_integrity.rs) read this file as text.
+# install.sh's equivalent has more than that -- an offline end-to-end run that
+# executes the installer and looks at the bytes on disk -- and this path does
+# not, because there is no PowerShell on the machine this was written on, so an
+# executable Windows test could only have been shipped unrun. The consequence is
+# specific and worth stating rather than hedging: a mutation that keeps the text
+# and disables the effect -- `if ($false -and $actual -ne $expected)` -- passes
+# every assertion those two tests make. Closing it needs a Windows runner step
+# that runs `Assert-ReleaseChecksum` against a matching and a mismatching file.
+function Assert-ReleaseChecksum {
+    param(
+        [Parameter(Mandatory)] [string] $Archive,
+        [Parameter(Mandatory)] [string] $ChecksumPath
+    )
+
+    $checksumText = Get-Content -Path $ChecksumPath -Raw -ErrorAction Stop
+    $expected = ""
+    if ($checksumText) {
+        $expected = ($checksumText.Trim() -split '\s+')[0].ToLowerInvariant()
+    }
+    if ($expected -notmatch '^[a-f0-9]{64}$') {
+        throw "Checksum file '$ChecksumPath' does not contain a SHA-256 digest. Refusing to install '$Archive'."
+    }
+
+    $actual = (Get-FileHash -Path $Archive -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "SHA-256 verification failed for '$Archive': expected $expected, got $actual. Refusing to install."
+    }
+}
+
 function Confirm-AskBridgeBinary {
     param(
         [Parameter(Mandatory)] [string] $Path
@@ -354,12 +417,19 @@ if (Test-Path $TempDir) {
 New-Item -ItemType Directory -Path $TempDir | Out-Null
 
 try {
-    # 5. Download zip
+    # 5. Download zip and the checksum published beside it
     Write-Host "Downloading $ArtifactName..." -ForegroundColor Cyan
     $ZipPath = Join-Path $TempDir $ArtifactName
+    $ChecksumPath = "${ZipPath}.sha256"
     Invoke-WebRequest -Uri $ReleaseUrl -OutFile $ZipPath
+    Invoke-WebRequest -Uri "${ReleaseUrl}.sha256" -OutFile $ChecksumPath
 
-    # 6. Extract zip
+    # 6. Verify before extracting. Refusing after Expand-Archive has run and the
+    # binaries have been copied over $InstallDir is too late to be a refusal.
+    Write-Host "Verifying SHA-256 checksum..." -ForegroundColor Cyan
+    Assert-ReleaseChecksum -Archive $ZipPath -ChecksumPath $ChecksumPath
+
+    # 7. Extract zip
     Write-Host "Extracting archive..." -ForegroundColor Cyan
     Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
 
@@ -398,7 +468,7 @@ finally {
     }
 }
 
-# 7. Put the verified installation first in PATH and ensure command resolution.
+# 8. Put the verified installation first in PATH and ensure command resolution.
 Write-Host "Putting $InstallDir first in User PATH..." -ForegroundColor Cyan
 Set-AskBridgePathPriority -InstallDir $InstallDir
 Confirm-AskBridgeCommandResolution -ExpectedPath $DestPath

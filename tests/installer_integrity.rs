@@ -1,6 +1,6 @@
-//! `install.sh` is what `ask-bridge update` runs, and what it does is overwrite
-//! the binary the user then runs. Two properties of that chain are load-bearing
-//! and neither was checked anywhere:
+//! `install.sh` and `install.ps1` are what `ask-bridge update` runs, and what
+//! they do is overwrite the binary the user then runs. Two properties of that
+//! chain are load-bearing and neither was checked anywhere:
 //!
 //! 1. the release archive is verified against the SHA-256 the release workflow
 //!    already publishes beside it (`release.yml`, "Package binary") before the
@@ -9,8 +9,54 @@
 //! 2. the updater does not pipe a downloaded script straight into a shell,
 //!    where a body that stops half way through is executed as far as it got and
 //!    the pipeline still reports the shell's exit status, not the download's.
+//!
+//! There are TWO installers and property 1 was added to one of them first, so
+//! read the coverage here as two unequal halves rather than one guarantee:
+//!
+//! * `install.sh` is covered by an offline end-to-end run
+//!   (`install_sh_leaves_the_existing_binary_alone_when_...`) that executes the
+//!   real script and inspects the bytes on disk, so disabling the gate in place
+//!   is caught;
+//! * `install.ps1` is covered by text alone (`install_ps1_*`), because there is
+//!   no PowerShell on the machine this was written on. See the comment on
+//!   `Assert-ReleaseChecksum` in install.ps1 for the exact mutation that
+//!   survives on that side.
+//!
+//! Property 2 is likewise one-sided: `no_updater_path_pipes_a_download_into_a_
+//! shell` forbids `| bash`, and the Windows arm still does `irm ... | iex`,
+//! pinned as a known gap rather than fixed.
 
 const INSTALL_SH: &str = include_str!("../install.sh");
+const INSTALL_PS1: &str = include_str!("../install.ps1");
+
+/// The digest of `path`, computed the way `install.sh` computes it: `shasum`
+/// if it is there, `sha256sum` otherwise.
+///
+/// Mirroring the installer's own fallback is the point. Hard-requiring
+/// `shasum` makes the test stricter than the code it covers, and on a runner
+/// that ships only `sha256sum` it fails as though the installer were broken.
+#[cfg(unix)]
+fn sha256_of(path: &std::path::Path) -> String {
+    use std::process::Command;
+
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .or_else(|_| Command::new("sha256sum").arg(path).output())
+        .expect("one of shasum/sha256sum must exist -- install.sh needs one too");
+    assert!(
+        output.status.success(),
+        "hashing {} failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    text.split_whitespace()
+        .next()
+        .expect("the hashing tool printed no digest")
+        .to_string()
+}
 
 /// Everything the checksum gate needs, pulled out of the shipped `install.sh`
 /// so the test runs the real function body rather than a copy of it.
@@ -43,14 +89,7 @@ fn install_sh_refuses_an_archive_that_does_not_match_the_published_checksum() {
     std::fs::write(&archive, b"the real release archive").unwrap();
 
     // The published checksum, computed the same way the release workflow does.
-    let good = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(&archive)
-        .output()
-        .expect("shasum should be available on unix");
-    assert!(good.status.success());
-    let digest = String::from_utf8(good.stdout).unwrap();
-    let digest = digest.split_whitespace().next().unwrap().to_string();
+    let digest = sha256_of(&archive);
 
     let script = dir.path().join("verify.sh");
     let mut file = std::fs::File::create(&script).unwrap();
@@ -225,14 +264,7 @@ esac
     let tampered = archive("tampered", TAMPERED);
 
     let published = dir.path().join("genuine.sha256");
-    let digest = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(&genuine)
-        .output()
-        .expect("shasum should be available on unix");
-    assert!(digest.status.success());
-    let digest = String::from_utf8(digest.stdout).unwrap();
-    let digest = digest.split_whitespace().next().unwrap();
+    let digest = sha256_of(&genuine);
     std::fs::write(
         &published,
         format!("{digest}  ask-bridge-x86_64-unknown-linux-gnu.tar.xz\n"),
@@ -288,10 +320,131 @@ esac
     );
 }
 
+/// `install.ps1` with its comments removed, so the assertions below read the
+/// script and not the prose describing it. This is load-bearing rather than
+/// tidy: the comment on the call site names `Expand-Archive`, which by itself
+/// is enough to invert the ordering test.
+///
+/// Whole comment lines only -- and then it *checks* that no `#` is left, so the
+/// day someone writes a trailing `# ...` this panics instead of quietly letting
+/// comment text be counted as code.
+fn powershell_code(source: &str) -> String {
+    let code: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains('#'),
+        "install.ps1 now uses `#` outside a whole-line comment, which this \
+         stripper cannot tell from code -- teach it before trusting it"
+    );
+    code
+}
+
+/// The body of `function <name> { ... }` in the shipped `install.ps1`,
+/// delimited the way the file is written: a top-level function's closing brace
+/// is the only `}` at column 0 after its header. Panics rather than returning
+/// an empty body, so a renamed or re-indented function cannot make the
+/// assertions below vacuously true.
+fn powershell_function(source: &str, name: &str) -> String {
+    let header = format!("\nfunction {name} {{\n");
+    let body = source
+        .split_once(&header)
+        .unwrap_or_else(|| panic!("install.ps1 no longer defines function {name}"))
+        .1;
+    let end = body.find("\n}\n").unwrap_or_else(|| {
+        panic!("function {name} in install.ps1 is not brace-balanced at column 0")
+    });
+    body[..end].to_string()
+}
+
+/// The Windows half of the same gate. Until 2026-08-14 `install.ps1` had no
+/// checksum check of any kind -- `grep -inE 'hash|digest|sha' install.ps1`
+/// returned nothing -- while `install.sh` had one, so a guarantee that read as
+/// "the installer verifies the release" held on exactly one of the two
+/// platforms `ask-bridge update` installs on.
+///
+/// Verifying after `Expand-Archive` has run and the binaries have been copied
+/// over `$InstallDir` is not a refusal, so the order is part of the property.
+#[test]
+fn install_ps1_verifies_the_published_checksum_before_it_extracts() {
+    let code = powershell_code(INSTALL_PS1);
+    let archive = code
+        .find("Invoke-WebRequest -Uri $ReleaseUrl -OutFile $ZipPath")
+        .expect("install.ps1 must still download the release archive");
+    let checksum = code
+        .find("\"${ReleaseUrl}.sha256\"")
+        .expect("install.ps1 must download the .sha256 the release workflow publishes");
+    let verify = code
+        .find("Assert-ReleaseChecksum -Archive")
+        .expect("install.ps1 must check the archive against the published SHA-256");
+    let extract = code
+        .find("Expand-Archive")
+        .expect("install.ps1 must still extract the archive");
+
+    assert!(
+        archive < verify && checksum < verify && verify < extract,
+        "install.ps1 must download the archive and its checksum, then verify, \
+         then extract (offsets: archive {archive}, checksum {checksum}, \
+         verify {verify}, extract {extract})"
+    );
+}
+
+/// A verification that prints and carries on is not a verification. This looks
+/// at the gate's body for the two shapes that make it one -- reject the digest
+/// on format *before* comparing it, and `throw` on both branches -- because the
+/// ordering test above cannot see either.
+///
+/// Text only, and deliberately not dressed up as more: no PowerShell exists on
+/// the machine this was written on, so `install.sh`'s trick of executing the
+/// real installer against stubbed downloads has no counterpart here. A mutation
+/// that keeps the text and disables the effect (`if ($false -and $actual -ne
+/// $expected)`) satisfies every assertion below.
+#[test]
+fn install_ps1_checksum_gate_refuses_instead_of_warning() {
+    let body = powershell_function(&powershell_code(INSTALL_PS1), "Assert-ReleaseChecksum");
+
+    assert!(
+        body.contains("Get-FileHash") && body.contains("SHA256"),
+        "install.ps1 no longer hashes the archive it is about to install:\n{body}"
+    );
+    assert!(
+        body.contains("$actual -ne $expected"),
+        "install.ps1 no longer compares the archive's digest with the published \
+         one:\n{body}"
+    );
+    // An empty checksum file, a truncated digest and a "404: Not Found" page
+    // saved where the checksum should be all have to fail on shape, before the
+    // comparison: "" -eq "" is the one way two unknowns compare equal.
+    assert!(
+        body.contains("-notmatch '^[a-f0-9]{64}$'"),
+        "install.ps1 no longer requires the published checksum to *be* a SHA-256 \
+         before trusting a match:\n{body}"
+    );
+    assert!(
+        body.matches("throw").count() >= 2,
+        "both the malformed-checksum branch and the mismatch branch must end the \
+         install; one of them no longer throws:\n{body}"
+    );
+    for spelling in ["Write-Host", "Write-Warning", "Write-Error", "return"] {
+        assert!(
+            !body.contains(spelling),
+            "the checksum gate reports a failure with `{spelling}` instead of \
+             refusing, so install.ps1 would carry on and overwrite the user's \
+             binary with the archive it just rejected:\n{body}"
+        );
+    }
+}
+
 /// `curl ... | bash` hands the shell whatever arrived. A connection that drops
 /// half way through delivers half a script, which bash runs as far as it got --
 /// and the pipeline's exit status is bash's, so the update reports success.
 /// Downloading to a file first makes the failed download the failure.
+///
+/// This covers the Unix spelling only. The Windows arm is still
+/// `irm ... | iex`; see
+/// `known_gap_the_windows_updater_pipes_the_installer_into_powershell`.
 #[test]
 fn no_updater_path_pipes_a_download_into_a_shell() {
     for (name, source) in [
@@ -311,6 +464,44 @@ fn no_updater_path_pipes_a_download_into_a_shell() {
         assert!(
             !code.contains("| bash"),
             "{name} still pipes a downloaded installer straight into a shell"
+        );
+    }
+}
+
+/// Known gap, disclosed rather than closed: on Windows `ask-bridge update`
+/// still runs `powershell -NoProfile -Command "irm .../install.ps1 | iex"`
+/// (src/update.rs and the inline fallback in src/main.rs). That is the same
+/// pattern the test above forbids -- a body that stops half way through is
+/// executed as far as it got, and the exit status reported is PowerShell's,
+/// not the download's -- and the checksum `Assert-ReleaseChecksum` now verifies
+/// says nothing about it, because it covers the *archive* that script fetches,
+/// not the script.
+///
+/// Not closed here for one reason, stated plainly: the replacement is
+/// PowerShell that downloads to a file and runs the file, and there is no
+/// PowerShell on the machine this was written on to run it even once. Shipping
+/// an unrun rewrite of the update path is worse than shipping a pinned gap.
+///
+/// This asserts today's behaviour so it cannot change unnoticed in either
+/// direction. A failure means the gap was closed -- rewrite this test and move
+/// `| iex` into `no_updater_path_pipes_a_download_into_a_shell` beside
+/// `| bash`; do not delete it.
+#[test]
+fn known_gap_the_windows_updater_pipes_the_installer_into_powershell() {
+    for (name, source) in [
+        ("src/main.rs", include_str!("../src/main.rs")),
+        ("src/update.rs", include_str!("../src/update.rs")),
+    ] {
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("install.ps1 | iex"),
+            "{name} no longer pipes the Windows installer into PowerShell -- \
+             the gap this test exists to disclose is closed, so rewrite it to \
+             forbid `| iex` rather than deleting it"
         );
     }
 }
