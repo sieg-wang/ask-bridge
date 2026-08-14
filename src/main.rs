@@ -6562,6 +6562,48 @@ exit "${CURL_EXIT:-1}"
         );
     }
 
+    /// The `label.trim()` applied once the ` [selected]` suffix is peeled off.
+    ///
+    /// Pinned because it was not. The suffix carries exactly one space, so a
+    /// label padded with a second one leaves that space behind, and a URL with
+    /// a space in it is not a URL any special scheme can own
+    /// ([`is_possible_page_url`]) -- so without the trim the tab parses as
+    /// *unidentified*: not the provider's, not blank, not disposable, and out
+    /// of reach of `--new`. Removing the trim leaves the whole suite green
+    /// (checked at 784bf7f: 260 passed, 0 failed), which is why this exists.
+    ///
+    /// Honest about its own reach: chrome-devtools-mcp emits `pageLabel` plus
+    /// one space, and a `pageLabel` cannot end in a space (the URL parser
+    /// strips a trailing one, and a titled label ends in `)`), so this pins the
+    /// parser's *tolerance* rather than a shape upstream produces today. That
+    /// is what the trim is for -- one upstream spacing change would otherwise
+    /// make provider tabs silently invisible -- and defence-in-depth with no
+    /// test is indistinguishable from a line nobody meant to write.
+    #[test]
+    fn a_padded_selected_marker_still_yields_the_url() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "0: https://chatgpt.com/  [selected]\n",
+            "1: https://chatgpt.com/c/one [selected]\n",
+        ));
+
+        // Positive control: the shape upstream actually emits. A change that
+        // broke both readings could not pass this test quietly.
+        assert_eq!(
+            (pages[1].url.as_deref(), pages[1].selected),
+            (Some("https://chatgpt.com/c/one"), true),
+            "the ordinary single-space listing line stopped parsing"
+        );
+        assert_eq!(
+            (pages[0].url.as_deref(), pages[0].selected),
+            (Some("https://chatgpt.com/"), true),
+            "a label padded with a second space left that space inside the URL, \
+             so the tab is now unidentified: not the provider's, not blank, and \
+             beyond the reach of `--new`"
+        );
+        assert_eq!(provider_of(&pages[0]), Some(Provider::ChatGpt));
+    }
+
     /// The isolatedContext marker must be anchored to the grammar, not merely
     /// searched for: a page can put the literal marker in its *title*, and
     /// splitting on that would truncate the label back to attacker-chosen text
