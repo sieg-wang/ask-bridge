@@ -7837,6 +7837,85 @@ exit "${CURL_EXIT:-1}"
         }
     }
 
+    // ---------------------------------------------------------------------
+    // What the causal-identity guard does NOT cover. Both tests below assert
+    // today's behaviour so that it is disclosed and cannot change silently; a
+    // failure here means the gap was closed, and the test should be rewritten
+    // to say so rather than relaxed.
+    // ---------------------------------------------------------------------
+
+    /// `--new` disposes of a provider tab another run is using.
+    ///
+    /// The identity guard protects the tab this run *opens*. It says nothing
+    /// about the tabs `--new` clears away first, and nothing in a listing
+    /// separates "the other run's live conversation" from "a tab the user left
+    /// open", which is exactly what `--new` is documented to clear.
+    #[test]
+    fn known_gap_h10_new_disposes_of_another_runs_conversation_tab() {
+        let mut fake = FakeMcp::new(&[(1, "ChatGPT (https://chatgpt.com/c/other-run)")]);
+
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            true,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        assert_eq!(
+            fake.page_ids_for("close_page"),
+            vec![1],
+            "`--new` no longer closes a provider tab it cannot prove is stale; \
+             if that is deliberate this gap is closed and this test should be \
+             rewritten to state the new rule"
+        );
+    }
+
+    /// Every identity refusal leaks the tab it had already opened.
+    ///
+    /// The refusal happens after `new_page`, and the run cannot clean up after
+    /// itself for the same reason it is refusing: it does not know which of the
+    /// fresh tabs is its own, and closing the wrong one would take the other
+    /// run's conversation with it. The leak is not inert -- the leftover
+    /// provider tab is what the *next* run's adopt branch picks up (see the
+    /// comment on that branch), so repeated collisions make the adoption gap
+    /// more likely, not less.
+    #[test]
+    fn known_gap_h10_a_refusal_leaves_the_tab_it_opened_behind() {
+        for force_new in [false, true] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_lands_on = Some("https://auth.openai.com/authorize?x=1".to_string());
+            fake.new_page_also_opens = Some("https://chatgpt.com/c/other".to_string());
+
+            let err = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                force_new,
+                true,
+                false,
+                Duration::ZERO,
+            )
+            .expect_err(&format!(
+                "expected the identity refusal (force_new={force_new})"
+            ));
+            assert!(err.contains("refusing"), "{err}");
+
+            assert!(
+                fake.open_ids().contains(&2),
+                "the refused run cleaned up the tab it opened (force_new={force_new}); \
+                 this gap is closed and this test should be rewritten: {:?}",
+                fake.open_ids()
+            );
+            assert!(
+                fake.page_ids_for("close_page").is_empty(),
+                "a refusal closed a tab (force_new={force_new}): {:?}",
+                fake.page_ids_for("close_page")
+            );
+        }
+    }
+
     /// While waiting for the page to load, the periodic re-focus must go back
     /// to the tab this call pinned. Re-deriving "the first tab that looks like
     /// the provider" hands the session to the stale tab that failed to close.
@@ -12965,12 +13044,31 @@ fn fresh_page_ids(before_ids: &[usize], after: &[Page], provider: Provider) -> V
 /// `isPageSelected`, McpContext.js:387). `#selectedPage` lives on the
 /// `McpContext` and is compared by page identity, so it is per-connection and
 /// index-free: each ask-bridge run drives its own chrome-devtools-mcp child, and
-/// a tab another child opened is never `[selected]` in this one's listing.
+/// no *explicit* selection made by one child is visible in another's listing.
+///
+/// That is not the same as "another child's tab is never `[selected]` here",
+/// which is what an earlier version of this comment claimed. There is one
+/// implicit selection: `McpContext.createPagesSnapshot()` ends with
+///
+/// ```text
+/// if ((!this.#selectedPage || this.#pages.indexOf(...) === -1) && this.#pages[0])
+///     this.selectPage(this.#getMcpPage(this.#pages[0]));
+/// ```
+///
+/// so when this client's own selected page is *gone*, the next snapshot selects
+/// whatever is first in the list. The reachable shape: run B's `--new` closes
+/// run A's tab, and A -- having taken the second `list_pages` because the
+/// `new_page` echo was ambiguous -- gets a listing in which B's fresh tab is the
+/// first page and therefore `[selected]`, so A reads it as its own. Narrow (it
+/// needs the re-list path, B closing A's tab, and A's other tabs gone), not
+/// modelled by `FakeMcp`, and it is disclosed rather than closed: closing it
+/// needs `new_page` to name the page it created, which is an upstream change to
+/// chrome-devtools-mcp -- nothing in the response identifies it today.
 ///
 /// A page whose line ends in a forged `[selected]` (an untitled `data:` URL can
-/// carry one, see `parse_pages`) does not turn this into a guess either: two
-/// claimants is `None`, which the caller must treat as "cannot identify", not as
-/// "pick one".
+/// carry a space and the marker, see `parse_pages`) does not turn this into a
+/// guess either: two claimants is `None`, which the caller must treat as
+/// "cannot identify", not as "pick one".
 fn created_page_id(before_ids: &[usize], after: &[Page]) -> Option<usize> {
     let claimants: Vec<usize> = after
         .iter()
@@ -13381,10 +13479,17 @@ where
             }
         };
         // ...and the ID that survived that must be the ID this run was told it
-        // created. `--new` closes tabs around the one it pins, so the
-        // asymmetric two-run interleaving (this run's tab still blank, the
-        // other run's already on the provider) would otherwise pin the other
-        // run's conversation *and* dispose of this run's own tab as debris.
+        // created. Without this, the asymmetric two-run interleaving (this
+        // run's tab still blank, the other run's already on the provider) pins
+        // the other run's conversation, and everything downstream -- the
+        // readiness re-focus, the prompt, the copy -- lands there.
+        //
+        // It does *not* additionally throw away this run's own tab: probed with
+        // this guard disabled, `--new` reports `closed=[1]` -- the pre-existing
+        // blank tab -- and leaves this run's tab open. `disposable_ids` is built
+        // from `pages`, the snapshot taken before `new_page`, and page IDs are
+        // never reused, so the tab this run just opened cannot be in it. An
+        // earlier version of this comment claimed otherwise.
         if created != Some(new_page_id) {
             return Err(format!(
                 "The new {} tab (ID: {}) is not the tab this run opened (opened: {:?}); another ask-bridge run is most likely driving the same browser, so refusing to drive a tab that may be its conversation",
@@ -13416,6 +13521,15 @@ where
         )?;
         pinned_page_id = Some(new_page_id);
     } else {
+        // Known gap, disclosed rather than closed: from here down the tab is
+        // *adopted*, and adoption has no identity check at all -- only
+        // `verify_selected_page_is_provider`, which asks about the origin.
+        // A provider tab that another ask-bridge run is in the middle of using
+        // is indistinguishable from the user's own idle tab, which is the case
+        // this branch exists to reuse. The causal identity used above is
+        // unavailable by construction: it comes from this client's `new_page`,
+        // and an already-settled tab was never opened by this run. The two
+        // `known_gap_h10_*` tests below pin what that costs.
         let provider_pages: Vec<&Page> = pages
             .iter()
             .filter(|page| {
