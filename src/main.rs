@@ -9312,37 +9312,207 @@ exit "${CURL_EXIT:-1}"
             }
         }
         let arm = &arm[..end.expect("the screenshot arm must be brace-balanced")];
-        // Whole comment lines are dropped, exactly as
-        // `no_updater_path_pipes_a_download_into_a_shell` does it and for the
-        // same reason: the arm has to be allowed to *describe* what it does,
-        // and a comment quoting the `?` would otherwise satisfy every
-        // assertion below while the line beside it swallows the error.
-        let arm: String = arm
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            arm.contains(concat!("screenshot_png_bytes(&res)", "?")),
-            "the screenshot arm no longer lets a missing image end the run:\n{arm}"
-        );
-        assert!(
-            arm.contains(concat!(
-                "std::fs::write(\"target/screenshot.png\", bytes)",
-                "?"
-            )),
-            "the screenshot arm no longer lets a failed write end the run, so it \
-             can exit 0 over the file the previous run left:\n{arm}"
-        );
+        // The arm has to be allowed to *describe* what it does, so comments do
+        // not count -- but "contains, once comments are gone" was never enough
+        // on its own, because a *string literal* quoting the `?` satisfies it
+        // just as well as a comment did. The two load-bearing statements are
+        // therefore matched whole: a cloak that has to be byte-for-byte the
+        // statement, alone on its line and outside every comment, is the
+        // statement.
+        //
+        // This is deliberately brittle in one direction: if rustfmt ever wraps
+        // one of these lines, update the expected text here. Do not loosen it
+        // back to a substring match -- that is the hole, not the fix.
+        let code = rust_code_lines(arm);
+        for statement in [
+            concat!("let bytes = screenshot_png_bytes(&res)", "?;"),
+            concat!("std::fs::write(\"target/screenshot.png\", bytes)", "?;"),
+        ] {
+            assert!(
+                code.iter().any(|line| line == statement),
+                "the screenshot arm no longer ends the run on `{statement}`, so it \
+                 can exit 0 over a missing image or over the file the previous run \
+                 left:\n{code:#?}"
+            );
+        }
         // The one print the arm may still make is the tab-preparation failure,
         // which aborts. What it may not do is format the tool response: that is
         // how the base64 of a logged-in page got into stderr, and both spellings
         // of the dump go through a debug placeholder.
+        //
+        // Checked against the *raw* arm, comments included, because here more
+        // text can only make the assertion stricter. If a comment ever needs to
+        // write one of these two spellings, reword the comment -- the arm is
+        // fifteen lines and the alternative is a guard that can be talked out
+        // of firing.
         assert!(
             !arm.contains("{:?}") && !arm.contains("{res"),
             "the screenshot arm formats the tool response back out instead of \
              failing on it:\n{arm}"
+        );
+    }
+
+    /// `source` split into lines with Rust comments removed and each line
+    /// trimmed, so an assertion can require a statement to *be* a line rather
+    /// than merely appear somewhere in the text.
+    ///
+    /// String and char literals are tracked, not just skipped over. Cutting
+    /// each line at its first `//` would also cut the `//` inside
+    /// `"https://..."`, and mistaking the `'"'` char literal for the start of a
+    /// string would swallow everything after it -- both turn a guard into one
+    /// that reads the wrong text and says nothing about it.
+    ///
+    /// The sibling guard `no_updater_path_pipes_a_download_into_a_shell` still
+    /// drops whole comment lines only, and that is correct there rather than an
+    /// oversight: its assertion is `!contains`, so text left behind can only
+    /// make it fire more readily. Under-stripping is a false failure there and
+    /// a false pass here, which is why only this one needed the lexer.
+    fn rust_code_lines(source: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut block_depth = 0usize;
+        for raw in source.lines() {
+            let chars: Vec<char> = raw.chars().collect();
+            let mut code = String::new();
+            let mut i = 0usize;
+            let mut in_string = false;
+            while i < chars.len() {
+                let c = chars[i];
+                let next = chars.get(i + 1).copied();
+                if block_depth > 0 {
+                    if c == '/' && next == Some('*') {
+                        block_depth += 1;
+                        i += 2;
+                    } else if c == '*' && next == Some('/') {
+                        block_depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if in_string {
+                    code.push(c);
+                    if c == '\\' {
+                        if let Some(escaped) = next {
+                            code.push(escaped);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match (c, next) {
+                    ('/', Some('/')) => break,
+                    ('/', Some('*')) => {
+                        block_depth = 1;
+                        i += 2;
+                    }
+                    ('"', _) => {
+                        in_string = true;
+                        code.push(c);
+                        i += 1;
+                    }
+                    // `'a'`, `'\n'` and above all `'"'` are char literals;
+                    // `'static` and `&'a str` are lifetimes and must be left
+                    // alone.
+                    ('\'', _) => {
+                        let closes_at = if next == Some('\\') {
+                            chars[i + 2..]
+                                .iter()
+                                .position(|c| *c == '\'')
+                                .map(|at| i + 2 + at)
+                        } else if chars.get(i + 2) == Some(&'\'') {
+                            Some(i + 2)
+                        } else {
+                            None
+                        };
+                        match closes_at {
+                            Some(end) => {
+                                code.extend(&chars[i..=end]);
+                                i = end + 1;
+                            }
+                            None => {
+                                code.push(c);
+                                i += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        code.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            lines.push(code.trim().to_string());
+        }
+        lines
+    }
+
+    /// Positive controls for [`rust_code_lines`], including the two cloaks that
+    /// survived the whole suite before it existed. Without these the guard
+    /// above could be reading an empty string and still be green.
+    #[test]
+    fn rust_code_lines_hides_comments_and_nothing_else() {
+        // It really does return the code.
+        assert_eq!(
+            rust_code_lines("  let x = 1;  \n"),
+            vec!["let x = 1;".to_string()],
+            "the stripper dropped a line that is entirely code"
+        );
+
+        // The cloak that survived: a trailing comment quoting the statement,
+        // beside a line that swallows the error.
+        let m8 = rust_code_lines(concat!(
+            "let bytes = screenshot_png_bytes(&res).unwrap_or_default(); ",
+            "// let bytes = screenshot_png_bytes(&res)?;\n"
+        ));
+        assert!(
+            !m8.iter()
+                .any(|line| line == "let bytes = screenshot_png_bytes(&res)?;"),
+            "a trailing comment still passes for the statement it quotes: {m8:?}"
+        );
+        assert_eq!(
+            m8,
+            vec!["let bytes = screenshot_png_bytes(&res).unwrap_or_default();".to_string()],
+            "the code beside the comment was not what came back"
+        );
+
+        // The other cloak: a block comment, including the multi-line spelling
+        // in which a quoted statement is alone on its line.
+        let m15 = rust_code_lines(concat!(
+            "/* let bytes = screenshot_png_bytes(&res)?; */\n",
+            "/*\n",
+            "let bytes = screenshot_png_bytes(&res)?;\n",
+            "*/\n",
+            "let bytes = screenshot_png_bytes(&res).unwrap_or_default();\n"
+        ));
+        assert!(
+            !m15.iter()
+                .any(|line| line == "let bytes = screenshot_png_bytes(&res)?;"),
+            "a block comment still passes for the statement it quotes: {m15:?}"
+        );
+
+        // ...and it must not cut inside a literal. `//` in a URL and a `'\"'`
+        // char literal are the two that would silently truncate the code.
+        assert_eq!(
+            rust_code_lines("let u = \"https://x/y\"; // gone\n"),
+            vec!["let u = \"https://x/y\";".to_string()],
+            "the stripper cut a line at the `//` inside a string literal"
+        );
+        assert_eq!(
+            rust_code_lines("let q = '\"'; let s = \"kept\"; // gone\n"),
+            vec!["let q = '\"'; let s = \"kept\";".to_string()],
+            "a `'\"'` char literal was read as the start of a string, so the rest \
+             of the line was swallowed"
+        );
+        assert_eq!(
+            rust_code_lines("fn f<'a>(s: &'a str) -> &'a str { s } // gone\n"),
+            vec!["fn f<'a>(s: &'a str) -> &'a str { s }".to_string()],
+            "a lifetime was read as a char literal"
         );
     }
 
