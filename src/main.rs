@@ -6570,7 +6570,7 @@ exit "${CURL_EXIT:-1}"
     /// ([`is_possible_page_url`]) -- so without the trim the tab parses as
     /// *unidentified*: not the provider's, not blank, not disposable, and out
     /// of reach of `--new`. Removing the trim leaves the whole suite green
-    /// (checked at 784bf7f: 260 passed, 0 failed), which is why this exists.
+    /// (measured at 784bf7f: 259 passed, 0 failed), which is why this exists.
     ///
     /// Honest about its own reach: chrome-devtools-mcp emits `pageLabel` plus
     /// one space, and a `pageLabel` cannot end in a space (the URL parser

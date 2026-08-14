@@ -191,6 +191,12 @@ fn install_sh_verifies_before_it_extracts() {
 /// corrupt file would be rejected by `tar` even with the checksum gate deleted,
 /// and this test would then pass for a reason that has nothing to do with the
 /// gate.
+///
+/// Building it needs `tar -cJf`, which is a hard requirement here on purpose:
+/// `install.sh` itself runs `tar -xJf`, so a runner without xz cannot run the
+/// installer either and the test is not stricter than the code it covers. The
+/// digest is the case where that reasoning does *not* hold -- install.sh falls
+/// back to `sha256sum` -- which is why [`sha256_of`] falls back too.
 #[cfg(unix)]
 #[test]
 fn install_sh_leaves_the_existing_binary_alone_when_the_published_checksum_does_not_match() {

@@ -158,6 +158,12 @@ function Assert-WindowsExecutable {
 # rather than being read as agreement. ("" -eq "" is the one way two unknowns
 # compare equal, which is the bug the format guard exists to prevent.)
 #
+# Not a new design: this is `verifyChecksum` from npm/postinstall.cjs, step for
+# step -- trim, split on whitespace, take the first field, lower-case it, reject
+# anything that is not /^[a-f0-9]{64}$/, then compare. That path has verified
+# this same archive since before either shell installer did, so the three
+# installers now agree rather than each inventing a rule.
+#
 # What it is NOT -- stated here so the Windows path does not inherit a
 # stronger-sounding claim than it has, the same limitation install.sh states:
 # the checksum comes from the same host, over the same connection, as the
