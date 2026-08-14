@@ -3500,11 +3500,18 @@ fn parse_pages(text: &str) -> Vec<Page> {
             // Line grammar (McpResponse.js:666):
             //   <id>: <label>[ [selected]][ isolatedContext=<name>]
             // Peel the optional suffixes right to left, in that order.
+            //
+            // The space is part of the marker: upstream emits `' [selected]'`,
+            // and `<label>` is `<title> (<url>)` or a bare URL, so it is never
+            // empty and the space is always there. Matching the bare suffix
+            // instead reads any URL that happens to end in those six characters
+            // as a second selected page -- and since `created_page_id` treats
+            // two claimants as "cannot identify", that is enough to abort an
+            // otherwise uncontested run.
             let rest = strip_isolated_context_suffix(rest.trim());
-            let (label, selected) = if rest.ends_with("[selected]") {
-                (rest.strip_suffix("[selected]").unwrap().trim(), true)
-            } else {
-                (rest, false)
+            let (label, selected) = match rest.strip_suffix(" [selected]") {
+                Some(label) => (label.trim(), true),
+                None => (rest, false),
             };
             let url = page_url_from_label(label).map(str::to_string);
             pages.push(Page { id, url, selected });
@@ -7531,6 +7538,50 @@ exit "${CURL_EXIT:-1}"
         assert_eq!(created_page_id(&[1], &forged), None);
     }
 
+    /// The marker is emitted as `' [selected]'` -- always with that leading
+    /// space (chrome-devtools-mcp 1.5.0, McpResponse.js:666, and the label it
+    /// follows is either `<title> (<url>)` or a bare URL, never empty). A URL
+    /// that merely *ends* in the six characters is not a selected page, and
+    /// reading it as one costs a claimant: with the run's own tab already
+    /// claiming, two claimants is `None`, and `None` now aborts the run.
+    #[test]
+    fn a_url_that_ends_in_the_marker_is_not_a_selected_page() {
+        // Untitled because it is still loading, which is exactly when a fresh
+        // tab shows its bare URL.
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: https://notes.example.com/board#[selected]\n",
+            "3: https://chatgpt.com/ [selected]\n",
+        ));
+        assert_eq!(
+            pages
+                .iter()
+                .filter(|p| p.selected)
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "a URL ending in the literal text was read as a second selection"
+        );
+        assert_eq!(
+            pages[1].url.as_deref(),
+            Some("https://notes.example.com/board#[selected]"),
+            "the URL must not be truncated at the text that looks like the marker"
+        );
+        assert_eq!(created_page_id(&[1], &pages), Some(3));
+
+        // The space is what upstream emits, so a page that puts one there can
+        // still forge a claim -- `created_page_id`'s answer to that is `None`,
+        // not "take the first", and that must not change.
+        let forged = parse_pages(concat!(
+            "## Pages\n",
+            "1: https://example.com/\n",
+            "2: data:text/html,x [selected]\n",
+            "3: https://chatgpt.com/ [selected]\n",
+        ));
+        assert_eq!(created_page_id(&[1], &forged), None);
+    }
+
     /// Two ask-bridge runs against the same Chrome each get their own
     /// chrome-devtools-mcp child, but the browser's page-ID space is shared. So
     /// a run that opens its tab while the other run is opening one sees *two*
@@ -7699,6 +7750,44 @@ exit "${CURL_EXIT:-1}"
                 fake.selected,
                 Some(2),
                 "the run must stay on the tab it opened (force_new={force_new})"
+            );
+        }
+    }
+
+    /// The cost of reading the identity out of prose: whatever makes
+    /// [`created_page_id`] answer `None` now *aborts* a run that would
+    /// otherwise have been fine. So the reading has to be exact.
+    ///
+    /// One run, no collision, its own tab correctly fresh, selected and on the
+    /// provider -- plus one ordinary tab that appeared alongside it and whose
+    /// URL happens to end in the six characters `[selected]`. Nothing here is
+    /// ambiguous to a reader; it was ambiguous only to a suffix match that did
+    /// not require the space the marker is always emitted with.
+    #[test]
+    fn a_tab_whose_url_ends_in_the_marker_does_not_abort_an_uncontested_run() {
+        for force_new in [false, true] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_also_opens =
+                Some("https://notes.example.com/board#[selected]".to_string());
+
+            let result = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                force_new,
+                true,
+                false,
+                Duration::ZERO,
+            );
+
+            assert!(
+                result.is_ok(),
+                "an uncontested run was refused because another tab's URL ends \
+                 in the marker text (force_new={force_new}): {result:?}"
+            );
+            assert_eq!(
+                fake.selected,
+                Some(2),
+                "the run must drive the tab it opened (force_new={force_new})"
             );
         }
     }
