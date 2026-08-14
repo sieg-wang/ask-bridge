@@ -7792,6 +7792,51 @@ exit "${CURL_EXIT:-1}"
         }
     }
 
+    /// The other half of the same refusal: `created == None` is "cannot
+    /// identify", and that is a refusal too, not a licence to take the only
+    /// candidate on offer.
+    ///
+    /// The listing comes back with exactly one fresh provider tab and *no*
+    /// fresh tab that this client selected. That is reachable without any
+    /// forgery: this run's own tab can be gone by the time the list is taken --
+    /// it closed itself, or it crashed -- and when the selected page goes away
+    /// chrome-devtools-mcp 1.5.0 re-selects `#pages[0]`
+    /// (`McpContext.createPagesSnapshot`), which is some tab that was already
+    /// there. What is left unclaimed is the *other* run's fresh provider tab,
+    /// and adopting it is the whole defect this guard exists for.
+    #[test]
+    fn a_fresh_provider_tab_that_no_selection_claims_is_refused_too() {
+        for force_new in [false, true] {
+            let mut fake = FakeMcp::new(&[(1, "https://example.com/notes")]);
+            fake.new_page_opens_nothing = true;
+            fake.new_page_echoes_transiently = Some("https://chatgpt.com/".to_string());
+
+            let err = ensure_provider_tab_with(
+                &mut |tool, args| fake.call(tool, args),
+                Provider::ChatGpt,
+                force_new,
+                true,
+                false,
+                Duration::ZERO,
+            )
+            .expect_err(&format!(
+                "a fresh provider tab this run cannot claim was driven anyway \
+                 (force_new={force_new})"
+            ));
+
+            assert!(
+                err.contains("is not the tab this run opened") && err.contains("opened: None"),
+                "the refusal must be the identity one, and must say that nothing \
+                 claimed the tab (force_new={force_new}): {err}"
+            );
+            assert!(
+                !fake.page_ids_for("select_page").contains(&2),
+                "the unclaimed tab was driven (force_new={force_new}): {:?}",
+                fake.page_ids_for("select_page")
+            );
+        }
+    }
+
     /// While waiting for the page to load, the periodic re-focus must go back
     /// to the tab this call pinned. Re-deriving "the first tab that looks like
     /// the provider" hands the session to the stale tab that failed to close.
