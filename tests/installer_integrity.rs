@@ -140,6 +140,154 @@ fn install_sh_verifies_before_it_extracts() {
     );
 }
 
+/// The two tests above check the comparison in isolation and the textual order
+/// of download/verify/extract. Neither notices whether a failed verification
+/// still *stops* the installer: turning the `exit 1` at the call site into a
+/// warning leaves both of them green. This one runs the shipped `install.sh`
+/// end to end -- `curl`, `node`, `npx` and `uname` stubbed, so no network, no
+/// browser and no Homebrew -- and looks at the binary that ends up on disk.
+///
+/// The archive the stubbed download hands over is a *valid* `tar.xz` carrying a
+/// different binary, because that is the shape of a swapped release. A merely
+/// corrupt file would be rejected by `tar` even with the checksum gate deleted,
+/// and this test would then pass for a reason that has nothing to do with the
+/// gate.
+#[cfg(unix)]
+#[test]
+fn install_sh_leaves_the_existing_binary_alone_when_the_published_checksum_does_not_match() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const GENUINE: &[u8] = b"#!/bin/sh\n# the genuine release binary\n";
+    const TAMPERED: &[u8] = b"#!/bin/sh\n# TAMPERED payload\n";
+    const PREEXISTING: &[u8] = b"the binary the user already has";
+
+    let dir = tempfile::tempdir().unwrap();
+    let stubs = dir.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    let write_stub = |name: &str, body: &str| {
+        let file = stubs.join(name);
+        std::fs::write(&file, body).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+
+    // Serves whichever file the two environment variables point at. Written to
+    // accept the flags in any order so that changing `curl -fL x -o y` does not
+    // by itself turn this test green or red.
+    write_stub(
+        "curl",
+        r#"#!/bin/bash
+url=""; out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+case "$url" in
+    *.sha256) cp "$SERVED_CHECKSUM" "$out" ;;
+    *) cp "$SERVED_ARCHIVE" "$out" ;;
+esac
+"#,
+    );
+    // install.sh only asks whether these two exist.
+    write_stub("node", "#!/bin/bash\nexit 0\n");
+    write_stub("npx", "#!/bin/bash\nexit 0\n");
+    // Pin the platform. The Darwin arm shells out to Homebrew when Chrome is
+    // missing; the Linux arm only warns, which is what a test may do.
+    write_stub(
+        "uname",
+        "#!/bin/bash\ncase \"$1\" in\n    -m) echo x86_64 ;;\n    *) echo Linux ;;\nesac\n",
+    );
+
+    // Two releases under the same name: the one whose checksum was published,
+    // and the one the download actually delivers.
+    let archive = |name: &str, payload: &[u8]| -> PathBuf {
+        let stage = dir.path().join(format!("stage-{name}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("ask-bridge"), payload).unwrap();
+        let out = dir.path().join(format!("{name}.tar.xz"));
+        let built = Command::new("tar")
+            .arg("-cJf")
+            .arg(&out)
+            .arg("-C")
+            .arg(&stage)
+            .arg("ask-bridge")
+            .status()
+            .expect("tar should be available on unix")
+            .success();
+        assert!(built, "could not build the {name} test archive");
+        out
+    };
+    let genuine = archive("genuine", GENUINE);
+    let tampered = archive("tampered", TAMPERED);
+
+    let published = dir.path().join("genuine.sha256");
+    let digest = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&genuine)
+        .output()
+        .expect("shasum should be available on unix");
+    assert!(digest.status.success());
+    let digest = String::from_utf8(digest.stdout).unwrap();
+    let digest = digest.split_whitespace().next().unwrap();
+    std::fs::write(
+        &published,
+        format!("{digest}  ask-bridge-x86_64-unknown-linux-gnu.tar.xz\n"),
+    )
+    .unwrap();
+
+    let home = dir.path().join("home");
+    let installed = home.join(".local").join("bin").join("ask-bridge");
+    let run = |served: &Path| -> (bool, Vec<u8>, String) {
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, PREEXISTING).unwrap();
+        let out = Command::new("bash")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+            .env(
+                "PATH",
+                format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("HOME", &home)
+            // Keep the installer's own `mktemp -d` inside the test's tempdir.
+            .env("TMPDIR", dir.path())
+            .env("SERVED_ARCHIVE", served)
+            .env("SERVED_CHECKSUM", &published)
+            .output()
+            .expect("bash should be available on unix");
+        (
+            out.status.success(),
+            std::fs::read(&installed).unwrap(),
+            String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr),
+        )
+    };
+
+    // Positive control first. Without it, an installer that fell over on one of
+    // the stubs would "refuse" the tampered archive for a reason that has
+    // nothing to do with the checksum.
+    let (ok, bytes, log) = run(&genuine);
+    assert!(ok, "the genuine release was not installed:\n{log}");
+    assert_eq!(bytes, GENUINE, "the genuine release was not what landed");
+
+    let (ok, bytes, log) = run(&tampered);
+    assert!(
+        !ok,
+        "install.sh reported success after being handed an archive that does \
+         not match the published checksum:\n{log}"
+    );
+    assert_ne!(
+        bytes, TAMPERED,
+        "install.sh overwrote the user's binary with the tampered payload"
+    );
+    assert_eq!(
+        bytes, PREEXISTING,
+        "the binary the user already had did not survive the refusal"
+    );
+}
+
 /// `curl ... | bash` hands the shell whatever arrived. A connection that drops
 /// half way through delivers half a script, which bash runs as far as it got --
 /// and the pipeline's exit status is bash's, so the update reports success.

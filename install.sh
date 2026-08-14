@@ -104,6 +104,14 @@ download_file() {
 # Fails closed by construction: anything that does not produce the archive's
 # real digest -- a missing hashing tool, an unreadable file, an error page saved
 # where the checksum should be -- fails the comparison rather than skipping it.
+#
+# What it is NOT: the checksum comes from the same host, over the same
+# connection, as the archive it describes. It catches a body that changed on the
+# way here -- corruption, truncation, a stale mirror, a caching proxy -- and
+# nothing more. Anyone who can serve the archive can serve a matching .sha256,
+# so this is not a defence against a compromised release host or a broken TLS
+# path; that needs a signature the installer can check against a key it did not
+# just download, which upstream does not publish.
 verify_release_checksum() {
     archive="$1"
     checksum_file="$2"
