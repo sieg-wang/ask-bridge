@@ -7916,6 +7916,66 @@ exit "${CURL_EXIT:-1}"
         }
     }
 
+    /// The adopt path drives a provider tab this run never opened.
+    ///
+    /// This is the largest of the three gaps and was the only one with no
+    /// change detector at all -- the other two have one each, while this one
+    /// had a comment. The causal-identity guard covers the window in which a
+    /// tab is *fresh*; from `provider_pages.first()` down the only gate is
+    /// `verify_selected_page_is_provider`, which asks where the tab is and
+    /// never whose it is. A conversation another run is in the middle of is
+    /// indistinguishable from the idle tab this branch exists to reuse, and the
+    /// leak pinned by the test above makes that collision more likely with
+    /// every refusal, not less.
+    ///
+    /// Not closable here: the identity the fresh-tab branch uses comes from
+    /// this client's own `new_page`, and a settled tab was never opened by this
+    /// run, so there is nothing to compare it against. A failure means the gap
+    /// was closed -- rewrite this test to state the new rule rather than
+    /// relaxing it.
+    #[test]
+    fn known_gap_h10_the_adopt_path_drives_another_runs_conversation_tab() {
+        let mut fake = FakeMcp::new(&[
+            (1, "https://example.com/notes"),
+            (
+                2,
+                "ChatGPT (https://chatgpt.com/c/another-runs-conversation)",
+            ),
+        ])
+        .on_live_url(2, "https://chatgpt.com/c/another-runs-conversation");
+
+        let result = ensure_provider_tab_with(
+            &mut |tool, args| fake.call(tool, args),
+            Provider::ChatGpt,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        assert_eq!(
+            fake.page_ids_for("select_page"),
+            vec![2],
+            "the adopt path no longer drives a settled provider tab it cannot \
+             prove it opened; if that is deliberate this gap is closed and this \
+             test should be rewritten to state the new rule"
+        );
+        // Not merely "selected": this is the tab the prompt is typed into and
+        // the tab the answer is copied back from.
+        assert_eq!(
+            prompt_target_url(&fake),
+            "https://chatgpt.com/c/another-runs-conversation",
+            "the run would type its prompt into the other run's conversation"
+        );
+        assert!(
+            fake.urls_for("new_page").is_empty(),
+            "a tab was opened instead of adopted, so this no longer exercises \
+             the adopt path: {:?}",
+            fake.urls_for("new_page")
+        );
+    }
+
     /// While waiting for the page to load, the periodic re-focus must go back
     /// to the tab this call pinned. Re-deriving "the first tab that looks like
     /// the provider" hands the session to the stale tab that failed to close.
@@ -13528,8 +13588,16 @@ where
         // is indistinguishable from the user's own idle tab, which is the case
         // this branch exists to reuse. The causal identity used above is
         // unavailable by construction: it comes from this client's `new_page`,
-        // and an already-settled tab was never opened by this run. The two
-        // `known_gap_h10_*` tests below pin what that costs.
+        // and an already-settled tab was never opened by this run.
+        //
+        // What it costs is pinned by
+        // `known_gap_h10_the_adopt_path_drives_another_runs_conversation_tab`
+        // -- named, not located: the `tests` module is thousands of lines
+        // *above* this branch, and an earlier version of this comment said
+        // "below". Two more `known_gap_h10_*` tests beside it pin the two
+        // smaller residuals (`--new` disposing of another run's conversation,
+        // and every identity refusal leaking the tab it opened -- the leak that
+        // makes this branch's adoption more likely).
         let provider_pages: Vec<&Page> = pages
             .iter()
             .filter(|page| {
