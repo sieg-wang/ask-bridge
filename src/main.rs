@@ -17,6 +17,47 @@ use std::os::windows::process::CommandExt;
 
 const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
 
+/// The CDP debugging port ask-bridge launches on, probes, adopts and closes.
+const DEFAULT_DEBUG_PORT: u16 = 9223;
+
+/// Env var that overrides `DEFAULT_DEBUG_PORT`.
+///
+/// WHY this exists, and why it is not a CLI flag: it is a TEST-SAFETY seam.
+/// `tests/open_cli.rs` spawns the real binary running the real `open`
+/// subcommand, and `start_chrome_if_needed` adopts whatever ask-bridge browser
+/// is listening on the debug port. With the port hardcoded, `cargo test` on a
+/// machine where the user's ask-bridge browser is up drives THEIR logged-in
+/// browser over CDP against their live sessions — the suite passed only because
+/// the port happened to be free. A test that can bind its own port cannot do
+/// that, whatever else is running.
+///
+/// Every place that names the port reads it from here. A partial substitution
+/// would be worse than none — the CLI would launch the browser on one port and
+/// probe another — so `debug_port_is_read_from_one_place` pins that no bare
+/// `9223` literal returns to the port-bearing code.
+const DEBUG_PORT_ENV: &str = "ASK_BRIDGE_DEBUG_PORT";
+
+/// Resolved once per process: the env var is read at first use and cached, so
+/// the port cannot change under a run that has already launched a browser on it.
+fn debug_port() -> u16 {
+    use std::sync::OnceLock;
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        std::env::var(DEBUG_PORT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u16>().ok())
+            // Port 0 means "any port" to bind(2) and is meaningless here: fall
+            // back rather than launch a browser on a port nothing can predict.
+            .filter(|port| *port != 0)
+            .unwrap_or(DEFAULT_DEBUG_PORT)
+    })
+}
+
+/// `127.0.0.1:<port>` — the only address ask-bridge ever connects to.
+fn debug_addr() -> String {
+    format!("127.0.0.1:{}", debug_port())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
     LoggedIn,
@@ -1464,7 +1505,7 @@ fn build_chrome_devtools_server_config(
     let mut mcp_args = vec![
         "-y".to_string(),
         MCP_PACKAGE_SPEC.to_string(),
-        "--browser-url=http://127.0.0.1:9223".to_string(),
+        format!("--browser-url=http://{}", debug_addr()),
     ];
     if quiet_mcp {
         mcp_args.push("--no-usage-statistics".to_string());
@@ -1595,14 +1636,15 @@ fn remove_chrome_pid_file() -> Result<(), String> {
 }
 
 fn browser_id_from_websocket_url(url: &str) -> Option<String> {
-    const LOOPBACK_PREFIXES: &[&str] = &[
-        "ws://127.0.0.1:9223/devtools/browser/",
-        "ws://localhost:9223/devtools/browser/",
-        "ws://[::1]:9223/devtools/browser/",
+    let port = debug_port();
+    let loopback_prefixes = [
+        format!("ws://127.0.0.1:{port}/devtools/browser/"),
+        format!("ws://localhost:{port}/devtools/browser/"),
+        format!("ws://[::1]:{port}/devtools/browser/"),
     ];
-    let id = LOOPBACK_PREFIXES
+    let id = loopback_prefixes
         .iter()
-        .find_map(|prefix| url.strip_prefix(prefix))?
+        .find_map(|prefix| url.strip_prefix(prefix.as_str()))?
         .trim();
     (!id.is_empty() && !id.contains(['/', '?', '#'])).then(|| id.to_string())
 }
@@ -1648,13 +1690,17 @@ fn debug_browser_id() -> Option<String> {
     const MAX_RESPONSE_SIZE: usize = 64 * 1024;
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let mut stream = TcpStream::connect("127.0.0.1:9223").ok()?;
+    let mut stream = TcpStream::connect(debug_addr()).ok()?;
     let timeout = Some(Duration::from_millis(500));
     stream.set_read_timeout(timeout).ok()?;
     stream.set_write_timeout(timeout).ok()?;
     stream
         .write_all(
-            b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:9223\r\nConnection: close\r\n\r\n",
+            format!(
+                "GET /json/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                debug_addr()
+            )
+            .as_bytes(),
         )
         .ok()?;
 
@@ -1908,7 +1954,7 @@ fn start_chrome_if_needed(
 ) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
-    if TcpStream::connect("127.0.0.1:9223").is_ok() {
+    if TcpStream::connect(debug_addr()).is_ok() {
         let snapshot = inspect_chrome_debug_port(&profile_path);
         if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
             && chrome_record_matches_current(
@@ -1946,14 +1992,16 @@ fn start_chrome_if_needed(
                     .any(|cmd| command_uses_browser(&cmd, override_path));
                 if !running_matches {
                     eprintln!(
-                        "Note: an ask-bridge browser is already running on port 9223 with a different binary than the configured '{}'; reusing the running one. Run `ask-bridge close` first to switch browsers.",
+                        "Note: an ask-bridge browser is already running on port {} with a different binary than the configured '{}'; reusing the running one. Run `ask-bridge close` first to switch browsers.",
+                        debug_port(),
                         override_path
                     );
                 }
             }
             if verbose && headless && !is_debug_chrome_background(&profile_path) {
                 println!(
-                    "Reusing existing ask-bridge Chrome on port 9223. Run `ask-bridge close` if you want to restart it in background mode."
+                    "Reusing existing ask-bridge Chrome on port {}. Run `ask-bridge close` if you want to restart it in background mode.",
+                    debug_port()
                 );
             }
             return Ok(());
@@ -1972,20 +2020,24 @@ fn start_chrome_if_needed(
                 })?;
             }
             if verbose {
-                println!("Reusing the existing ask-bridge Chrome on port 9223.");
+                println!(
+                    "Reusing the existing ask-bridge Chrome on port {}.",
+                    debug_port()
+                );
             }
             return Ok(());
         }
 
-        return Err(
-            "Port 9223 is already used by a non-ask Chrome process. Stop it or use a different debugging port."
-                .to_string(),
-        );
+        return Err(format!(
+            "Port {} is already used by a non-ask Chrome process. Stop it or use a different debugging port.",
+            debug_port()
+        ));
     }
 
     if verbose {
         println!(
-            "Chrome is not running on port 9223. Starting Chrome with remote debugging (headless: {})...",
+            "Chrome is not running on port {}. Starting Chrome with remote debugging (headless: {})...",
+            debug_port(),
             headless
         );
     }
@@ -2004,7 +2056,7 @@ fn start_chrome_if_needed(
     // successor would lose unrelated settings.
 
     let mut args: Vec<String> = vec![
-        "--remote-debugging-port=9223".to_string(),
+        format!("--remote-debugging-port={}", debug_port()),
         format!("--user-data-dir={}", profile_path),
         ASK_BRIDGE_CHROME_MARKER.to_string(),
         "--no-first-run".to_string(),
@@ -2123,7 +2175,7 @@ fn start_chrome_if_needed(
     // (open/LaunchServices + post-update Gatekeeper scans).
     let mut last_identity_error = None;
     for _ in 0..PORT_WAIT_ITERS {
-        if TcpStream::connect("127.0.0.1:9223").is_ok() {
+        if TcpStream::connect(debug_addr()).is_ok() {
             let snapshot = inspect_chrome_debug_port(&profile_path);
             if let Some(record) =
                 build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
@@ -2144,13 +2196,14 @@ fn start_chrome_if_needed(
                     );
                 }
                 if verbose {
-                    println!("Chrome started and listening on port 9223.");
+                    println!("Chrome started and listening on port {}.", debug_port());
                 }
                 return Ok(());
             }
-            last_identity_error = Some(
-                "Chrome did not expose a valid CDP browser identity on port 9223.".to_string(),
-            );
+            last_identity_error = Some(format!(
+                "Chrome did not expose a valid CDP browser identity on port {}.",
+                debug_port()
+            ));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -2162,8 +2215,9 @@ fn start_chrome_if_needed(
             error
         )),
         None => Err(format!(
-            "Timed out waiting for browser '{}' to start on port 9223",
-            chrome_path
+            "Timed out waiting for browser '{}' to start on port {}",
+            chrome_path,
+            debug_port()
         )),
     }
 }
@@ -2295,7 +2349,9 @@ struct ChromeDebugSnapshot {
     ask_pids: Vec<String>,
 }
 
-#[cfg(any(target_os = "windows", test))]
+// Not `cfg(windows, test)` any more: the escalation these three guard now runs
+// on every platform, and that old gating is precisely what let ten green unit
+// assertions cover code the shipped macOS binary did not contain.
 fn same_pid_set(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && left.iter().all(|pid| right.contains(pid))
 }
@@ -2308,7 +2364,6 @@ fn same_pid_set(left: &[String], right: &[String]) -> bool {
 /// when BOTH snapshots have one; a hung browser (CDP dead → `browser_id:
 /// None`) is the very case the force branch exists for and must not be
 /// blocked on it.
-#[cfg(any(target_os = "windows", test))]
 fn validated_force_kill_pids(
     initial: &ChromeDebugSnapshot,
     current: &ChromeDebugSnapshot,
@@ -2338,7 +2393,6 @@ fn debug_listener_scope_is_unambiguous(listener_pids: &[String]) -> bool {
 /// last graceful-shutdown port poll): that is a SUCCESSFUL close, not an
 /// identity failure. Callers must still confirm the probe itself ran (the
 /// port really stopped accepting connections) before trusting this.
-#[cfg(any(target_os = "windows", test))]
 fn snapshot_shows_browser_gone(current: &ChromeDebugSnapshot) -> bool {
     current.listener_pids.is_empty() && current.ask_pids.is_empty()
 }
@@ -2371,17 +2425,26 @@ fn command_uses_browser(command: &str, browser_path: &str) -> bool {
 }
 
 /// Whether a single open tab is a "blank"/new-tab page that ask-bridge may
-/// navigate directly instead of opening a new tab. Matches about:blank, the
-/// Chrome new-tab-page marker, and browser-internal welcome/newtab pages
-/// (chrome://, brave://, edge://, ...) — but NOT an ordinary http(s) URL whose
-/// host merely starts with "newtab" (e.g. https://newtab.example.com).
+/// navigate directly instead of opening a new tab. Matches about:blank and
+/// browser-internal new-tab/welcome pages (chrome://, brave://, edge://, ...) —
+/// but NOT an ordinary http(s) URL that merely mentions one of those markers,
+/// whether in its host (https://newtab.example.com) or in its path
+/// (https://example.com/blog/new-tab-page-tips).
+///
+/// Both exclusions are the same bug found twice. The scheme test was added for
+/// the `newtab` marker but `new-tab-page` was left as an unanchored,
+/// scheme-blind `contains`, so any http(s) page whose path contained that
+/// string was judged blank — and the caller then navigates a "blank" tab IN
+/// PLACE, replacing a page the user was actually reading.
 fn is_blank_tab_url(url: &str) -> bool {
-    if url == "about:blank" || url.contains("new-tab-page") {
+    if url == "about:blank" {
         return true;
     }
     match url.split_once("://") {
         Some((scheme, rest)) if scheme != "http" && scheme != "https" => {
-            rest.starts_with("newtab") || rest.starts_with("welcome")
+            rest.starts_with("newtab")
+                || rest.starts_with("welcome")
+                || rest.starts_with("new-tab-page")
         }
         _ => false,
     }
@@ -2426,7 +2489,7 @@ fn debug_port_listener_pids() -> Vec<String> {
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                parse_windows_netstat_listener_pids(&stdout, 9223)
+                parse_windows_netstat_listener_pids(&stdout, debug_port())
             }
             _ => Vec::new(),
         }
@@ -2435,7 +2498,7 @@ fn debug_port_listener_pids() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     {
         let output = Command::new("lsof")
-            .args(["-tiTCP:9223", "-sTCP:LISTEN"])
+            .args([format!("-tiTCP:{}", debug_port()).as_str(), "-sTCP:LISTEN"])
             .output();
 
         match output {
@@ -2691,14 +2754,79 @@ fn require_ask_chrome_pids_to_exit(
     }
 }
 
+/// Whether a signal to a browser PID is the polite request or the last resort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AskChromeSignal {
+    Graceful,
+    Force,
+}
+
+/// Signal only the PIDs that STILL identify as this profile's ask-bridge Chrome,
+/// re-checked immediately before the syscall, and report which ones were signalled.
+///
+/// WHY the re-check, and why it is not paranoia: `inspect_chrome_debug_port`
+/// shells out to `lsof` and then to `ps`/`wmic` once per candidate, so tens of
+/// milliseconds pass between "this PID owns the debug port" and the signal. If
+/// the browser exits inside that gap and the kernel hands the number to an
+/// unrelated process, the collect-then-signal loop signalled a stranger.
+/// SIGTERM to an innocent process is rude; SIGKILL to one is the tier-1 harm
+/// this repository cares most about — and widening the force kill off Windows is
+/// exactly what makes the gap matter, so the widening carries this with it.
+///
+/// It is not atomic; nothing short of a pidfd/kqueue handle is. What it does buy
+/// is a window shrunk from a whole multi-process inspection to a single `ps`
+/// call, and an identity check that is a property of the SIGNAL rather than of a
+/// snapshot taken seconds earlier.
+///
+/// A PID whose command line cannot be read is NOT signalled. That is not a new
+/// way to fail silently: `inspect_chrome_debug_port` derives `ask_pids` by
+/// walking parents through this same probe, so on a machine where it cannot
+/// answer there are no `ask_pids` to signal in the first place.
+fn signal_validated_ask_pids(
+    pids: &[String],
+    profile_path: &str,
+    signal: AskChromeSignal,
+) -> Vec<String> {
+    let mut signalled = Vec::new();
+    for pid in pids {
+        let still_ours = process_command(pid)
+            .map(|command| command_identifies_ask_chrome(&command, profile_path))
+            .unwrap_or(false);
+        if !still_ours {
+            continue;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("taskkill");
+            match signal {
+                AskChromeSignal::Graceful => command.args(["/PID", pid, "/T"]),
+                AskChromeSignal::Force => command.args(["/F", "/PID", pid]),
+            };
+            let _ = command.status();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let flag = match signal {
+                AskChromeSignal::Graceful => "-TERM",
+                AskChromeSignal::Force => "-KILL",
+            };
+            let _ = Command::new("kill").args([flag, pid]).status();
+        }
+
+        signalled.push(pid.clone());
+    }
+    signalled
+}
+
 fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     let snapshot = inspect_chrome_debug_port(profile_path);
     if snapshot.listener_pids.is_empty() {
-        if TcpStream::connect("127.0.0.1:9223").is_ok() {
-            return Err(
-                "Port 9223 is active, but ask-bridge could not identify its listener process. No process was closed."
-                    .to_string(),
-            );
+        if TcpStream::connect(debug_addr()).is_ok() {
+            return Err(format!(
+                "Port {} is active, but ask-bridge could not identify its listener process. No process was closed.",
+                debug_port()
+            ));
         }
         if let Err(_error) = remove_chrome_pid_file() {
             // ignore cleanup failure when port is already closed
@@ -2706,32 +2834,23 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         return Ok(false);
     }
     if !debug_listener_scope_is_unambiguous(&snapshot.listener_pids) {
-        return Err(
-            "Multiple processes are listening on port 9223, so ask-bridge cannot safely determine which process to close. No process was closed."
-                .to_string(),
-        );
+        return Err(format!(
+            "Multiple processes are listening on port {}, so ask-bridge cannot safely determine which process to close. No process was closed.",
+            debug_port()
+        ));
     }
 
     if snapshot.ask_pids.is_empty() {
-        return Err(
-            "Port 9223 is already used by a non-ask Chrome process. Stop it or use a different debugging port."
-                .to_string(),
-        );
+        return Err(format!(
+            "Port {} is already used by a non-ask Chrome process. Stop it or use a different debugging port.",
+            debug_port()
+        ));
     }
 
-    for pid in &snapshot.ask_pids {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = Command::new("taskkill").args(["/PID", pid, "/T"]).status();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = Command::new("kill").args(["-TERM", pid]).status();
-        }
-    }
+    signal_validated_ask_pids(&snapshot.ask_pids, profile_path, AskChromeSignal::Graceful);
 
     for _ in 0..50 {
-        if TcpStream::connect("127.0.0.1:9223").is_err() {
+        if TcpStream::connect(debug_addr()).is_err() {
             // Port closed is NOT process gone: wait for the PIDs to actually
             // exit so an immediate relaunch can't hit the old SingletonLock.
             require_ask_chrome_pids_to_exit(&snapshot.ask_pids, profile_path, 100)?;
@@ -2741,7 +2860,15 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    #[cfg(target_os = "windows")]
+    // Was `#[cfg(target_os = "windows")]`. On macOS/Linux a browser that
+    // ignores SIGTERM therefore left the debug port wedged until a human ran
+    // `kill -9` by hand, and every later `open` failed with "Port N is already
+    // used by a non-ask Chrome process". The escalation is safe to widen only
+    // because it is gated on the IDENTITY proofs below rather than on the port
+    // poll: `validated_force_kill_pids` refuses unless a FRESH inspection finds
+    // the same single listener, the same ask-bridge owner set, and (when both
+    // have one) the same CDP browser UUID, and `signal_validated_ask_pids` then
+    // re-reads each command line immediately before the kill.
     {
         let current = inspect_chrome_debug_port(profile_path);
         if snapshot_shows_browser_gone(&current) {
@@ -2749,11 +2876,11 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
             // right after the last port poll — success) from "probe failed to
             // execute" (netstat/wmic unavailable while the port is still
             // wedged — error).
-            if TcpStream::connect("127.0.0.1:9223").is_ok() {
-                return Err(
-                    "Port 9223 is still open, but its owner could not be re-identified; refusing to force-kill any PID."
-                        .to_string(),
-                );
+            if TcpStream::connect(debug_addr()).is_ok() {
+                return Err(format!(
+                    "Port {} is still open, but its owner could not be re-identified; refusing to force-kill any PID.",
+                    debug_port()
+                ));
             }
             require_ask_chrome_pids_to_exit(&snapshot.ask_pids, profile_path, 100)?;
             let _ = remove_chrome_pid_file();
@@ -2763,16 +2890,10 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
             "Browser identity changed while waiting for graceful shutdown; refusing to force-kill any PID."
                 .to_string()
         })?;
-        for pid in &force_kill_pids {
-            let _ = Command::new("taskkill")
-                .arg("/F")
-                .arg("/PID")
-                .arg(pid)
-                .status();
-        }
+        signal_validated_ask_pids(&force_kill_pids, profile_path, AskChromeSignal::Force);
 
         for _ in 0..50 {
-            if TcpStream::connect("127.0.0.1:9223").is_err() {
+            if TcpStream::connect(debug_addr()).is_err() {
                 require_ask_chrome_pids_to_exit(&force_kill_pids, profile_path, 100)?;
                 let _ = remove_chrome_pid_file();
                 return Ok(true);
@@ -3808,6 +3929,21 @@ mod tests {
         assert!(!is_blank_tab_url("https://chatgpt.com/"));
         assert!(!is_blank_tab_url("https://gemini.google.com/app"));
         assert!(!is_blank_tab_url("about:settings"));
+        // AB-U4. The same over-match as the `://newtab` one fixed above, on the
+        // arm that commit left alone: `contains("new-tab-page")` is unanchored
+        // and scheme-blind, so ANY http(s) page whose path happens to contain
+        // that string was judged blank. The consequence is not cosmetic — the
+        // caller navigates such a tab IN PLACE instead of opening a new one, so
+        // a real page the user was reading is replaced by the prompt.
+        assert!(!is_blank_tab_url(
+            "https://example.com/blog/new-tab-page-tips"
+        ));
+        assert!(!is_blank_tab_url(
+            "https://chatgpt.com/c/new-tab-page-notes"
+        ));
+        // The browser-internal form must keep matching, or this is not a
+        // narrowing but a deletion.
+        assert!(is_blank_tab_url("brave://new-tab-page/"));
     }
 
     #[test]
@@ -3984,6 +4120,88 @@ mod tests {
         );
         terminate_marked_ask_chrome_stub(&mut marked);
         assert!(still_running);
+    }
+
+    /// AB-A3, the half that makes widening the force kill off Windows safe:
+    /// a PID that no longer identifies as THIS profile's ask-bridge Chrome must
+    /// not be signalled at all — least of all with SIGKILL.
+    ///
+    /// This is the PID-recycling window made concrete. Between
+    /// `inspect_chrome_debug_port` (an `lsof` plus one `ps` per candidate) and
+    /// the signal, the browser can exit and the kernel can hand its number to
+    /// an unrelated process. The pre-TERM snapshot still names that number, so
+    /// a collect-then-signal loop kills a stranger. Here the unmarked stub
+    /// stands in for the stranger: it is alive, it holds the PID we were told
+    /// to kill, and it must survive.
+    #[cfg(unix)]
+    #[test]
+    fn signal_validated_ask_pids_spares_a_pid_that_is_no_longer_ask_chrome() {
+        use std::os::unix::process::CommandExt;
+
+        let profile = "/tmp/ask-bridge-test-profile";
+
+        // The stranger: alive, own process group, no ask-bridge marker and no
+        // --user-data-dir for our profile.
+        let mut stranger = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :", "sh", "--not-ask-bridge"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stranger_pid = stranger.id().to_string();
+
+        let signalled = signal_validated_ask_pids(
+            std::slice::from_ref(&stranger_pid),
+            profile,
+            AskChromeSignal::Force,
+        );
+
+        let survived = process_is_alive(&stranger_pid) != Some(false);
+        terminate_marked_ask_chrome_stub(&mut stranger);
+
+        assert!(
+            signalled.is_empty(),
+            "a PID whose command line does not identify ask-bridge Chrome was \
+             signalled anyway: {signalled:?}"
+        );
+        assert!(
+            survived,
+            "SIGKILL reached a process that is not ask-bridge Chrome — this is \
+             the recycled-PID harm the escalation must never cause"
+        );
+    }
+
+    /// Negative control: without it, a signaller that never signals anything
+    /// would satisfy the test above while leaving every hung browser wedged.
+    #[cfg(unix)]
+    #[test]
+    fn signal_validated_ask_pids_does_signal_a_live_ask_chrome() {
+        let profile = "/tmp/ask-bridge-test-profile";
+        let mut marked = spawn_marked_ask_chrome_stub();
+        let marked_pid = marked.id().to_string();
+
+        let signalled = signal_validated_ask_pids(
+            std::slice::from_ref(&marked_pid),
+            profile,
+            AskChromeSignal::Force,
+        );
+
+        // `wait` rather than a `process_is_alive` poll: this test process is the
+        // stub's parent, so a SIGKILLed stub stays visible to `ps` as a zombie
+        // until it is reaped. Polling liveness here measured the reaping, not
+        // the kill, and reported a successful force-kill as a failure.
+        let status = marked.wait().unwrap();
+        terminate_marked_ask_chrome_stub(&mut marked);
+
+        assert_eq!(signalled, vec![marked_pid.clone()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "a live, marked ask chrome was not force-killed (status {status:?})"
+            );
+        }
     }
 
     /// Spawns a stub process whose argv carries the ask-bridge marker, so the
